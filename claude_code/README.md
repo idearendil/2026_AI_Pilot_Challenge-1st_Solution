@@ -16,11 +16,15 @@
 |---|---|
 | `env_utils.py` | 원본 YAML(`student_ppo_mlp.yaml`)과 동일한 환경 세팅으로 `DogFightWrapper` 생성 + 보상/관측 모듈 hook |
 | `my_reward.py` | **[편집] 보상 함수** (`MY_REWARD_CONFIG`, `compute_reward`) |
-| `my_observation.py` | **[편집] 관측 벡터** (`OBSERVATION_SIZE`, `build_observation`) |
+| `my_observation.py` | **[편집] 관측 벡터** + 제출환경 state 재구성(`StateReconstructor`) |
+| `verify_reconstruction.py` | 학습 env 에서 재구성값 vs 실제 state 검증 |
+| `verify_tier_damage.py` | 학습 env 의 시간 게이팅 3-tier damage 적용 검증 |
 | `model.py` | MLP actor-critic(가우시안 정책) + 2-파일 번들 저장/로드 + action 변환 |
 | `ppo.py` | GAE + clipped surrogate 기반 순수 PyTorch PPO 트레이너 |
+| `parallel.py` | Ray 기반 병렬 rollout 수집 (`ParallelPPOTrainer`, `physical_cpu_count`) |
 | `train.py` | 학습 entrypoint (CLI). 종료 시 번들 저장 |
 | `action_provider.py` | MLP 정책을 원본 `ActionProvider` 계약으로 감싼 어댑터 |
+| `self_play.py` | 상대를 같은 actor network 로 조종하는 `SelfPlayProvider` |
 | `submission.py` | 대결 서버 연결 (원본 my_submission.py 와 동일한 경로) |
 | `evaluate.py` | 학습한 번들을 로컬 환경에서 검증 |
 
@@ -37,7 +41,26 @@
 동역학·보상·종료·관측 파이프라인이 RLlib 경로와 100% 동일하고, **유일한 차이는
 학습 루프(RLlib → claude_code PPO)** 입니다.
 
-### 표적 모드 (`--target-mode`)
+### 상대(self-play) — 기본값
+
+`train.py` 는 **기본적으로 self-play** 입니다: 상대 전투기를 **학습 중인 같은 actor
+network** 로 조종합니다(`self_play.SelfPlayProvider`). 정책이 향상되면 상대도 같이
+강해지는 완전한 self-learning 입니다.
+
+- 상대는 자신의 `StateReconstructor`(상대 관점 HP)로 **대칭 관측**을 만들고, model 을
+  통과시켜 action 을 냅니다. `action_repeat=step_ratio` 로 본 기체와 동일한 제어 주기.
+- 상대는 결정론적(평균 action)으로 동작합니다(`SelfPlayProvider(explore=True)` 로 변경 가능).
+- **시작 위치 랜덤화**: `STANDARD_ENV_CONFIG["randomize_start_side"]=True`(기본) — 매 episode
+  학습 agent 시작 위치를 두 위치(config `ownship`/`target`) 중 랜덤 선택(좌우 교대)해
+  한쪽에 과적합하지 않게 합니다. 끄려면 `randomize_start_side=False`.
+- 끄려면 `--no-self-play` (그러면 아래 `--target-mode` 스크립트 상대 사용).
+
+```powershell
+... claude_code\train.py --output-name team01 --output-tag selfplay_v1     # 기본 self-play
+... claude_code\train.py --no-self-play --target-mode loiter ...           # 스크립트 상대
+```
+
+### 스크립트 상대 모드 (`--target-mode`, `--no-self-play` 일 때만)
 
 `train.py` 의 학습 데모 기본값은 **`loiter`** 입니다. 이유:
 
@@ -124,19 +147,49 @@ iteration 마다 다음이 출력됩니다:
 - 학습률 선형 감쇠
 - advantage 정규화, clipped value loss, `approx_kl` 기반 epoch 조기 종료
 
-### 보상/관측을 claude_code 에서 직접 정의
+### 병렬 데이터 수집 (Ray) — 기본값
 
-보상·관측은 환경(`src/dogfight/`)이 계산하지만, **claude_code 안에서 바로 바꿀 수**
-있습니다. 두 편집 파일이 있고(`claude_code/my_reward.py`, `claude_code/my_observation.py`),
-모듈 경로로 활성화합니다(기본값은 두 파일 모두 원본 동작과 동일하게 맞춰져 있어,
-활성화만 해서는 결과가 바뀌지 않습니다):
+큰 모델 + GPU 학습을 대비해, CPU-bound 한 env stepping 을 여러 프로세스(Ray actor)로
+병렬 수집합니다. **worker 수 기본값 = 물리 CPU 코어 수**(논리 코어 아님; psutil 없으면
+OS 조회 → 마지막엔 logical//2). 각 worker 는 자신의 env(self-play 포함)+로컬 model 을
+갖고, 매 iteration 마다 driver 가 weights/obs_rms 를 broadcast → 병렬 수집 → driver 에서
+update(GPU 가능).
+
+```powershell
+... claude_code\train.py --num-workers 6 ...      # 명시 (기본은 물리 코어 수)
+... claude_code\train.py --num-workers 1 ...      # 단일 프로세스(Ray 미사용)
+... claude_code\train.py --device cuda ...         # 큰 모델: driver update 를 GPU 로
+```
+
+측정(이 머신, 물리 6코어, 3072 step/iter, self-play+claude16): 단일 **~15.5s/iter** →
+6-worker **~3.4s/iter (약 4.5×)**. worker 는 CPU 추론, driver 만 `--device cuda` 로 GPU
+update. `--num-workers 1` 이면 Ray 없이 단일 프로세스 경로를 씁니다.
+
+> 주의: obs_rms 는 driver 가 authoritative 로 관리(worker batch 통계를 병합), 각 worker 는
+> broadcast 된 obs_rms 로 정규화. reward 스케일러는 worker 별로 유지됩니다(분포 동일해 수렴).
+
+### 보상/관측을 claude_code 에서 직접 정의 (기본값)
+
+`train.py` 는 **기본적으로 `claude_code/my_reward.py` 와 `claude_code/my_observation.py`
+를 사용**합니다(플래그 불필요). 이 두 파일을 편집하면 학습 보상/관측이 바뀝니다.
 
 ```powershell
 D:\other_programs\anaconda3\envs\aip\python.exe claude_code\train.py `
-  --reward-module claude_code.my_reward `
-  --observation-module claude_code.my_observation `
-  --output-name team01 --output-tag custom_v1
+  --output-name team01 --output-tag v1          # 그냥 실행하면 my_reward + my_observation 사용
 ```
+
+프레임워크 기본 보상(`src/dogfight/envs/reward.py`)·tactical16 관측을 쓰려면 빈 값을 줍니다:
+
+```powershell
+... claude_code\train.py --reward-module "" --observation-module "" ...
+```
+
+> 현재 `my_reward.py`:
+> - **종료**: 상대 격추/고도이탈 → +10, 내 격추/고도이탈 → −10
+> - **보조(매 step, 양측 생존 중)**: `(상대 HP감소 − 내 HP감소) × 10` (피해 유도 shaping)
+>
+> 긴 episode(200s) 에서는 rollout 당 episode 수가 적어지므로 `--rollout-steps` 를
+> 크게(예: 4096) 두는 것을 권장합니다.
 
 - **보상**(`my_reward.py`): `MY_REWARD_CONFIG`(계수) + `compute_reward(...) -> (total, components)`.
   학습에만 영향(추론/제출에는 무관). 계수만 바꾸려면 `env_utils.STANDARD_ENV_CONFIG["reward"]`
@@ -149,6 +202,75 @@ D:\other_programs\anaconda3\envs\aip\python.exe claude_code\train.py `
 
 > 검증: custom 보상+관측으로 학습한 번들에 대해, 학습 중 결정론적 평가 return 과
 > `evaluate.py` return 이 동일하게 나오는 것을 확인했습니다(학습↔추론 관측 일치).
+
+### 제출환경 state 재구성 (HP·고도·속도)
+
+대결 서버 추론에서는 위치·자세·속도(state 0~8)만 들어오고 HP·고도·속도(KCAS)·WEZ 는
+0 입니다. `my_observation.py` 의 `StateReconstructor` 가 이를 복원합니다:
+
+- **고도** = `-D` (= `-state[2]`)  ← 위치
+- **속도(TAS)** = `||(u,v,w)||` (= `||state[6:9]||`)  ← 속도
+- **거리/ATA/AA/LOS** = `geo_info` 계산  ← 위치·자세
+- **HP** = 매 RL-step `rate(r,theta,t) * DT_PER_STEP` 누적  ← 대결 서버 damage 공식
+  (`damage_rate()`. r=거리[ft], theta=ATA)
+
+**시간 게이팅** (대결 서버 규칙, `damage_rate` 에 반영):
+
+| tier | 범위 | 각도 | 계수 | 활성화 |
+|---|---|---|---|---|
+| 1 | 500~3000 ft | ±1° | 1.0·(3000−r)/2500 | 0s~ (항상) |
+| 2 | 500~3500 ft | ±2° | 0.3·(3500−r)/3000 | **100s 부터** |
+| 3 | 500~4000 ft | ±3° | 0.1·(4000−r)/3500 | **150s 부터** |
+
+**delta_t 보정**: 학습 env 의 `update_damage` 는 `계수 × env._delta_t(=1/60)` 를 매 sim
+sub-step 적용하고, RL-step = `step_ratio(=6)` sub-step 이므로 **`DT_PER_STEP = 6/60 =
+0.1 s`** (코드+실측으로 추출). 재구성도 `HP -= rate × 0.1` 로 동일하게 시간적분하므로,
+tier-1 구간에서 **재구성 HP 가 env real HP 와 근접**(검증: 평균차 ≈ 0.044).
+
+### 학습 env 의 시간 게이팅 3-tier damage (`TierGatedDogFightEnv`)
+
+**원본 프레임워크 env**(`single_agent_env.py`)는 `wez` 가 `__init__` 에서 한 번 설정 후
+안 바뀌어 **항상 tier-1 만** 적용합니다(시간 게이팅 없음 — 코드 + 실측으로 확인).
+매뉴얼의 시간 게이팅(tier2 100s, tier3 150s)은 대결 서버 규칙입니다.
+
+그래서 `claude_code/env_utils.py` 의 **`make_env` 는 기본적으로 `TierGatedDogFightEnv`**
+(원본을 상속해 `update_damage` 만 오버라이드)를 사용해, 대결 서버와 동일한 **시간 게이팅
+3-tier damage** 를 학습 env 에 적용합니다(`my_observation.damage_rate` 와 동일 공식).
+`max_engage_time=200s` 라 episode 가 100s/150s 를 넘어 tier-2/3 가 실제로 발생합니다.
+원본 단일-tier 로 비교하려면 `make_env(..., time_gated_damage=False)`.
+
+검증(`verify_tier_damage.py`, 결정론적): tier2 기하(r=3200ft,ATA=1.5°)는 t=50s→0,
+t=120s→0.0005; tier3 기하(r=3800ft,ATA=2.5°)는 t=120s→0, t=160s→0.000095. base env 는
+이 기하에서 항상 0(단일-tier). tier env 값은 공식 × delta_t 와 정확히 일치.
+
+`build_observation` 은 이 재구성값으로 16-D 관측을 만들어, 학습·검증·제출에서 16개
+feature 가 **모두 유효**합니다(기존엔 5개가 추론에서 -1 고정이었음).
+
+HP 누적은 **RL-step 당 정확히 1회** 갱신되어야 하므로(`advance_reconstructor`), 학습은
+`ppo.py`, 추론은 `MLPActionProvider.compute_action` 에서 호출하고 `build_observation`
+은 읽기만 합니다. 따라서 학습·평가·제출의 누적 빈도가 일치합니다(검증: recon 관측
+번들의 학습 중 결정론적 평가 return 과 `evaluate.py` return 이 동일).
+
+**검증 명령**:
+
+```powershell
+D:\other_programs\anaconda3\envs\aip\python.exe claude_code\verify_reconstruction.py
+```
+
+학습 env 실측 결과: 고도 평균오차 ≈ **2.3 m**(7000m 중), 속도 평균오차 ≈ **0.03 m/s**,
+표적 HP 재구성 vs env real HP 평균차 ≈ **0.044** → 위치·자세·속도만으로 거의 정확히
+복원됨(`DT_PER_STEP` 보정으로 tier-1 HP 도 근접). 제출 서버는 시간 게이팅된 3-tier 라
+재구성값이 그쪽과 맞습니다.
+
+> 좌표계 주의: 고도는 학습 NED(D=아래 양수) 기준 `-D` 입니다. 라이브 서버가 z 를
+> "고도(위 양수)"로 준다면 `my_observation.ALT_SIGN` 을 `+1.0` 으로 바꾸세요.
+
+학습:
+```powershell
+D:\other_programs\anaconda3\envs\aip\python.exe claude_code\train.py `
+  --observation-module claude_code.my_observation `
+  --output-name team01 --output-tag recon_v1
+```
 
 ## 2) 로컬 검증
 

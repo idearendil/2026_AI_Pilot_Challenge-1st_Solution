@@ -28,10 +28,12 @@ for _p in (ROOT, ROOT / "src"):
 
 from claude_code.env_utils import make_env, STANDARD_ENV_CONFIG
 from claude_code.model import save_bundle
+from claude_code.parallel import physical_cpu_count
 from claude_code.ppo import PPOConfig, PPOTrainer, IterationStats
 
 
-def _deterministic_eval(model, obs_rms, eval_env, n_episodes: int, device: str) -> tuple[float, float]:
+def _deterministic_eval(model, obs_rms, eval_env, n_episodes: int, device: str,
+                        reconstruct: bool = False) -> tuple[float, float]:
     """현재 정책을 탐험 없이(평균 action) 굴려 평균 return / 길이를 잰다.
 
     환경 초기 상태가 결정적이므로 적은 episode 로도 정책 품질을 대표한다. action 은
@@ -44,9 +46,15 @@ def _deterministic_eval(model, obs_rms, eval_env, n_episodes: int, device: str) 
         n = (np.asarray(o, dtype=np.float64) - obs_rms.mean) / np.sqrt(obs_rms.var + 1e-8)
         return np.clip(n, -10.0, 10.0).astype(np.float32)
 
+    if reconstruct:
+        from claude_code.my_observation import reset_reconstructor, advance_reconstructor
     returns, lengths = [], []
     for ep in range(n_episodes):
+        if reconstruct:
+            reset_reconstructor()
         o, _ = eval_env.reset(seed=100000 + ep)
+        if reconstruct:
+            reset_reconstructor()
         done, ret, steps = False, 0.0, 0
         while not done:
             with torch.no_grad():
@@ -54,6 +62,8 @@ def _deterministic_eval(model, obs_rms, eval_env, n_episodes: int, device: str) 
                     torch.as_tensor(_norm(o), dtype=torch.float32, device=device).unsqueeze(0)
                 ).squeeze(0).cpu().numpy().astype(np.float32)
             o, r, term, trunc, _ = eval_env.step(a)
+            if reconstruct:
+                advance_reconstructor(eval_env._ownship_state, eval_env._target_state)
             ret += float(r)
             steps += 1
             done = term or trunc
@@ -65,13 +75,13 @@ def _deterministic_eval(model, obs_rms, eval_env, n_episodes: int, device: str) 
 def parse_args():
     p = argparse.ArgumentParser(description="claude_code standalone PPO trainer for DogFight 1v1")
     p.add_argument("--iterations", type=int, default=50)
-    p.add_argument("--rollout-steps", type=int, default=2048)
+    p.add_argument("--rollout-steps", type=int, default=100000)
     p.add_argument("--lr", type=float, default=3e-4)
     p.add_argument("--gamma", type=float, default=0.99)
     p.add_argument("--gae-lambda", type=float, default=0.95)
     p.add_argument("--clip-coef", type=float, default=0.2)
-    p.add_argument("--update-epochs", type=int, default=10)
-    p.add_argument("--minibatch-size", type=int, default=256)
+    p.add_argument("--update-epochs", type=int, default=4)
+    p.add_argument("--minibatch-size", type=int, default=512)
     p.add_argument("--ent-coef", type=float, default=0.0)
     p.add_argument("--vf-coef", type=float, default=0.5)
     p.add_argument("--target-kl", type=float, default=0.05)
@@ -81,10 +91,12 @@ def parse_args():
     p.add_argument("--no-normalize-obs", action="store_true", help="관측 정규화 끄기")
     p.add_argument("--no-scale-reward", action="store_true", help="보상 스케일링 끄기")
     p.add_argument("--no-anneal-lr", action="store_true", help="학습률 감쇠 끄기")
-    p.add_argument("--reward-module", default="",
-                   help="보상 모듈 경로. 예: claude_code.my_reward (빈 값이면 기본 보상)")
-    p.add_argument("--observation-module", default="",
-                   help="관측 모듈 경로. 예: claude_code.my_observation (빈 값이면 tactical16)")
+    # 기본값으로 claude_code 의 my_reward / my_observation 을 사용한다.
+    # 프레임워크 기본 보상/관측을 쓰려면 빈 문자열을 넘긴다: --reward-module "" --observation-module ""
+    p.add_argument("--reward-module", default="claude_code.my_reward",
+                   help="보상 모듈 경로 (기본: claude_code.my_reward). 빈 값이면 프레임워크 기본 보상")
+    p.add_argument("--observation-module", default="claude_code.my_observation",
+                   help="관측 모듈 경로 (기본: claude_code.my_observation). 빈 값이면 tactical16")
     p.add_argument("--eval-interval", type=int, default=5,
                    help="결정론적 평가 주기(iter). 최고 성능 정책을 번들로 저장.")
     p.add_argument("--eval-episodes", type=int, default=2)
@@ -95,7 +107,18 @@ def parse_args():
     # 정책 품질과 무관하게 ~-30 에 고정되므로 학습 시연에는 부적합하다.
     # behavior_tree 는 실제 대회형 강한 상대(처음부터 학습은 매우 어려움).
     p.add_argument("--target-mode", default="loiter",
-                   choices=["fixed", "behavior_tree", "loiter", "autopilot"])
+                   choices=["fixed", "behavior_tree", "loiter", "autopilot"],
+                   help="--no-self-play 일 때만 사용하는 스크립트 상대 종류")
+    # 상대를 같은 actor network 로 조종(완전 self-learning). 기본 켜짐.
+    p.add_argument("--self-play", dest="self_play", action="store_true", default=True,
+                   help="상대를 같은 actor network 로 조종 (기본값)")
+    p.add_argument("--no-self-play", dest="self_play", action="store_false",
+                   help="self-play 끄고 --target-mode 스크립트 상대 사용")
+    # Ray 병렬 데이터 수집. 기본 worker 수 = 물리 CPU 코어 수(논리 아님). 1 이면 단일 프로세스.
+    p.add_argument("--num-workers", type=int, default=physical_cpu_count(),
+                   help="Ray rollout worker 수 (기본=물리 코어 수). 1 이면 Ray 미사용")
+    p.add_argument("--device", default="cpu",
+                   help="driver update 디바이스 (큰 모델은 cuda). worker 는 항상 CPU 추론")
     p.add_argument("--output-name", default="team01")
     p.add_argument("--output-tag", default="ppo_mlp_v1")
     p.add_argument("--artifacts-dir", default="artifacts")
@@ -106,11 +129,15 @@ def main():
     args = parse_args()
     hidden = tuple(int(x) for x in args.hidden.split(",") if x.strip())
 
-    env = make_env(
+    env_kwargs = dict(
         overrides={"target_mode": args.target_mode},
         reward_module=args.reward_module,
         observation_module=args.observation_module,
     )
+    env = make_env(**env_kwargs)
+    obs_dim = int(env.observation_space.shape[0])
+    act_dim = int(env.action_space.shape[0])
+    meta_obs_mode = (env.config.get("observation_mode") if args.observation_module else "tactical16")
     print(f"[claude_code/PPO] obs={env.observation_space.shape} act={env.action_space.shape} "
           f"target_mode={args.target_mode} "
           f"reward_module={args.reward_module or '(default)'} "
@@ -134,29 +161,57 @@ def main():
         normalize_obs=not args.no_normalize_obs,
         scale_reward=not args.no_scale_reward,
         anneal_lr=not args.no_anneal_lr,
+        reconstruct_state=(args.observation_module == "claude_code.my_observation"),
         seed=args.seed,
+        device=args.device,
     )
-    trainer = PPOTrainer(env, cfg)
 
-    # 결정론적 평가용 별도 환경 (rollout 환경 상태를 건드리지 않음).
+    # 데이터 수집: num_workers>1 이면 Ray 병렬, 아니면 단일 프로세스.
+    if args.num_workers > 1:
+        from claude_code.parallel import ParallelPPOTrainer
+        env.close()   # driver 는 rollout env 를 step 하지 않음 (worker 가 가짐)
+        trainer = ParallelPPOTrainer(env_kwargs, cfg, args.num_workers,
+                                     args.self_play, obs_dim, act_dim)
+        if args.self_play:
+            print("[claude_code/PPO] 상대 = SELF-PLAY (worker 별 같은 actor network)")
+    else:
+        trainer = PPOTrainer(env, cfg)
+        if args.self_play:
+            from claude_code.self_play import SelfPlayProvider
+            sr = int(STANDARD_ENV_CONFIG["step_ratio"])
+            env._target_action_provider = SelfPlayProvider(
+                trainer.model, trainer.obs_rms, env._observation_fn,
+                env._observation_mode, sr, cfg.device)
+            print("[claude_code/PPO] 상대 = SELF-PLAY (학습 중인 같은 actor network)")
+        else:
+            print(f"[claude_code/PPO] 상대 = 스크립트 target_mode={args.target_mode}")
+
+    # 결정론적 평가용 별도 환경 (driver 에서 단일 실행).
     eval_env = make_env(
         overrides={"target_mode": args.target_mode},
         reward_module=args.reward_module,
         observation_module=args.observation_module,
         runner_index="eval",
     )
+    if args.self_play:
+        from claude_code.self_play import SelfPlayProvider
+        sr = int(STANDARD_ENV_CONFIG["step_ratio"])
+        eval_env._target_action_provider = SelfPlayProvider(
+            trainer.model, trainer.obs_rms, eval_env._observation_fn,
+            eval_env._observation_mode, sr, cfg.device)
 
     bundle_dir = Path(args.artifacts_dir) / "models" / args.output_name / args.output_tag
     base_metadata = {
         "output_name": args.output_name,
         "output_tag": args.output_tag,
         "target_mode": args.target_mode,
+        "self_play": bool(args.self_play),
         "train_iterations": args.iterations,
         # 추론(submission/evaluate)이 동일 관측을 만들기 위해 모듈 경로를 기록.
         "reward_module": args.reward_module,
         "observation_module": args.observation_module,
-        "observation_mode": (env.config.get("observation_mode")
-                             if args.observation_module else "tactical16"),
+        "observation_mode": meta_obs_mode,
+        "num_workers": args.num_workers,
         "env_config": {k: STANDARD_ENV_CONFIG[k] for k in
                        ("step_ratio", "max_engage_time", "episode_step_limit")},
     }
@@ -201,7 +256,8 @@ def main():
         is_last = s.iteration == args.iterations
         if args.eval_interval > 0 and (s.iteration % args.eval_interval == 0 or is_last):
             eval_ret, eval_len = _deterministic_eval(
-                trainer.model, trainer.obs_rms, eval_env, args.eval_episodes, cfg.device
+                trainer.model, trainer.obs_rms, eval_env, args.eval_episodes, cfg.device,
+                reconstruct=cfg.reconstruct_state,
             )
             improved = eval_ret > best["return"]
             if improved:
@@ -224,6 +280,8 @@ def main():
         log_file.close()
         env.close()
         eval_env.close()
+        if hasattr(trainer, "close"):
+            trainer.close()   # Ray shutdown (병렬 모드)
 
     if not best["saved"]:
         # 평가가 한 번도 수행되지 않은 경우(eval_interval<=0) 최종 정책 저장.

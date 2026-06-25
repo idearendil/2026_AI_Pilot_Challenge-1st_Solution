@@ -20,6 +20,24 @@ from claude_code.normalizers import RunningMeanStd, RewardScaler
 OBS_CLIP = 10.0
 
 
+def compute_gae(rewards, values, dones, last_value, last_done, gamma, gae_lambda):
+    """GAE advantage / return 계산 (단일/병렬 수집 공용)."""
+    T = len(rewards)
+    adv = np.zeros(T, dtype=np.float32)
+    last_gae = 0.0
+    for t in reversed(range(T)):
+        if t == T - 1:
+            next_nonterminal = 1.0 - float(last_done)
+            next_value = last_value
+        else:
+            next_nonterminal = 1.0 - dones[t + 1]
+            next_value = values[t + 1]
+        delta = rewards[t] + gamma * next_value * next_nonterminal - values[t]
+        last_gae = delta + gamma * gae_lambda * next_nonterminal * last_gae
+        adv[t] = last_gae
+    return adv, adv + values
+
+
 @dataclass
 class PPOConfig:
     total_iterations: int = 50
@@ -40,6 +58,7 @@ class PPOConfig:
     normalize_obs: bool = True          # 관측 running mean/std 정규화
     scale_reward: bool = True           # 할인 누적 보상 std 로 보상 스케일링
     anneal_lr: bool = True              # 학습률 선형 감쇠
+    reconstruct_state: bool = False     # claude_code.my_observation HP 재구성 갱신
     seed: int = 0
     device: str = "cpu"
 
@@ -85,8 +104,18 @@ class PPOTrainer:
         self.obs_rms = RunningMeanStd(shape=(obs_dim,)) if config.normalize_obs else None
         self.reward_scaler = RewardScaler(config.gamma) if config.scale_reward else None
 
+        # 상태 재구성 (HP 누적) 갱신 함수 (claude_code.my_observation 사용 시)
+        self._reset_recon = self._advance_recon = None
+        if config.reconstruct_state:
+            from claude_code.my_observation import reset_reconstructor, advance_reconstructor
+            self._reset_recon = reset_reconstructor
+            self._advance_recon = advance_reconstructor
+            self._reset_recon()
+
         # rollout 가로지르며 유지되는 환경 상태
         obs, _ = env.reset(seed=config.seed)
+        if self._reset_recon is not None:
+            self._reset_recon()
         self._next_obs = np.asarray(obs, dtype=np.float32)
         self._next_done = False
         self._ep_return = 0.0
@@ -133,6 +162,10 @@ class PPOTrainer:
 
             next_obs, reward, terminated, truncated, info = self.env.step(action_np)
             done = bool(terminated or truncated)
+            # HP 재구성 갱신: 이번 RL-step 결과 state 로 1회 advance (obs 는 step 안에서
+            # advance 전 HP 를 읽었으므로 추론 경로와 동일한 1-step lag).
+            if self._advance_recon is not None:
+                self._advance_recon(self.env._ownship_state, self.env._target_state)
             self.global_step += 1
             self._ep_return += float(reward)   # 로깅용 raw return
             self._ep_len += 1
@@ -151,6 +184,9 @@ class PPOTrainer:
                     ep_components.append(dict(comp))
                 self._ep_return = 0.0
                 self._ep_len = 0
+                # 새 에피소드 전에 HP=1 로 리셋 → env.reset 의 관측이 올바른 HP 로 빌드됨.
+                if self._reset_recon is not None:
+                    self._reset_recon()
                 next_obs, _ = self.env.reset()
 
             self._next_obs = np.asarray(next_obs, dtype=np.float32)
@@ -180,22 +216,8 @@ class PPOTrainer:
         return batch, ep_returns, ep_lengths, ep_components
 
     def _compute_gae(self, rewards, values, dones, last_value, last_done):
-        cfg = self.cfg
-        T = len(rewards)
-        adv = np.zeros(T, dtype=np.float32)
-        last_gae = 0.0
-        for t in reversed(range(T)):
-            if t == T - 1:
-                next_nonterminal = 1.0 - float(last_done)
-                next_value = last_value
-            else:
-                next_nonterminal = 1.0 - dones[t + 1]
-                next_value = values[t + 1]
-            delta = rewards[t] + cfg.gamma * next_value * next_nonterminal - values[t]
-            last_gae = delta + cfg.gamma * cfg.gae_lambda * next_nonterminal * last_gae
-            adv[t] = last_gae
-        returns = adv + values
-        return adv, returns
+        return compute_gae(rewards, values, dones, last_value, last_done,
+                           self.cfg.gamma, self.cfg.gae_lambda)
 
     # ── 정책 업데이트 ────────────────────────────────────────────────────────
     def update(self, batch):
@@ -303,4 +325,4 @@ class PPOTrainer:
         return history
 
 
-__all__ = ["PPOConfig", "PPOTrainer", "IterationStats"]
+__all__ = ["PPOConfig", "PPOTrainer", "IterationStats", "compute_gae"]

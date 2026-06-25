@@ -29,12 +29,26 @@ class MLPActionProvider(ActionProvider):
         self.obs_dim = int(self.metadata.get("observation_size", 16))
         # 학습 때와 동일한 관측 정규화 적용 (없으면 항등).
         self._normalize_obs = make_obs_normalizer(self.metadata.get("obs_normalization"))
+        # claude_code.my_observation 을 쓴 번들이면 HP/damage 재구성을 RL-step 당 1회
+        # 갱신한다 (다른 관측 모듈에는 영향 없음).
+        self._reconstruct = self.metadata.get("observation_module") == "claude_code.my_observation"
+        if self._reconstruct:
+            from claude_code.my_observation import reset_reconstructor, advance_reconstructor
+            self._reset_recon = reset_reconstructor
+            self._advance_recon = advance_reconstructor
 
     def reset(self, context: ActionContext | None = None) -> None:
         # MLP 정책은 recurrent state 가 없으므로 reset 시 별도 처리 불필요.
-        return None
+        if self._reconstruct:
+            self._reset_recon()
 
     def compute_action(self, context: ActionContext) -> ActionResult:
+        # HP/damage 재구성을 RL-step 당 1회 갱신 (관측 빌드 전에 호출되어도 1-step lag 로
+        # 학습 경로와 동일). context 에 양측 state 가 채워져 있을 때만.
+        if (self._reconstruct and context.ownship_state is not None
+                and context.target_state is not None):
+            self._advance_recon(context.ownship_state, context.target_state)
+
         observation = context.observation
         if observation is None:
             raise ValueError(
