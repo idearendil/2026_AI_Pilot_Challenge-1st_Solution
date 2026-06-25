@@ -1,0 +1,132 @@
+[
+  {
+    "path": "RLLibLstm\\manifest.json",
+    "sha256": "d49280741ae9d4a71b0b4f981f6a0cdc265d5df622724ebbbbfb9bb16dfb621e",
+    "bytes": 5071
+  },
+  {
+    "path": "RLLibLstm\\patch_record.json",
+    "sha256": "90ff5357aaa855470ccc13d05bd9f9d341ac44670f8f7e7c119e48ae1a252556",
+    "bytes": 4539
+  },
+  {
+    "path": "RLLibLstm\\ray_2_54_0_original\\ray\\rllib\\algorithms\\sac\\default_sac_rl_module.py",
+    "sha256": "91a84a252b58823d7330cfa72d601f88674d3dec436c4c9e9b7b17ccf2af38ab",
+    "bytes": 5618
+  },
+  {
+    "path": "RLLibLstm\\ray_2_54_0_original\\ray\\rllib\\algorithms\\sac\\sac_catalog.py",
+    "sha256": "826b335c22767cfa2fe974965aa9cd1c8758aae28dac4d10e7cd2be5545d6bb4",
+    "bytes": 12378
+  },
+  {
+    "path": "RLLibLstm\\ray_2_54_0_original\\ray\\rllib\\algorithms\\sac\\torch\\default_sac_torch_rl_module.py",
+    "sha256": "044dfda71fb3476a50967ad27bdea12b7a78a2923dc82da3be8fbe53d272b08e",
+    "bytes": 11509
+  },
+  {
+    "path": "RLLibLstm\\ray_2_54_0_original\\ray\\rllib\\algorithms\\sac\\torch\\sac_torch_learner.py",
+    "sha256": "48c7d51ad9e0b75f237b2c6161cc07f1a2de85a8602e965cd7500301be2e2384",
+    "bytes": 17589
+  },
+  {
+    "path": "RLLibLstm\\ray_2_54_0_original\\ray\\rllib\\utils\\replay_buffers\\prioritized_episode_buffer.py",
+    "sha256": "68e33f30295749303ea21a3422c7f9182a5a29ad107d422452bb028c88ffdaa0",
+    "bytes": 33219
+  },
+  {
+    "path": "RLLibLstm\\ray_2_54_0_original\\ray\\rllib\\utils\\replay_buffers\\utils.py",
+    "sha256": "a4444ddaf6372e36e0058199d7935c6f1cfbf31db588f53b0c96f4a018c4679c",
+    "bytes": 18038
+  },
+  {
+    "path": "RLLibLstm\\ray_2_54_0_patched\\ray\\rllib\\algorithms\\sac\\default_sac_rl_module.py",
+    "sha256": "e82bb129206c8b85717d0594b8284b8e02a84209b04ac687983a20bcca5ba61a",
+    "bytes": 5978
+  },
+  {
+    "path": "RLLibLstm\\ray_2_54_0_patched\\ray\\rllib\\algorithms\\sac\\sac_catalog.py",
+    "sha256": "3de9116fa7fa30299d5b9b7bb7231a41571210fca73a8e33d47078408db9abcd",
+    "bytes": 17607
+  },
+  {
+    "path": "RLLibLstm\\ray_2_54_0_patched\\ray\\rllib\\algorithms\\sac\\torch\\default_sac_torch_rl_module.py",
+    "sha256": "e9362adbc3543f362798b3c2a93933704540aee11fbdbb667092c623a89b64b6",
+    "bytes": 19609
+  },
+  {
+    "path": "RLLibLstm\\ray_2_54_0_patched\\ray\\rllib\\algorithms\\sac\\torch\\sac_torch_learner.py",
+    "sha256": "57eea79f39d71c9a21f76588ffcd0cac7b79607f8068844cea046aceaa78a87f",
+    "bytes": 19082
+  },
+  {
+    "path": "RLLibLstm\\ray_2_54_0_patched\\ray\\rllib\\utils\\replay_buffers\\prioritized_episode_buffer.py",
+    "sha256": "025e29b94003ab43e6e59d733d450fd5ee577c678f2c3af2b74518cd1b002d00",
+    "bytes": 41199
+  },
+  {
+    "path": "RLLibLstm\\ray_2_54_0_patched\\ray\\rllib\\utils\\replay_buffers\\utils.py",
+    "sha256": "a4444ddaf6372e36e0058199d7935c6f1cfbf31db588f53b0c96f4a018c4679c",
+    "bytes": 18038
+  },
+  {
+    "path": "RLLibLstm\\README.md",
+    "sha256": "a29efd9199d86609ba5332ee5bedac09ebd701973683b5bde9dac95093ae1a66",
+    "bytes": 13712
+  },
+  {
+    "path": "RLLibLstm\\SAC_LSTM_FULL_GUIDE.md",
+    "sha256": "ac6537fd3fe7a8c05b64365ff8f3514ee344d154657362dac7dddedaa55eb9a4",
+    "bytes": 39400
+  },
+  {
+    "path": "RLLibLstm\\tools\\analyze_lstm_smoke_log.py",
+    "sha256": "f1d9d82fef96d1d2baaab71378707733ece9b4d1a2ae32b2685b1eb7643061fc",
+    "bytes": 13816
+  },
+  {
+    "path": "RLLibLstm\\tools\\apply_rllib_sac_lstm_patch.py",
+    "sha256": "28424906492b2b9a2d3a5df6dcc5f57e6c9678aac4cc1ff849463d8a6f44387b",
+    "bytes": 10456
+  },
+  {
+    "path": "RLLibLstm\\tools\\compare_lstm_replay_training_logs.py",
+    "sha256": "a95d13db30c28a71fbc24cc122237704638599adca2a5258c8a423294104af4c",
+    "bytes": 2665
+  },
+  {
+    "path": "RLLibLstm\\tools\\smoke_build_algorithm_from_bundle_lstm.py",
+    "sha256": "b4a551cf1de81c8f2ba9e505af2fdae7131efa2d676c0611d873df5f5fe4d514",
+    "bytes": 3457
+  },
+  {
+    "path": "RLLibLstm\\tools\\smoke_prioritized_sequence_replay.py",
+    "sha256": "8be34cb5770b88da811f6ebb6570f6713669186a432f9a73a56ff2faa0b3f10e",
+    "bytes": 4646
+  },
+  {
+    "path": "RLLibLstm\\tools\\smoke_rl_action_provider_lstm_bundle.py",
+    "sha256": "29e64fecffde7b8acb4d4e2556901474fff12ddea71007367c5b710afd000f16",
+    "bytes": 5799
+  },
+  {
+    "path": "RLLibLstm\\tools\\smoke_sac_lstm_actor_critic_module_forward.py",
+    "sha256": "bf2dfc928c961c41038f50c7915da18a05e4e38c11e7f32a339fb954796e82f3",
+    "bytes": 5445
+  },
+  {
+    "path": "RLLibLstm\\tools\\smoke_sac_lstm_module_forward.py",
+    "sha256": "0c739ed3b78d73b673ed11a93b4411699f5f4ccc3469638db64fbb89ae46333e",
+    "bytes": 3495
+  },
+  {
+    "path": "RLLibLstm\\tools\\smoke_unreal_policy_lstm_reset.py",
+    "sha256": "0334b7073b8e93690e7ff486945f287c80514d0ce017afa19c185c883aa4bd1d",
+    "bytes": 2560
+  },
+  {
+    "path": "RLLibLstm\\tools\\verify_prioritized_sequence_replay_integrity.py",
+    "sha256": "ab84b42ee3be1fbe946a8f7cdf0e992bca50040f6570aecd7ea636a7f5b9779c",
+    "bytes": 8723
+  }
+]

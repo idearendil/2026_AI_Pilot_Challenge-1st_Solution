@@ -1,0 +1,97 @@
+# Student mixed initial_scenario example: SAC + MLP
+#
+# 이 예시는 reset마다 target type을 섞는 initial_scenario 작성법을 보여준다.
+# - scenario index 0-4: behavior_tree target
+# - scenario index 5-7: loiter target
+# - 시작 target_mode는 behavior_tree로 둔다. reset 때 선택된 index가 5-7이면
+#   환경이 target_mode를 loiter로 전환한다.
+
+name: student_mixed_initial_sac_mlp
+script: train_rllib
+
+output:
+  name: team01
+  tag: mixed_initial_sac_mlp_v1
+
+env:
+  observation_mode: tactical16
+  target_mode: behavior_tree
+  target_behavior_dll: AIP_BASE_target.dll
+  # reward_module: student.my_reward
+  max_engage_time: 300.0
+  episode_step_limit: 18000
+
+env_config:
+  step_ratio: 6
+  initial_scenario:
+    mode: ref_old_random
+    legacy_use_random_scenario: true
+    legacy_use_first_scenario_only: false
+    legacy_scenario_indices: [0, 1, 2, 3, 4, 5, 6, 7]
+    legacy_randomization:
+      aircraft_radius_m: 100.0
+      roll_deg: 5.0
+      pitch_deg: 5.0
+      heading_deg: 5.0
+      shared_n_m: 4000.0
+      shared_e_m: 4000.0
+      shared_d_m: 4000.0
+      target_distance_n_m: 300.0
+      speed_mps: 50.0
+      loiter_bank_deg_range: [40.0, 70.0]
+  reward:
+    mode: default
+    step_penalty: -0.01
+    damage_scale: 20.0
+    pursuit_scale: 0.3
+    low_altitude_penalty: 0.1
+    win_reward: 100.0
+    loss_reward: -100.0
+    draw_reward: -30.0
+
+algo:
+  name: sac
+  framework: torch
+  lr: 3.0e-4
+  gamma: 0.99
+  train_batch_size: 256
+  minibatch_size: 256
+  tau: 0.005
+  target_entropy: auto
+  replay_buffer_capacity: 10000
+  mlp:
+    enabled: true
+    fcnet_hiddens: [256, 256]
+    fcnet_activation: relu
+    head_fcnet_hiddens: []
+    head_fcnet_activation: relu
+
+runtime:
+  iterations: 50
+  num_env_runners: 1
+  num_envs_per_env_runner: 1
+  rollout_fragment_length: auto
+  batch_mode: truncate_episodes
+  save_lightweight_bundle: true
+  lightweight_bundle_frequency: 0
+  save_native_checkpoint: false
+  native_checkpoint_frequency: 0
+
+dashboard:
+  enabled: true
+  logdir: artifacts/dashboard
+
+policy_probe:
+  enabled: true
+  interval: 10
+  steps: 4
+  print: true
+
+engagement_log:
+  enabled: false
+  interval: 10
+  steps: 600
+  episodes: 1
+  print: true
+
+notes: "Mixed initial_scenario SAC MLP example. Indices 0-4 use BT target; 5-7 use loiter target."

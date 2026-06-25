@@ -1,0 +1,116 @@
+# Student mixed initial_scenario example: SAC + LSTM
+#
+# SAC LSTM은 RLLibLstm 패치가 적용된 Ray/RLlib 환경에서 사용한다.
+# 혼합 시나리오 계약은 student_mixed_initial_sac_mlp.yaml과 동일하다.
+
+name: student_mixed_initial_sac_lstm
+script: train_rllib
+
+output:
+  name: team01
+  tag: mixed_initial_sac_lstm_v1
+
+env:
+  observation_mode: tactical16
+  target_mode: behavior_tree
+  target_behavior_dll: AIP_BASE_target.dll
+  # reward_module: student.my_reward
+  max_engage_time: 300.0
+  episode_step_limit: 18000
+
+env_config:
+  step_ratio: 6
+  initial_scenario:
+    mode: ref_old_random
+    legacy_use_random_scenario: true
+    legacy_use_first_scenario_only: false
+    legacy_scenario_indices: [0, 1, 2, 3, 4, 5, 6, 7]
+    legacy_randomization:
+      aircraft_radius_m: 100.0
+      roll_deg: 5.0
+      pitch_deg: 5.0
+      heading_deg: 5.0
+      shared_n_m: 4000.0
+      shared_e_m: 4000.0
+      shared_d_m: 4000.0
+      target_distance_n_m: 300.0
+      speed_mps: 50.0
+      loiter_bank_deg_range: [40.0, 70.0]
+  reward:
+    mode: default
+    step_penalty: -0.01
+    damage_scale: 20.0
+    pursuit_scale: 0.3
+    low_altitude_penalty: 0.1
+    win_reward: 100.0
+    loss_reward: -100.0
+    draw_reward: -30.0
+
+algo:
+  name: sac
+  framework: torch
+  lr: 3.0e-4
+  gamma: 0.99
+  train_batch_size: 64
+  minibatch_size: 64
+  tau: 0.005
+  target_entropy: auto
+  replay_buffer_capacity: 10000
+  lstm:
+    enabled: true
+    scope: actor_critic
+    cell_size: 64
+    max_seq_len: 8
+    debug_io: false
+  network:
+    type: sequence_v1
+    actor:
+      encoder:
+        - linear: {out: 128}
+        - activation: relu
+        - lstm: {hidden: 64, layers: 1}
+        - linear: {out: 128}
+        - activation: relu
+      head:
+        - linear: {out: action_dist_inputs}
+    critic:
+      input: obs_action
+      zero_init_state: true
+      encoder:
+        - linear: {out: 128}
+        - activation: relu
+        - lstm: {hidden: 64, layers: 1}
+        - linear: {out: 128}
+        - activation: relu
+      head:
+        - linear: {out: q_value}
+
+runtime:
+  iterations: 50
+  num_env_runners: 1
+  num_envs_per_env_runner: 1
+  rollout_fragment_length: 8
+  batch_mode: truncate_episodes
+  save_lightweight_bundle: true
+  lightweight_bundle_frequency: 0
+  save_native_checkpoint: false
+  native_checkpoint_frequency: 0
+
+dashboard:
+  enabled: true
+  logdir: artifacts/dashboard
+
+policy_probe:
+  enabled: true
+  interval: 10
+  steps: 4
+  print: true
+
+engagement_log:
+  enabled: true
+  interval: 10
+  steps: 600
+  episodes: 1
+  print: true
+
+notes: "Mixed initial_scenario SAC LSTM example. Indices 0-4 use BT target; 5-7 use loiter target."

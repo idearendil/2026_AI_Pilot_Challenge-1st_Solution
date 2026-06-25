@@ -1,0 +1,37 @@
+<root main_tree_to_execute = "MainTree">
+
+
+  <BehaviorTree ID="MainTree">
+    <Sequence>
+       
+        <!-- EF 부분 트리-->
+        <Sequence>
+          <SelectTarget name="SelectTarget" BB="{BB}"/>
+          <DirectionVectorUpdate name="DirectionVectorUpdate" BB="{BB}"/>
+          <DistanceUpdate name="DistanceUpdateService" BB="{BB}"/>
+          <CheckSight name="CheckSight" BB="{BB}"/>          
+          <AngleOffUpdate name="AngleOffUpdate" BB="{BB}"/>
+          <AspectAngleUpdate name="AspectAngleUpdate" BB="{BB}"/>
+
+          <Fallback>
+
+            <Sequence>
+              <DECO_DistanceCheck name="DistanceCheck" UpDown="Greater"  Distance="2000" BB="{BB}"/>
+              <Task_Empty name="Task_Empty" BB="{BB}"/>
+            </Sequence>
+
+            <Sequence>
+              <DECO_DistanceCheck name="DistanceCheck" UpDown="Less"  Distance="2000" BB="{BB}"/>
+              <Task_Empty name="Task_Empty" BB="{BB}"/>
+            </Sequence>
+
+          </Fallback>
+
+        </Sequence>
+        
+        
+    </Sequence>
+  </BehaviorTree>
+
+
+</root>

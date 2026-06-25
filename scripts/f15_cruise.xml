@@ -1,0 +1,10 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<?xml-stylesheet type="text/xsl" href="http://jsbsim.sf.net/JSBSimScript.xsl"?>
+<runscript xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="http://jsbsim.sf.net/JSBSimScript.xsd" name="Cruise flight in f15.">
+  <description>
+    This is a very simple script that trims the aircraft with running
+    engines at altitude and runs out to 100 seconds. Some state data
+    is printed out at ten second intervals. 
+  </description>
+  <use aircraft="f15" initialize="f15_init" />
+</runscript>

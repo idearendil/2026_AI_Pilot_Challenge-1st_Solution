@@ -1,0 +1,83 @@
+# Student PPO MLP template
+#
+# PPO는 on-policy 알고리즘이다. replay buffer를 쓰지 않고, rollout batch 품질과
+# train_batch_size/minibatch_size 조합이 중요하다.
+
+name: student_ppo_mlp
+script: train_rllib
+
+output:
+  name: team01
+  tag: ppo_mlp_v1
+
+# 1) 시나리오 선택 + 4) 개인 관측/보상 hook
+env:
+  observation_mode: tactical16
+  # observation_mode: custom
+  # observation_module: student.my_observation
+  target_mode: fixed
+  target_behavior_dll: AIP_BASE_target.dll
+  # reward_module: student.my_reward
+  max_engage_time: 60.0
+  episode_step_limit: 3600
+
+env_config:
+  step_ratio: 6
+  reward:
+    mode: default
+    step_penalty: -0.01
+    damage_scale: 20.0
+    pursuit_scale: 0.3
+    low_altitude_penalty: 0.1
+    win_reward: 100.0
+    loss_reward: -100.0
+    draw_reward: -30.0
+
+# 2) 알고리즘 + 3) 하이퍼파라미터 + 5) MLP 신경망
+algo:
+  name: ppo
+  framework: torch
+  lr: 3.0e-4
+  gamma: 0.99
+  train_batch_size: 1024
+  minibatch_size: 128
+  gae_lambda: 0.95
+  clip_param: 0.2
+  mlp:
+    enabled: true
+    fcnet_hiddens: [256, 256]
+    fcnet_activation: relu
+    head_fcnet_hiddens: []
+    head_fcnet_activation: relu
+    vf_share_layers: true
+
+runtime:
+  iterations: 50
+  num_env_runners: 1
+  num_envs_per_env_runner: 1
+  rollout_fragment_length: auto
+  batch_mode: truncate_episodes
+  save_lightweight_bundle: true
+  lightweight_bundle_frequency: 0
+  save_native_checkpoint: false
+  native_checkpoint_frequency: 0
+
+# 6) 로그 설정
+dashboard:
+  enabled: true
+  logdir: artifacts/dashboard
+
+policy_probe:
+  enabled: true
+  interval: 10
+  steps: 4
+  print: true
+
+engagement_log:
+  enabled: false
+  interval: 10
+  steps: 600
+  episodes: 1
+  print: true
+
+notes: "Student PPO MLP baseline."

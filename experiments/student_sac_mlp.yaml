@@ -1,0 +1,115 @@
+# Student SAC MLP template
+#
+# 실행:
+#   python scripts\run_experiment.py experiments\student_sac_mlp.yaml
+# dry-run:
+#   python scripts\run_experiment.py experiments\student_sac_mlp.yaml --dry-run
+
+name: student_sac_mlp
+script: train_rllib
+
+# 0) 출력 이름
+# - output.name: 팀 이름 또는 실험 그룹 이름
+# - output.tag: 모델/로그 저장 하위 이름
+output:
+  name: test_mlp
+  tag: sac_mlp_v1
+
+# 1) 시나리오 선택
+# - observation_mode: classic12 | relative14 | tactical16 | custom
+# - custom 관측을 쓰려면 observation_mode: custom + observation_module 사용
+# - target_mode: fixed | loiter | autopilot | behavior_tree
+# - behavior_tree는 target_behavior_dll 필요
+env:
+  observation_mode: tactical16
+  # observation_module: student.my_observation
+  target_mode: behavior_tree
+  target_behavior_dll: AIP_BASE_target.dll
+  # reward_module: student.my_reward
+  max_engage_time: 60.0
+  episode_step_limit: 3600
+
+# 1+) 세부 환경 설정
+# - train_rllib.py는 experiment-yaml의 env_config를 env 기본값에 병합한다.
+# - target_loiter/autopilot, reward, wez, initial_scenario 같은 세부 값을 여기서 조정한다.
+env_config:
+  step_ratio: 6
+  wez:
+    angle_deg: 2.0
+    min_range_m: 152.4
+    max_range_m: 914.4
+  # target_mode: loiter일 때 사용
+  target_loiter:
+    enabled: true
+    bank: 30.0
+    pitch: 0.0
+  # target_mode: autopilot일 때 사용
+  target_autopilot:
+    heading_cmd: 180.0
+    altitude_cmd: 7000.0
+    speed_cmd: 250.0
+  # 기본 보상 스케일. 개인 보상은 env.reward_module: student.my_reward 사용.
+  reward:
+    mode: default
+    step_penalty: -0.01
+    damage_scale: 20.0
+    pursuit_scale: 0.3
+    low_altitude_penalty: 0.1
+    win_reward: 100.0
+    loss_reward: -100.0
+    draw_reward: -30.0
+
+# 2) 학습 알고리즘 선택 + 3) 하이퍼파라미터 조정 + 5) 신경망 선택
+# - SAC는 off-policy라 replay buffer를 사용한다.
+# - MLP 구조는 algo.mlp에서 조정한다.
+algo:
+  name: sac
+  framework: torch
+  lr: 3.0e-4
+  gamma: 0.99
+  train_batch_size: 256
+  minibatch_size: 256
+  tau: 0.005
+  target_entropy: auto
+  replay_buffer_capacity: 10000
+  mlp:
+    enabled: true
+    fcnet_hiddens: [256, 256]
+    fcnet_activation: relu
+    head_fcnet_hiddens: []
+    head_fcnet_activation: relu
+
+# 학습 실행 설정
+runtime:
+  iterations: 50
+  num_env_runners: 1
+  num_envs_per_env_runner: 1
+  rollout_fragment_length: auto
+  batch_mode: truncate_episodes
+  save_lightweight_bundle: true
+  lightweight_bundle_frequency: 5
+  save_native_checkpoint: true
+  native_checkpoint_frequency: 25
+  # 학습 재개:
+  # restore_checkpoint: artifacts/checkpoints/team01/sac_mlp_v1/checkpoint_000010
+  # init_bundle: artifacts/models/team01/sac_mlp_v1
+
+# 6) 로그 남기는 설정
+dashboard:
+  enabled: true
+  logdir: artifacts/dashboard
+
+policy_probe:
+  enabled: true
+  interval: 10
+  steps: 4
+  print: true
+
+engagement_log:
+  enabled: false
+  interval: 10
+  steps: 600
+  episodes: 1
+  print: true
+
+notes: "Student SAC MLP baseline. Edit env/algo/runtime/log sections for experiments."

@@ -1,0 +1,116 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>DogFight Dashboard</title>
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+  <header class="app-header">
+    <div class="brand">DogFight Dashboard</div>
+    <nav class="tabs" aria-label="Dashboard tabs">
+      <button id="tab-training" class="tab-button active" type="button" data-tab="training">Training</button>
+      <button id="tab-replay" class="tab-button" type="button" data-tab="replay">Replay</button>
+    </nav>
+    <span id="app-status" class="app-status">Starting...</span>
+  </header>
+
+  <main>
+    <section id="training-panel" class="tab-panel active" aria-labelledby="tab-training">
+      <header class="training-toolbar">
+        <select id="run-select" aria-label="Training run"></select>
+        <button id="compare-button" type="button">Compare</button>
+        <label class="smooth">
+          <span>EMA</span>
+          <input id="smooth-slider" type="range" min="1" max="50" value="8">
+          <span id="smooth-value">8</span>
+        </label>
+        <span id="status-text">Connecting...</span>
+      </header>
+
+      <section id="cards" class="cards"></section>
+
+      <div class="training-layout">
+        <aside class="training-sidebar">
+          <div class="section-title">Runs</div>
+          <div id="run-list" class="run-list"></div>
+          <div class="section-title">Config</div>
+          <pre id="config-box" class="config-box"></pre>
+          <div class="section-title">Metrics</div>
+          <div id="metric-box" class="metric-box"></div>
+        </aside>
+        <main id="chart-grid" class="chart-grid"></main>
+      </div>
+    </section>
+
+    <section id="replay-panel" class="tab-panel" aria-labelledby="tab-replay">
+      <header class="replay-toolbar">
+        <select id="log-select" aria-label="Replay log"></select>
+        <button id="reload-button" type="button" title="Reload logs">Reload</button>
+        <button id="play-button" type="button" title="Play or pause">Pause</button>
+        <label class="speed-control">
+          <span>Speed</span>
+          <input id="speed-slider" type="range" min="0" max="20" step="0.5" value="5">
+          <span id="speed-value">5.0x</span>
+        </label>
+        <span id="replay-status-text">Loading...</span>
+      </header>
+
+      <div class="viewer-shell">
+        <section class="scene-panel">
+          <div id="scene-root" class="scene-root"></div>
+          <div id="hud-left" class="hud hud-left"></div>
+          <div id="hud-right" class="hud hud-right"></div>
+          <div id="hud-bottom" class="hud hud-bottom"></div>
+        </section>
+
+        <aside class="side-panel">
+          <div class="section-title">Display</div>
+          <label class="toggle"><input id="toggle-hud" type="checkbox" checked> HUD</label>
+          <label class="toggle"><input id="toggle-sea" type="checkbox" checked> Sea</label>
+          <label class="toggle"><input id="toggle-trails" type="checkbox" checked> Trails</label>
+          <label class="toggle"><input id="toggle-wez" type="checkbox" checked> WEZ</label>
+
+          <div class="section-title">View</div>
+          <div class="camera-mode-group" role="group" aria-label="Camera follow mode">
+            <button class="camera-mode-button" type="button" data-camera-mode="blue">Blue</button>
+            <button class="camera-mode-button" type="button" data-camera-mode="red">Red</button>
+            <button class="camera-mode-button" type="button" data-camera-mode="midpoint">Center</button>
+          </div>
+
+          <div class="section-title">Replay</div>
+          <input id="timeline" class="timeline" type="range" min="0" max="1" step="0.001" value="0">
+          <div class="readout-grid">
+            <span>Time</span><strong id="time-readout">0.00s</strong>
+            <span>Range</span><strong id="range-readout">n/a</strong>
+            <span>Closure</span><strong id="closure-readout">n/a</strong>
+            <span>Rel Alt</span><strong id="relalt-readout">n/a</strong>
+          </div>
+
+          <div class="section-title">Logs</div>
+          <pre id="log-info" class="log-info"></pre>
+
+          <div class="section-title">Debug</div>
+          <div class="debug-grid">
+            <span>WebGL</span><strong id="debug-webgl">n/a</strong>
+            <span>Frames</span><strong id="debug-frames">0</strong>
+            <span>Samples</span><strong id="debug-samples">0</strong>
+          </div>
+        </aside>
+      </div>
+    </section>
+  </main>
+
+  <div id="modal" class="modal" hidden>
+    <div class="modal-panel">
+      <button id="modal-close" class="modal-close" type="button">x</button>
+      <div id="modal-title" class="modal-title"></div>
+      <canvas id="modal-canvas"></canvas>
+      <div id="modal-legend" class="chart-legend modal-legend"></div>
+    </div>
+  </div>
+
+  <script type="module" src="/app.js"></script>
+</body>
+</html>

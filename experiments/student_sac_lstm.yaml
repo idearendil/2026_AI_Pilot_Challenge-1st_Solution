@@ -1,0 +1,117 @@
+# Student SAC LSTM template
+#
+# 주의:
+# - SAC LSTM은 RLLibLstm 패치가 적용된 Ray/RLlib 환경에서 사용한다.
+# - actor_only: actor만 LSTM, Q는 MLP
+# - actor_critic: actor/Q/twin/target Q 모두 recurrent Q 계약 사용
+
+name: student_sac_lstm
+script: train_rllib
+
+output:
+  name: team01
+  tag: sac_lstm_actor_critic_v1
+
+# 1) 시나리오 선택
+env:
+  observation_mode: tactical16
+  # observation_mode: custom
+  # observation_module: student.my_observation
+  target_mode: fixed
+  target_behavior_dll: AIP_BASE_target.dll
+  # 4) 개인 보상 설정: student/my_reward.py를 수정한 뒤 아래 줄 활성화
+  # reward_module: student.my_reward
+  max_engage_time: 60.0
+  episode_step_limit: 3600
+
+env_config:
+  step_ratio: 6
+  wez:
+    angle_deg: 2.0
+    min_range_m: 152.4
+    max_range_m: 914.4
+  reward:
+    mode: default
+    step_penalty: -0.01
+    damage_scale: 20.0
+    pursuit_scale: 0.3
+    low_altitude_penalty: 0.1
+    win_reward: 100.0
+    loss_reward: -100.0
+    draw_reward: -30.0
+
+# 2) 알고리즘 + 3) 하이퍼파라미터 + 5) 신경망
+algo:
+  name: sac
+  framework: torch
+  lr: 3.0e-4
+  gamma: 0.99
+  train_batch_size: 64
+  minibatch_size: 64
+  tau: 0.005
+  target_entropy: auto
+  replay_buffer_capacity: 10000
+  lstm:
+    enabled: true
+    scope: actor_critic  # actor_only | actor_critic
+    cell_size: 64
+    max_seq_len: 8
+    debug_io: false
+    # prioritized_replay: true  # 패치 검증 후 opt-in
+  # 자유 신경망 설계. actor/critic encoder와 head layer를 순서대로 작성한다.
+  network:
+    type: sequence_v1
+    actor:
+      encoder:
+        - linear: {out: 128}
+        - activation: relu
+        - lstm: {hidden: 64, layers: 1}
+        - linear: {out: 128}
+        - activation: relu
+      head:
+        - linear: {out: action_dist_inputs}
+    critic:
+      input: obs_action
+      zero_init_state: true
+      encoder:
+        - linear: {out: 128}
+        - activation: relu
+        - lstm: {hidden: 64, layers: 1}
+        - linear: {out: 128}
+        - activation: relu
+      head:
+        - linear: {out: q_value}
+
+runtime:
+  iterations: 50
+  num_env_runners: 1
+  num_envs_per_env_runner: 1
+  rollout_fragment_length: 8
+  batch_mode: truncate_episodes
+  save_lightweight_bundle: true
+  lightweight_bundle_frequency: 0
+  save_native_checkpoint: false
+  native_checkpoint_frequency: 0
+  # 학습 재개:
+  # init_bundle: artifacts/models/team01/sac_lstm_actor_critic_v1
+  # restore_checkpoint: artifacts/checkpoints/team01/sac_lstm_actor_critic_v1/checkpoint_000010
+
+# 6) 로그 설정
+dashboard:
+  enabled: true
+  logdir: artifacts/dashboard
+
+policy_probe:
+  enabled: true
+  interval: 10
+  steps: 4
+  print: true
+
+engagement_log:
+  enabled: true
+  interval: 10
+  steps: 600
+  episodes: 1
+  print: true
+
+notes: "Student SAC LSTM template. Requires patched RLLibLstm environment for SAC recurrent training."
