@@ -133,6 +133,7 @@ def make_env(
     overrides: Optional[dict] = None,
     reward_module: str = "",
     observation_module: str = "",
+    reward_overrides: Optional[dict] = None,
     time_gated_damage: bool = True,
     runner_index: str = "ppo",
     env_index: int = 0,
@@ -142,6 +143,8 @@ def make_env(
     overrides 로 일부 키만 바꿔서 self-play, 다른 target_mode 등 실험할 수 있다.
     reward_module/observation_module 에 모듈 경로(예: "claude_code.my_reward")를 주면
     해당 보상/관측 함수를 주입한다.
+    reward_overrides 는 (모듈 reward_config 를 적용한 뒤) reward 계수 일부를 덮어쓴다.
+    예: phase2 에서 distance 항 끄기 → reward_overrides={"distance_reward_scale": 0.0}.
     time_gated_damage=True(기본)면 대결 서버의 시간 게이팅 3-tier damage 를 적용한
     TierGatedDogFightEnv 를 사용한다. False 면 원본 단일-tier DogFightWrapper.
     """
@@ -157,6 +160,10 @@ def make_env(
     if reward_config is not None:
         cfg["reward"] = dict(reward_config)   # 모듈 계수로 교체
         cfg["reward_module"] = reward_module
+    # 모듈 reward_config 적용 후 일부 계수만 덮어쓴다(phase 전환용).
+    if reward_overrides:
+        cfg.setdefault("reward", {})
+        _deep_update(cfg["reward"], dict(reward_overrides))
     if observation_hook is not None:
         cfg["observation_mode"] = observation_hook["mode"]
         cfg["observation_module"] = observation_module

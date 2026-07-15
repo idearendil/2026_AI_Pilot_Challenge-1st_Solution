@@ -19,7 +19,7 @@ from dogfight.ai.action_provider import ActionContext, ActionProvider, ActionRes
 from GeoMathUtil import GeometryInfo
 
 from claude_code import my_observation
-from claude_code.model import policy_action_to_command
+from claude_code.model import policy_action_to_command, discrete_indices_to_continuous
 from claude_code.my_observation import StateReconstructor
 
 
@@ -75,6 +75,9 @@ class SelfPlayProvider(ActionProvider):
                     raw = raw.squeeze(0).cpu().numpy()
                 else:
                     raw = self.model.act_deterministic(obs_t).squeeze(0).cpu().numpy()
+            # 이산 정책이면 카테고리 index → 연속값으로 변환 후 command 변환.
+            if hasattr(self.model, "num_bins"):
+                raw = discrete_indices_to_continuous(raw, self.model.num_bins)
             cmd = policy_action_to_command(raw)
             self._cached = ActionResult(action=cmd, source="self_play", confidence=0.9, info={})
         self._count += 1

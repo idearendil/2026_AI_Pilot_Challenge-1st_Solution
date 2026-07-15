@@ -14,8 +14,8 @@ import numpy as np
 import torch
 import torch.nn as nn
 
-from claude_code.model import MLPActorCritic
-from claude_code.normalizers import RunningMeanStd, RewardScaler
+from claude_code.model import make_actor_critic, discrete_indices_to_continuous
+from claude_code.normalizers import RunningMeanStd
 
 OBS_CLIP = 10.0
 
@@ -54,10 +54,13 @@ class PPOConfig:
     target_kl: Optional[float] = 0.05   # 초과 시 epoch 조기 종료 (None 이면 비활성)
     hidden: tuple = (256, 256)
     activation: str = "tanh"
-    log_std_init: float = -0.5
+    log_std_init: float = -0.5    # (이산 정책에서는 미사용)
+    num_bins: int = 7             # 각 행동 채널의 이산 카테고리 수
+    # critic 을 actor 와 완전히 분리된 네트워크로: 구조/학습률 독립 설정 (None=actor 와 동일)
+    critic_hidden: Optional[tuple] = None
+    critic_activation: Optional[str] = None
+    critic_lr: Optional[float] = None
     normalize_obs: bool = True          # 관측 running mean/std 정규화
-    scale_reward: bool = True           # 할인 누적 보상 std 로 보상 스케일링
-    anneal_lr: bool = True              # 학습률 선형 감쇠
     reconstruct_state: bool = False     # claude_code.my_observation HP 재구성 갱신
     seed: int = 0
     device: str = "cpu"
@@ -88,21 +91,26 @@ class PPOTrainer:
 
         obs_dim = int(env.observation_space.shape[0])
         act_dim = int(env.action_space.shape[0])
-        self.model = MLPActorCritic(
+        self.model = make_actor_critic(
             obs_dim, act_dim,
             hidden=config.hidden,
             activation=config.activation,
-            log_std_init=config.log_std_init,
+            critic_hidden=config.critic_hidden,
+            critic_activation=config.critic_activation,
+            num_bins=config.num_bins,
         ).to(config.device)
-        self.optimizer = torch.optim.Adam(self.model.parameters(), lr=config.lr, eps=1e-5)
+        # actor 와 critic 을 각각 별도 optimizer 로 (완전 분리). critic_lr=None 이면 lr 공유.
+        self.actor_lr0 = config.lr
+        self.critic_lr0 = config.critic_lr if config.critic_lr is not None else config.lr
+        self.actor_opt = torch.optim.Adam(self.model.actor_parameters(), lr=self.actor_lr0, eps=1e-5)
+        self.critic_opt = torch.optim.Adam(self.model.critic_parameters(), lr=self.critic_lr0, eps=1e-5)
 
         self.obs_dim = obs_dim
         self.act_dim = act_dim
         self.global_step = 0
 
-        # 정규화기
+        # 정규화기 (관측만 — 보상 스케일링 없음)
         self.obs_rms = RunningMeanStd(shape=(obs_dim,)) if config.normalize_obs else None
-        self.reward_scaler = RewardScaler(config.gamma) if config.scale_reward else None
 
         # 상태 재구성 (HP 누적) 갱신 함수 (claude_code.my_observation 사용 시)
         self._reset_recon = self._advance_recon = None
@@ -154,27 +162,24 @@ class PPOTrainer:
             obs_tensor = torch.as_tensor(norm_obs, dtype=torch.float32, device=device).unsqueeze(0)
             with torch.no_grad():
                 action, logp, _, value = self.model.get_action_and_value(obs_tensor)
+            # action = 카테고리 index(저장용). env.step 에는 연속값으로 변환해 전달.
             action_np = action.squeeze(0).cpu().numpy().astype(np.float32)
 
             act_buf[t] = action_np
             logp_buf[t] = float(logp.item())
             val_buf[t] = float(value.item())
 
-            next_obs, reward, terminated, truncated, info = self.env.step(action_np)
+            env_action = discrete_indices_to_continuous(action_np, self.model.num_bins)
+            next_obs, reward, terminated, truncated, info = self.env.step(env_action)
             done = bool(terminated or truncated)
             # HP 재구성 갱신: 이번 RL-step 결과 state 로 1회 advance (obs 는 step 안에서
             # advance 전 HP 를 읽었으므로 추론 경로와 동일한 1-step lag).
             if self._advance_recon is not None:
                 self._advance_recon(self.env._ownship_state, self.env._target_state)
             self.global_step += 1
-            self._ep_return += float(reward)   # 로깅용 raw return
+            self._ep_return += float(reward)
             self._ep_len += 1
-            # GAE 용 보상은 스케일링 (학습에만 영향, raw return 은 별도 누적)
-            rew_buf[t] = (
-                self.reward_scaler.scale(float(reward), done)
-                if self.reward_scaler is not None
-                else float(reward)
-            )
+            rew_buf[t] = float(reward)   # raw 보상 그대로 GAE 에 사용 (스케일링 없음)
 
             if done:
                 ep_returns.append(self._ep_return)
@@ -251,21 +256,21 @@ class PPOTrainer:
                 pg_loss2 = -mb_adv * torch.clamp(ratio, 1 - clip, 1 + clip)
                 policy_loss = torch.max(pg_loss1, pg_loss2).mean()
 
-                # clipped value loss
-                v_clipped = old_values[mb] + torch.clamp(
-                    new_value - old_values[mb], -clip, clip
-                )
-                vf1 = (new_value - returns[mb]) ** 2
-                vf2 = (v_clipped - returns[mb]) ** 2
-                value_loss = 0.5 * torch.max(vf1, vf2).mean()
+                # value loss (clip 없이 단순 MSE — value 가 큰 오차를 빠르게 따라가도록)
+                value_loss = 0.5 * ((new_value - returns[mb]) ** 2).mean()
 
                 entropy_loss = entropy.mean()
-                loss = policy_loss - cfg.ent_coef * entropy_loss + cfg.vf_coef * value_loss
+                # actor / critic 손실을 분리해 각자의 optimizer 로 독립 업데이트.
+                actor_loss = policy_loss - cfg.ent_coef * entropy_loss
+                critic_loss = cfg.vf_coef * value_loss
 
-                self.optimizer.zero_grad()
-                loss.backward()
-                nn.utils.clip_grad_norm_(self.model.parameters(), cfg.max_grad_norm)
-                self.optimizer.step()
+                self.actor_opt.zero_grad()
+                self.critic_opt.zero_grad()
+                (actor_loss + critic_loss).backward()   # 파라미터가 분리돼 각 net 에만 grad
+                nn.utils.clip_grad_norm_(self.model.actor_parameters(), cfg.max_grad_norm)
+                nn.utils.clip_grad_norm_(self.model.critic_parameters(), cfg.max_grad_norm)
+                self.actor_opt.step()
+                self.critic_opt.step()
 
                 with torch.no_grad():
                     approx_kls.append(((ratio - 1) - log_ratio).mean().item())
@@ -286,15 +291,50 @@ class PPOTrainer:
 
         return last_pl, last_vl, last_ent, last_kl, explained_var
 
+    # ── past-self stochastic 평가 (단일 프로세스) ────────────────────────────
+    def evaluate_vs(self, env, opp_state, opp_model_kwargs, opp_rms_dict,
+                    n_games, stochastic, base_seed):
+        """`env` 에서 현재 정책 vs 과거 snapshot(opp_*) 으로 n_games 판 평가.
+
+        병렬 모드가 아닐 때 driver 에서 순차 실행된다. `env` 의 상대를 과거
+        network 로 교체해 게임을 돌리고 끝나면 원래 상대를 복원한다.
+        """
+        from claude_code import evaluation
+        opp_model = make_actor_critic(**opp_model_kwargs)
+        opp_model.load_state_dict({k: torch.as_tensor(v) for k, v in opp_state.items()})
+        opp_model.eval()
+
+        prev = getattr(env, "_target_action_provider", None)
+        env._target_action_provider = evaluation.make_opponent(
+            env, opp_model, opp_rms_dict, stochastic)
+        mean = self.obs_rms.mean if self.obs_rms is not None else None
+        var = self.obs_rms.var if self.obs_rms is not None else None
+        seeds = [base_seed + i for i in range(n_games)]
+        try:
+            results = evaluation.play_games(
+                env, self.model, mean, var, seeds, stochastic,
+                self.cfg.reconstruct_state, self.cfg.device)
+        finally:
+            env._target_action_provider = prev
+            # 평가는 rollout env 와 공유되는 reconstructor singleton 을 건드리므로,
+            # rollout 연속성을 위해 singleton + rollout env 상태를 새로 리셋한다
+            # (진행 중이던 rollout episode 는 폐기 — eval 주기마다 1회).
+            if self._reset_recon is not None:
+                self._reset_recon()
+            obs, _ = self.env.reset()
+            if self._reset_recon is not None:
+                self._reset_recon()
+            self._next_obs = np.asarray(obs, dtype=np.float32)
+            self._next_done = False
+            self._ep_return = 0.0
+            self._ep_len = 0
+        return evaluation.summarize(results)
+
     # ── 메인 루프 ────────────────────────────────────────────────────────────
     def train(self, on_iteration: Optional[Callable[[IterationStats], None]] = None):
         history: list[IterationStats] = []
         for it in range(1, self.cfg.total_iterations + 1):
             t0 = time.time()
-            if self.cfg.anneal_lr:
-                frac = 1.0 - (it - 1) / self.cfg.total_iterations
-                for group in self.optimizer.param_groups:
-                    group["lr"] = frac * self.cfg.lr
             batch, ep_returns, ep_lengths, ep_components = self.collect_rollout()
             pl, vl, ent, kl, ev = self.update(batch)
 
@@ -302,7 +342,7 @@ class PPOTrainer:
             mean_len = float(np.mean(ep_lengths)) if ep_lengths else float("nan")
             comp_means: dict = {}
             if ep_components:
-                for key in ("pursuit", "damage", "terminal", "safety", "step"):
+                for key in ("pursuit", "damage", "distance", "aim", "terminal", "safety", "step"):
                     vals = [c.get(key, 0.0) for c in ep_components]
                     comp_means[key] = float(np.mean(vals))
             stats = IterationStats(

@@ -17,7 +17,9 @@ import torch
 
 from dogfight.ai.action_provider import ActionContext, ActionProvider, ActionResult
 
-from claude_code.model import load_bundle, make_obs_normalizer, policy_action_to_command
+from claude_code.model import (
+    load_bundle, make_obs_normalizer, policy_action_to_command, discrete_indices_to_continuous,
+)
 
 
 class MLPActionProvider(ActionProvider):
@@ -64,6 +66,9 @@ class MLPActionProvider(ActionProvider):
         obs = self._normalize_obs(obs)
         obs_tensor = torch.as_tensor(obs, dtype=torch.float32, device=self.device).unsqueeze(0)
         raw = self.model.act_deterministic(obs_tensor).squeeze(0).cpu().numpy()
+        # 이산 정책이면 카테고리 index → 연속값으로 변환.
+        if hasattr(self.model, "num_bins"):
+            raw = discrete_indices_to_continuous(raw, self.model.num_bins)
         command = policy_action_to_command(raw)  # [roll,pitch,rudder]∈[-1,1], throttle∈[0,1]
 
         return ActionResult(

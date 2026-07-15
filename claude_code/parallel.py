@@ -22,8 +22,8 @@ for _p in (ROOT, ROOT / "src"):
     if str(_p) not in sys.path:
         sys.path.insert(0, str(_p))
 
-from claude_code.model import MLPActorCritic
-from claude_code.normalizers import RunningMeanStd, RewardScaler
+from claude_code.model import make_actor_critic, discrete_indices_to_continuous
+from claude_code.normalizers import RunningMeanStd
 from claude_code.ppo import PPOConfig, PPOTrainer, IterationStats, compute_gae, OBS_CLIP
 
 
@@ -84,19 +84,19 @@ def _make_worker_cls():
 
             from claude_code.env_utils import make_env, STANDARD_ENV_CONFIG
             self.env = make_env(runner_index=f"w{worker_id}", **env_kwargs)
-            self.model = MLPActorCritic(**model_kwargs)
+            self.model = make_actor_critic(**model_kwargs)
             self.model.eval()
+            self._model_kwargs = dict(model_kwargs)   # 평가용 상대 network 재생성에 사용
+            self._opp_model = None
 
             self.gamma = cfg_dict["gamma"]
             self.gae_lambda = cfg_dict["gae_lambda"]
             self.normalize_obs = cfg_dict["normalize_obs"]
-            self.scale_reward = cfg_dict["scale_reward"]
             self.reconstruct = cfg_dict["reconstruct_state"]
             self.obs_dim = model_kwargs["obs_dim"]
             self.act_dim = model_kwargs["act_dim"]
 
             self.obs_rms = RunningMeanStd(shape=(self.obs_dim,)) if self.normalize_obs else None
-            self.reward_scaler = RewardScaler(self.gamma) if self.scale_reward else None
 
             if self.reconstruct:
                 from claude_code.my_observation import reset_reconstructor, advance_reconstructor
@@ -111,7 +111,7 @@ def _make_worker_cls():
                 sr = int(STANDARD_ENV_CONFIG["step_ratio"])
                 self.env._target_action_provider = SelfPlayProvider(
                     self.model, self.obs_rms, self.env._observation_fn,
-                    self.env._observation_mode, sr, "cpu")
+                    self.env._observation_mode, sr, "cpu", explore=True)
 
             obs, _ = self.env.reset(seed=seed)
             if self._reset_recon is not None:
@@ -129,6 +129,30 @@ def _make_worker_cls():
                 self.obs_rms.mean = np.asarray(mean, dtype=np.float64)
                 self.obs_rms.var = np.asarray(var, dtype=np.float64)
                 self.obs_rms.count = float(count)
+
+        def set_frozen_opponent(self, state_dict, rms_mean, rms_var, rms_count):
+            """self-play 상대를 '초기 actor net 고정'(별도 frozen 모델)으로 교체한다.
+
+            기본 self-play 는 상대가 self.model(매 iter 갱신되는 학습 agent)을 참조한다.
+            여기서는 학습 시작 시점의 weights 로 별도 frozen 모델을 만들어 상대 provider 가
+            그걸 쓰게 한다(학습이 진행돼도 상대는 고정). obs_rms 도 그 시점 값으로 고정.
+            """
+            from claude_code.env_utils import STANDARD_ENV_CONFIG
+            from claude_code.self_play import SelfPlayProvider
+            self._frozen_opp_model = make_actor_critic(**self._model_kwargs)
+            self._frozen_opp_model.load_state_dict(
+                {k: torch.as_tensor(v) for k, v in state_dict.items()})
+            self._frozen_opp_model.eval()
+            frozen_rms = None
+            if self.obs_rms is not None:
+                frozen_rms = RunningMeanStd(shape=(self.obs_dim,))
+                frozen_rms.mean = np.asarray(rms_mean, dtype=np.float64)
+                frozen_rms.var = np.asarray(rms_var, dtype=np.float64)
+                frozen_rms.count = float(rms_count)
+            sr = int(STANDARD_ENV_CONFIG["step_ratio"])
+            self.env._target_action_provider = SelfPlayProvider(
+                self._frozen_opp_model, frozen_rms, self.env._observation_fn,
+                self.env._observation_mode, sr, "cpu", explore=True)
 
         def _norm(self, obs):
             if self.obs_rms is None:
@@ -155,19 +179,19 @@ def _make_worker_cls():
                 with torch.no_grad():
                     a, lp, _, v = self.model.get_action_and_value(
                         torch.as_tensor(norm, dtype=torch.float32).unsqueeze(0))
-                a_np = a.squeeze(0).numpy().astype(np.float32)
+                a_np = a.squeeze(0).numpy().astype(np.float32)   # 카테고리 index (저장용)
                 act_buf[t] = a_np
                 logp_buf[t] = float(lp.item())
                 val_buf[t] = float(v.item())
 
-                next_obs, reward, term, trunc, info = self.env.step(a_np)
+                env_action = discrete_indices_to_continuous(a_np, self.model.num_bins)
+                next_obs, reward, term, trunc, info = self.env.step(env_action)
                 done = bool(term or trunc)
                 if self._advance_recon is not None:
                     self._advance_recon(self.env._ownship_state, self.env._target_state)
                 self._ep_return += float(reward)
                 self._ep_len += 1
-                rew_buf[t] = (self.reward_scaler.scale(float(reward), done)
-                              if self.reward_scaler is not None else float(reward))
+                rew_buf[t] = float(reward)   # raw 보상 그대로 (스케일링 없음)
                 if done:
                     ep_returns.append(self._ep_return)
                     ep_lengths.append(self._ep_len)
@@ -197,6 +221,41 @@ def _make_worker_cls():
                 "rms_count": n_steps,
             }
 
+        def eval_games(self, opp_state, opp_model_kwargs, opp_rms_dict,
+                       cur_mean, cur_var, seeds, stochastic):
+            """현재 self.model vs 과거 snapshot(opp_*) 으로 seeds 만큼 평가.
+
+            env 의 상대를 과거 network 로 잠시 교체하고, 끝나면 원래 self-play
+            상대를 복원한다. 평가가 진행 중 episode 를 끊으므로 이후 collect 의
+            연속성을 위해 env / reconstructor / episode 누적을 새로 리셋한다.
+            """
+            from claude_code import evaluation
+            if self._opp_model is None:
+                self._opp_model = make_actor_critic(**opp_model_kwargs)
+            self._opp_model.load_state_dict({k: torch.as_tensor(v) for k, v in opp_state.items()})
+            self._opp_model.eval()
+
+            prev = self.env._target_action_provider
+            self.env._target_action_provider = evaluation.make_opponent(
+                self.env, self._opp_model, opp_rms_dict, stochastic)
+            try:
+                results = evaluation.play_games(
+                    self.env, self.model, cur_mean, cur_var, seeds, stochastic,
+                    self.reconstruct, "cpu")
+            finally:
+                self.env._target_action_provider = prev
+                # 다음 collect 의 rollout 연속성 복구 (진행 중 episode 폐기)
+                if self._reset_recon is not None:
+                    self._reset_recon()
+                obs, _ = self.env.reset()
+                if self._reset_recon is not None:
+                    self._reset_recon()
+                self._next_obs = np.asarray(obs, dtype=np.float32)
+                self._next_done = False
+                self._ep_return = 0.0
+                self._ep_len = 0
+            return results
+
     return RolloutWorker
 
 
@@ -217,16 +276,23 @@ class ParallelPPOTrainer:
         torch.manual_seed(config.seed)
         np.random.seed(config.seed)
 
-        self.model = MLPActorCritic(
+        self.model = make_actor_critic(
             obs_dim, act_dim, hidden=config.hidden, activation=config.activation,
-            log_std_init=config.log_std_init).to(config.device)
-        self.optimizer = torch.optim.Adam(self.model.parameters(), lr=config.lr, eps=1e-5)
+            critic_hidden=config.critic_hidden, critic_activation=config.critic_activation,
+            num_bins=config.num_bins).to(config.device)
+        # actor / critic 별도 optimizer (완전 분리). PPOTrainer.update 가 이 둘을 사용.
+        self.actor_lr0 = config.lr
+        self.critic_lr0 = config.critic_lr if config.critic_lr is not None else config.lr
+        self.actor_opt = torch.optim.Adam(self.model.actor_parameters(), lr=self.actor_lr0, eps=1e-5)
+        self.critic_opt = torch.optim.Adam(self.model.critic_parameters(), lr=self.critic_lr0, eps=1e-5)
         self.obs_rms = RunningMeanStd(shape=(obs_dim,)) if config.normalize_obs else None
 
         model_kwargs = dict(obs_dim=obs_dim, act_dim=act_dim, hidden=tuple(config.hidden),
-                            activation=config.activation, log_std_init=config.log_std_init)
+                            activation=config.activation, num_bins=config.num_bins,
+                            critic_hidden=(tuple(config.critic_hidden) if config.critic_hidden else None),
+                            critic_activation=config.critic_activation)
         cfg_dict = dict(gamma=config.gamma, gae_lambda=config.gae_lambda,
-                        normalize_obs=config.normalize_obs, scale_reward=config.scale_reward,
+                        normalize_obs=config.normalize_obs,
                         reconstruct_state=config.reconstruct_state)
 
         if not ray.is_initialized():
@@ -287,15 +353,39 @@ class ParallelPPOTrainer:
     def update(self, batch):
         return PPOTrainer.update(self, batch)
 
+    # ── past-self stochastic 평가 (멀티프로세스: worker 재사용) ───────────────
+    def evaluate_vs(self, opp_state, opp_model_kwargs, opp_rms_dict,
+                    n_games, stochastic, base_seed):
+        """현재 정책(post-update) vs 과거 snapshot 을 worker 들에 분배해 평가."""
+        import ray
+        from claude_code import evaluation
+        self._broadcast()   # worker 에 현재 weights + obs_rms 반영
+        mean = self.obs_rms.mean if self.obs_rms is not None else None
+        var = self.obs_rms.var if self.obs_rms is not None else None
+        seeds = [base_seed + i for i in range(n_games)]
+        chunks = [seeds[i::self.num_workers] for i in range(self.num_workers)]
+        opp_ref = ray.put(opp_state)
+        futs = []
+        for w, ch in zip(self.workers, chunks):
+            if not ch:
+                continue
+            futs.append(w.eval_games.remote(
+                opp_ref, opp_model_kwargs, opp_rms_dict, mean, var, ch, stochastic))
+        results = [r for sub in ray.get(futs) for r in sub]
+        return evaluation.summarize(results)
+
+    def set_frozen_opponent(self, state_dict, rms_mean, rms_var, rms_count):
+        """모든 worker 의 self-play 상대를 '초기 actor net 고정' 으로 교체(broadcast)."""
+        import ray
+        ref = ray.put(state_dict)
+        ray.get([w.set_frozen_opponent.remote(ref, rms_mean, rms_var, rms_count)
+                 for w in self.workers])
+
     def train(self, on_iteration=None):
         import time
         history = []
         for it in range(1, self.cfg.total_iterations + 1):
             t0 = time.time()
-            if self.cfg.anneal_lr:
-                frac = 1.0 - (it - 1) / self.cfg.total_iterations
-                for g in self.optimizer.param_groups:
-                    g["lr"] = frac * self.cfg.lr
             batch, ep_returns, ep_lengths, ep_components = self.collect_rollout()
             pl, vl, ent, kl, ev = self.update(batch)
 
@@ -303,7 +393,7 @@ class ParallelPPOTrainer:
             mean_len = float(np.mean(ep_lengths)) if ep_lengths else float("nan")
             comp_means = {}
             if ep_components:
-                for key in ("pursuit", "damage", "terminal", "safety", "step"):
+                for key in ("pursuit", "damage", "distance", "aim", "terminal", "safety", "step"):
                     comp_means[key] = float(np.mean([c.get(key, 0.0) for c in ep_components]))
             stats = IterationStats(
                 iteration=it, global_step=self.global_step, mean_return=mean_ret,

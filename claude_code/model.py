@@ -58,16 +58,30 @@ class MLPActorCritic(nn.Module):
         hidden: Sequence[int] = (256, 256),
         activation: str = "tanh",
         log_std_init: float = -0.5,
+        critic_hidden: Sequence[int] | None = None,
+        critic_activation: str | None = None,
     ):
         super().__init__()
         self.obs_dim = int(obs_dim)
         self.act_dim = int(act_dim)
         self.hidden = list(hidden)
         self.activation = activation
+        # critic 은 actor 와 완전히 독립된 네트워크(파라미터·구조 모두 별개).
+        # critic_hidden/critic_activation 미지정 시 actor 와 같은 구조를 쓴다.
+        self.critic_hidden = list(critic_hidden) if critic_hidden is not None else list(hidden)
+        self.critic_activation = critic_activation if critic_activation is not None else activation
         self.actor_mean = _mlp(obs_dim, hidden, act_dim, activation)
-        self.critic = _mlp(obs_dim, hidden, 1, activation)
+        self.critic = _mlp(obs_dim, self.critic_hidden, 1, self.critic_activation)
         self.log_std = nn.Parameter(torch.full((act_dim,), float(log_std_init)))
         self.apply(self._init_weights)
+
+    def actor_parameters(self):
+        """actor(정책) 파라미터: actor_mean MLP + log_std."""
+        return list(self.actor_mean.parameters()) + [self.log_std]
+
+    def critic_parameters(self):
+        """critic(가치) 파라미터: critic MLP (actor 와 공유 없음)."""
+        return list(self.critic.parameters())
 
     @staticmethod
     def _init_weights(module: nn.Module) -> None:
@@ -107,6 +121,108 @@ class MLPActorCritic(nn.Module):
         """추론용: 분포 평균을 그대로 사용 (탐험 noise 없음)."""
         mean, _ = self.forward(obs)
         return mean
+
+
+# ── 이산(discrete) 행동 공간 ─────────────────────────────────────────────────
+# roll/pitch/yaw/throttle 각 채널을 num_bins(기본 7)개의 균등 분할 카테고리로
+# 이산화한다. 카테고리 index 는 make_action_grid 로 [-1,1] 의 연속값에 매핑되고,
+# env.step / 추론 경로의 throttle 변환((a+1)/2)은 기존과 동일하게 적용된다.
+ACTION_BINS = 7
+
+
+def make_action_grid(num_bins: int = ACTION_BINS, low: float = -1.0, high: float = 1.0) -> np.ndarray:
+    """[low, high] 를 num_bins 개로 균등 분할한 격자값(양 끝 포함)."""
+    return np.linspace(low, high, int(num_bins)).astype(np.float32)
+
+
+def discrete_indices_to_continuous(action_idx, num_bins: int = ACTION_BINS) -> np.ndarray:
+    """카테고리 index(0..num_bins-1) → [-1,1] 연속 행동값."""
+    grid = make_action_grid(num_bins)
+    idx = np.clip(np.asarray(action_idx).round().astype(np.int64), 0, int(num_bins) - 1)
+    return grid[idx].astype(np.float32)
+
+
+class MLPDiscreteActorCritic(nn.Module):
+    """채널별 독립 Categorical 정책 + 완전 분리형 critic(가치) 네트워크.
+
+    actor 는 (act_dim × num_bins) 로짓을 출력하고, 각 행동 채널을 독립적인
+    Categorical 분포로 본다(전체 행동 = 4개 카테고리의 곱). log_prob/entropy 는
+    채널별 값을 합산한다. critic 은 actor 와 파라미터를 공유하지 않는 별도 MLP.
+    """
+
+    def __init__(
+        self,
+        obs_dim: int,
+        act_dim: int = 4,
+        num_bins: int = ACTION_BINS,
+        hidden: Sequence[int] = (256, 256),
+        activation: str = "tanh",
+        critic_hidden: Sequence[int] | None = None,
+        critic_activation: str | None = None,
+        **_ignored,   # log_std_init 등 연속용 kwargs 를 무해하게 흡수
+    ):
+        super().__init__()
+        self.obs_dim = int(obs_dim)
+        self.act_dim = int(act_dim)
+        self.num_bins = int(num_bins)
+        self.hidden = list(hidden)
+        self.activation = activation
+        self.critic_hidden = list(critic_hidden) if critic_hidden is not None else list(hidden)
+        self.critic_activation = critic_activation if critic_activation is not None else activation
+        self.actor_logits = _mlp(obs_dim, hidden, self.act_dim * self.num_bins, activation)
+        self.critic = _mlp(obs_dim, self.critic_hidden, 1, self.critic_activation)
+        self.apply(MLPActorCritic._init_weights)
+
+    def actor_parameters(self):
+        return list(self.actor_logits.parameters())
+
+    def critic_parameters(self):
+        return list(self.critic.parameters())
+
+    def _dist(self, obs: torch.Tensor) -> torch.distributions.Categorical:
+        logits = self.actor_logits(obs).view(-1, self.act_dim, self.num_bins)
+        return torch.distributions.Categorical(logits=logits)
+
+    def get_value(self, obs: torch.Tensor) -> torch.Tensor:
+        return self.critic(obs).squeeze(-1)
+
+    def get_action_and_value(self, obs: torch.Tensor, action: torch.Tensor | None = None):
+        """샘플(or 평가)된 카테고리 index, 합산 log_prob, 합산 entropy, value 반환.
+
+        반환 action 은 **카테고리 index**(float 캐스팅). env.step 에 넣기 전에
+        discrete_indices_to_continuous 로 연속값으로 변환해야 한다.
+        """
+        dist = self._dist(obs)
+        if action is None:
+            action = dist.sample()              # (B, act_dim) long
+        else:
+            action = action.long()
+        log_prob = dist.log_prob(action).sum(-1)
+        entropy = dist.entropy().sum(-1)
+        value = self.get_value(obs)
+        return action.float(), log_prob, entropy, value
+
+    @torch.no_grad()
+    def act_deterministic(self, obs: torch.Tensor) -> torch.Tensor:
+        """추론용: 채널별 argmax 카테고리 index 반환 (탐험 없음)."""
+        logits = self.actor_logits(obs).view(-1, self.act_dim, self.num_bins)
+        return logits.argmax(-1).float()        # (B, act_dim) index
+
+
+def make_actor_critic(
+    obs_dim: int,
+    act_dim: int,
+    hidden: Sequence[int] = (256, 256),
+    activation: str = "tanh",
+    critic_hidden: Sequence[int] | None = None,
+    critic_activation: str | None = None,
+    num_bins: int = ACTION_BINS,
+    **_ignored,
+) -> MLPDiscreteActorCritic:
+    """학습/추론 공용 정책 팩토리 (현재 기본 = 이산 행동 정책)."""
+    return MLPDiscreteActorCritic(
+        obs_dim, act_dim, num_bins=num_bins, hidden=hidden, activation=activation,
+        critic_hidden=critic_hidden, critic_activation=critic_activation)
 
 
 # ── 환경/서버로 보낼 action 변환 ──────────────────────────────────────────────
@@ -154,6 +270,16 @@ def save_bundle(
     out = Path(output_dir)
     out.mkdir(parents=True, exist_ok=True)
 
+    is_discrete = isinstance(model, MLPDiscreteActorCritic)
+    model_meta = {
+        "type": "mlp_discrete_actor_critic" if is_discrete else "mlp_actor_critic",
+        "hidden": model.hidden,
+        "activation": model.activation,
+        "critic_hidden": model.critic_hidden,
+        "critic_activation": model.critic_activation,
+    }
+    if is_discrete:
+        model_meta["num_bins"] = model.num_bins
     metadata = {
         "framework": "claude_code_ppo",
         "algorithm": "PPO",
@@ -161,11 +287,7 @@ def save_bundle(
         "observation_size": model.obs_dim,
         "action_size": model.act_dim,
         "lstm": False,
-        "model": {
-            "type": "mlp_actor_critic",
-            "hidden": model.hidden,
-            "activation": model.activation,
-        },
+        "model": model_meta,
         "throttle_remap": "(a+1)/2",
         "action_clip": {"low": SIM_ACTION_LOW.tolist(), "high": SIM_ACTION_HIGH.tolist()},
         # 관측 정규화 통계 (추론에서 동일하게 적용). None 이면 정규화 미사용.
@@ -191,12 +313,19 @@ def load_bundle(bundle_dir: str | Path, device: str = "cpu") -> tuple[MLPActorCr
         state = pickle.load(fh)
 
     model_meta = metadata.get("model", {})
-    model = MLPActorCritic(
+    crit_hidden = model_meta.get("critic_hidden")
+    common = dict(
         obs_dim=int(metadata.get("observation_size", 16)),
         act_dim=int(metadata.get("action_size", 4)),
         hidden=tuple(model_meta.get("hidden", (256, 256))),
         activation=model_meta.get("activation", "tanh"),
+        critic_hidden=tuple(crit_hidden) if crit_hidden is not None else None,
+        critic_activation=model_meta.get("critic_activation"),
     )
+    if model_meta.get("type") == "mlp_discrete_actor_critic":
+        model = MLPDiscreteActorCritic(num_bins=int(model_meta.get("num_bins", ACTION_BINS)), **common)
+    else:
+        model = MLPActorCritic(**common)
     model.load_state_dict(state)
     model.to(device)
     model.eval()
@@ -205,6 +334,11 @@ def load_bundle(bundle_dir: str | Path, device: str = "cpu") -> tuple[MLPActorCr
 
 __all__ = [
     "MLPActorCritic",
+    "MLPDiscreteActorCritic",
+    "make_actor_critic",
+    "ACTION_BINS",
+    "make_action_grid",
+    "discrete_indices_to_continuous",
     "policy_action_to_command",
     "make_obs_normalizer",
     "save_bundle",

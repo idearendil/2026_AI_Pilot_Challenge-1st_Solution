@@ -60,22 +60,4 @@ class RunningMeanStd:
         return rms
 
 
-class RewardScaler:
-    """할인 누적 보상의 표준편차로 보상을 나눠 advantage 크기를 안정화한다."""
-
-    def __init__(self, gamma: float, epsilon: float = 1e-8):
-        self.gamma = gamma
-        self.epsilon = epsilon
-        self.rms = RunningMeanStd(shape=())
-        self._ret = 0.0
-
-    def scale(self, reward: float, done: bool) -> float:
-        self._ret = self._ret * self.gamma + float(reward)
-        self.rms.update(np.array([self._ret], dtype=np.float64))
-        scaled = float(reward) / float(np.sqrt(self.rms.var + self.epsilon))
-        if done:
-            self._ret = 0.0
-        return scaled
-
-
-__all__ = ["RunningMeanStd", "RewardScaler"]
+__all__ = ["RunningMeanStd"]

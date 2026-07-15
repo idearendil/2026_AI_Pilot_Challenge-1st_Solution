@@ -1,330 +1,214 @@
-# claude_code — 독립형 PPO 학습 & 제출
+# claude_code — DogFight 1v1 PPO 학습 패키지 (팀 매뉴얼)
 
-원본 DogFight 프레임워크와 **완전히 동일한 환경**(`DogFightWrapper`)을 그대로
-사용하되, RLlib 의존성 없이 **순수 PyTorch로 PPO를 직접 구현**한 패키지입니다.
-다양한 강화학습 아이디어를 빠르게 실험할 수 있도록 학습 루프 전체가 읽기 쉬운
-한 곳에 모여 있습니다.
+원본 DogFight 프레임워크의 **환경(`DogFightWrapper` / `TierGatedDogFightEnv`)은 그대로**
+쓰되, RLlib 없이 **순수 PyTorch 로 PPO 를 직접 구현**한 독립 패키지입니다. 이 문서는
+"어떻게 학습을 돌리고, 학습한 모델끼리 붙여서 리플레이 로그를 뽑아 보는가"를 처음
+보는 사람이 따라 할 수 있게 정리한 매뉴얼입니다.
 
-학습 결과는 원본과 같은 **2-파일 번들**(`metadata.json` + `policy_weights.pkl.gz`)로
-저장되며, `submission.py`가 원본 `student/my_submission.py`와 동일한 UDP 클라이언트
-경로로 대결 서버에 연결합니다. 즉 대결 서버 입장에서는 원본 RL 제출과 완전히
-동일하게 동작합니다.
+> 모든 명령은 **Release 디렉토리(=이 폴더의 부모)** 에서 실행합니다.
 
-## 파일 구성
+---
+
+## 1. 빠른 시작
+
+```
+# (1)-1 phase 1 학습(reward 식에 distance 항 추가됨)  — 결과 번들이 artifacts/models/team01/ppo_phase1 에 저장됨
+python claude_code/train.py --output-name team01 --output-tag ppo_phase1
+# (1)-2 phase 2 학습(reward 식에 distance 항 제거됨)  — 결과 번들이 artifacts/models/team01/ppo_phase2 에 저장됨
+(아직 phase2 학습을 하고 나서도 서로 damage를 잘 주진 못함...)
+python claude_code/train.py --output-name team01 --output-tag ppo_phase2 --resume-from claude_code/models/team01/ppo_phase1/iter_0150.pt --distance-reward-scale 0
+# (1)-3 last 모델이 아닌 특정 iteration의 모델을 번들로 저장하고 싶으면
+python claude_code/snapshot_to_bundle.py --snapshot claude_code/models/team01/ppo_phase2/iter_0050.pt
+
+# (2) 두 모델 대결 + 리플레이 로그 저장
+(rl 모델과 bt 모델을 사용하는 경우)
+python claude_code/run_local_dogfight.py --ownship-backend rl --ownship-bundle-dir artifacts/models/team01/ppo_phase2 --target-backend bt --target-bt-dll AIP_BASE_target.dll --max-engage-time 200 --episode-step-limit 12000 --save-log
+(rl 모델과 rl 모델을 사용하는 경우)
+python claude_code/run_local_dogfight.py --ownship-backend rl --ownship-bundle-dir artifacts/models/team01/ppo_phase2 --target-backend rl --target-bundle-dir artifacts/models/team01/ppo_phase2 --max-engage-time 200 --episode-step-limit 12000 --save-log
+
+# (3) 리플레이 로그는 artifacts/logs/ 아래 *_ownship_*.csv / *_target_*.csv / *_summary.json 로 저장됨 (Tacview 포맷)
+=> 리플레이 로그 파일 3개를 모두 logs/ 폴더로 옮기고 아래 명령어 실행 후 브라우저에 접속해서 확인
+python tools/web_log_viewer.py --logdir logs --port 7870
+```
+
+---
+
+## 2. 파일 구성 — 어떤 게 무슨 역할인가
 
 | 파일 | 역할 |
 |---|---|
-| `env_utils.py` | 원본 YAML(`student_ppo_mlp.yaml`)과 동일한 환경 세팅으로 `DogFightWrapper` 생성 + 보상/관측 모듈 hook |
-| `my_reward.py` | **[편집] 보상 함수** (`MY_REWARD_CONFIG`, `compute_reward`) |
-| `my_observation.py` | **[편집] 관측 벡터** + 제출환경 state 재구성(`StateReconstructor`) |
-| `verify_reconstruction.py` | 학습 env 에서 재구성값 vs 실제 state 검증 |
-| `verify_tier_damage.py` | 학습 env 의 시간 게이팅 3-tier damage 적용 검증 |
-| `model.py` | MLP actor-critic(가우시안 정책) + 2-파일 번들 저장/로드 + action 변환 |
-| `ppo.py` | GAE + clipped surrogate 기반 순수 PyTorch PPO 트레이너 |
-| `parallel.py` | Ray 기반 병렬 rollout 수집 (`ParallelPPOTrainer`, `physical_cpu_count`) |
-| `train.py` | 학습 entrypoint (CLI). 종료 시 번들 저장 |
-| `action_provider.py` | MLP 정책을 원본 `ActionProvider` 계약으로 감싼 어댑터 |
-| `self_play.py` | 상대를 같은 actor network 로 조종하는 `SelfPlayProvider` |
-| `submission.py` | 대결 서버 연결 (원본 my_submission.py 와 동일한 경로) |
-| `evaluate.py` | 학습한 번들을 로컬 환경에서 검증 |
+| **`train.py`** | **PPO 학습 entrypoint (여기서 학습을 시작).** CLI 옵션 파싱 → 학습 → 번들 저장 |
+| `ppo.py` | 단일 프로세스 PPO 트레이너 (GAE + clipped surrogate) |
+| `parallel.py` | Ray 기반 **병렬 rollout** 트레이너/워커 (`--num-workers>1` 일 때 사용) |
+| `model.py` | **정책 네트워크**(`MLPDiscreteActorCritic`) + 2-파일 번들 저장/로드 |
+| **`my_reward.py`** | **[편집] 보상 함수** (`MY_REWARD_CONFIG`, `compute_reward`) |
+| **`my_observation.py`** | **[편집] 관측 벡터(34-D)** + 제출환경 state 재구성(`StateReconstructor`) |
+| `env_utils.py` | 원본과 동일한 환경 생성(`make_env`, `TierGatedDogFightEnv`) + 보상/관측 hook |
+| `self_play.py` | 상대를 (다른) actor network 로 조종하는 `SelfPlayProvider` |
+| `action_provider.py` | 학습한 정책을 원본 `ActionProvider` 계약으로 감싼 추론 어댑터 |
+| `normalizers.py` | 관측 running mean/std 정규화(`RunningMeanStd`) |
+| `evaluation.py` | snapshot 저장/로드 + past-self 대결 평가(`play_games`) |
+| **`run_local_dogfight.py`** | **모델 vs (모델·스크립트·DLL) 로컬 대결 + 리플레이 로그 생성** |
+| **`snapshot_to_bundle.py`** | 매 iter snapshot(`iter_NNNN.pt`) → 제출용 2-파일 번들 변환 |
+| `evaluate.py` | 학습한 번들을 로컬에서 간단 검증 |
+| `submission.py` | 대결 서버 UDP 제출 (원본 `my_submission.py` 와 동일 경로) |
+| `verify_reconstruction.py` / `verify_tier_damage.py` | 재구성값·tier damage 검증 스크립트 |
 
-## 환경 세팅 (원본과 동일)
+**학습 결과물 위치**
+- 번들(제출용): `artifacts/models/<name>/<tag>/{metadata.json, policy_weights.pkl.gz}`
+  - `<tag>` = past-self 승률 > 0.5 인 **best iteration**, `<tag>_final` = **맨 마지막 iteration**
+- 학습 로그: `artifacts/logs/<name>/<tag>/ppo_training_log.csv`
+- 매 iter snapshot: `claude_code/models/<name>/<tag>/iter_NNNN.pt` (재현·리플레이 상대용)
 
-`env_utils.STANDARD_ENV_CONFIG` 는 `experiments/student_ppo_mlp.yaml` 의
-`env` / `env_config` 와 동일합니다.
+---
 
-- 관측: `tactical16` (16차원, `[-1, 1]` 정규화)
-- 행동: `Box([-1, 1]^4)` = roll, pitch, rudder, throttle
-- `step_ratio: 6`, `max_engage_time: 60s`, `episode_step_limit: 3600`
-- 보상/종료: 원본 `src/dogfight/envs/reward.py`, `termination.py` 그대로 사용
+---
 
-동역학·보상·종료·관측 파이프라인이 RLlib 경로와 100% 동일하고, **유일한 차이는
-학습 루프(RLlib → claude_code PPO)** 입니다.
+## 3. 바꿀 수 있는 주요 옵션 (train.py)
 
-### 상대(self-play) — 기본값
-
-`train.py` 는 **기본적으로 self-play** 입니다: 상대 전투기를 **학습 중인 같은 actor
-network** 로 조종합니다(`self_play.SelfPlayProvider`). 정책이 향상되면 상대도 같이
-강해지는 완전한 self-learning 입니다.
-
-- 상대는 자신의 `StateReconstructor`(상대 관점 HP)로 **대칭 관측**을 만들고, model 을
-  통과시켜 action 을 냅니다. `action_repeat=step_ratio` 로 본 기체와 동일한 제어 주기.
-- 상대는 결정론적(평균 action)으로 동작합니다(`SelfPlayProvider(explore=True)` 로 변경 가능).
-- **시작 위치 랜덤화**: `STANDARD_ENV_CONFIG["randomize_start_side"]=True`(기본) — 매 episode
-  학습 agent 시작 위치를 두 위치(config `ownship`/`target`) 중 랜덤 선택(좌우 교대)해
-  한쪽에 과적합하지 않게 합니다. 끄려면 `randomize_start_side=False`.
-- 끄려면 `--no-self-play` (그러면 아래 `--target-mode` 스크립트 상대 사용).
-
-```powershell
-... claude_code\train.py --output-name team01 --output-tag selfplay_v1     # 기본 self-play
-... claude_code\train.py --no-self-play --target-mode loiter ...           # 스크립트 상대
-```
-
-### 스크립트 상대 모드 (`--target-mode`, `--no-self-play` 일 때만)
-
-`train.py` 의 학습 데모 기본값은 **`loiter`** 입니다. 이유:
-
-| 표적 | 특성 | 학습 시연 적합성 |
+| 옵션 | 기본값 | 기능 |
 |---|---|---|
-| `loiter` | 선회하며 고도 유지(자기파괴 없음) | **적합(기본).** episode 가 timeout 으로 끝나(terminal=0) return 이 ownship 의 추격/사격 성과로만 결정됨 |
-| `fixed` / `autopilot` | 스스로 하강·추락 | 부적합. 매 episode 표적이 추락해 무승부(-30)로 끝나 return 이 정책 품질과 무관하게 ~-30 에 고정 |
-| `behavior_tree` | 실제 대회형 강한 상대 | 고난도. 처음부터 학습은 매우 어려움 |
-
-> 참고: `STANDARD_ENV_CONFIG` 자체는 원본 YAML 과 동일하게 `target_mode: fixed` 를
-> 담지만, `train.py` 는 학습 신호가 깨끗한 `loiter` 를 기본으로 사용합니다.
-> `--target-mode` 로 언제든 바꿀 수 있습니다.
-
-## 1) 학습
-
-```powershell
-D:\other_programs\anaconda3\envs\aip\python.exe claude_code\train.py `
-  --iterations 150 `
-  --rollout-steps 2048 `
-  --target-mode loiter `
-  --output-name team01 `
-  --output-tag ppo_mlp_v1
-```
-
-주요 옵션: `--lr`(기본 3e-4), `--gamma`, `--gae-lambda`, `--clip-coef`,
-`--update-epochs`, `--minibatch-size`, `--ent-coef`, `--hidden 256,256`,
-`--activation tanh|relu|elu`, `--log-std-init`, `--target-mode`,
-`--eval-interval`(기본 5), `--eval-episodes`(기본 2).
-
-> 학습률은 3e-4 부근이 안정적입니다. 1e-3 이상은 이 환경에서 policy 가
-> trust region 을 크게 벗어나(approx_kl 폭증) 붕괴합니다.
-
-학습 로그: `artifacts/logs/<name>/<tag>/ppo_training_log.csv`
-번들: `artifacts/models/<name>/<tag>/{metadata.json, policy_weights.pkl.gz}`
-
-iteration 마다 다음이 출력됩니다:
-
-- `return`: 평균 episode 합산 보상 (탐험 on 상태의 rollout 기준)
-- `len`: 평균 episode 길이 (생존을 배우면 timeout=600 에 수렴)
-- `pursuit` / `damage`: 추격/사격 보상 성분 (추격을 배우면 상승)
-- `ev`: value function explained variance (가치함수 학습 지표)
-- `EVAL`: `--eval-interval` 마다 **탐험을 끈 결정론적 정책**으로 평가한 return/length
-
-### 최고 성능 정책 저장 (best-model saving)
-
-학습 후반에는 탐험 noise 가 커지며 *rollout* return(탐험 on)이 출렁일 수 있습니다.
-실제 제출에 쓰는 것은 **탐험을 끈 결정론적 정책**이므로, 본 트레이너는
-`--eval-interval` 마다 결정론적 평가를 수행해 **그 시점까지의 최고 정책만 번들로
-저장**합니다. 따라서 마지막 iteration 이 출렁여도 저장된 번들은 항상 최고 성능
-스냅샷입니다. (환경 초기 상태가 결정적이라 적은 episode 로도 정책 품질을 대표합니다.)
-
-### 검증된 학습 결과 (loiter, 120 iters, seed 0)
-
-이 환경에서 PPO 가 실제로 학습됨을 확인했습니다 (CPU, 약 13분):
-
-| 지표 | 학습 전(랜덤 정책) | 학습 후(저장된 best 정책) |
-|---|---|---|
-| 결정론적 평가 outcome | crash (471 step) | **timeout (600 step, 추락 없음)** |
-| 결정론적 평가 return | ≈ **-29.9** | ≈ **+3.0** |
-| value EV | ~0 | **0.95 ~ 0.98** |
-| `pursuit` 성분 | ~0 | **+5 ~ +6 (양수)** |
-
-즉 에이전트는 (1) 추락하지 않고 비행하는 법, (2) episode 끝까지 생존하는 법,
-(3) 표적을 추격하는 법을 스스로 학습했습니다.
-
-**학습 ↔ 제출 경로 일치 검증:** 학습 중 결정론적 평가 return 과
-`evaluate.py`(= `MLPActionProvider` 제출 경로, `action_repeat=step_ratio`)의 return 이
-**+3.004 로 정확히 일치**합니다. 즉 학습 때와 대결 서버 추론 때 정책이 동일하게
-동작합니다.
-
-> 제어 주기 주의: 정책은 RL action 1회를 `step_ratio(=6)` sim step 동안 유지하도록
-> 학습됩니다. 제출(`submission.py`)은 `ProviderCommandPolicy(action_repeat=6)`,
-> 로컬 검증(`evaluate.py`)은 내부 `_ActionRepeatProvider(repeat=6)` 로 이 주기를
-> 맞춥니다. 이 값을 어기면(매 sim step 마다 정책 호출) 동작이 달라져 추락합니다.
-
-### 빠른 수렴을 위한 정규화
-
-순수 PPO 는 정규화 없이는 매우 느리게 학습합니다. 본 구현은 아래 표준 기법을 기본으로
-켜며, 필요하면 `--no-normalize-obs` / `--no-scale-reward` / `--no-anneal-lr` 로 끌 수
-있습니다:
-
-- 관측 running mean/std 정규화 (통계는 번들에 저장 → 추론에서 동일 적용)
-- 할인 누적 보상 std 기반 보상 스케일링 (학습 전용)
-- 학습률 선형 감쇠
-- advantage 정규화, clipped value loss, `approx_kl` 기반 epoch 조기 종료
-
-### 병렬 데이터 수집 (Ray) — 기본값
-
-큰 모델 + GPU 학습을 대비해, CPU-bound 한 env stepping 을 여러 프로세스(Ray actor)로
-병렬 수집합니다. **worker 수 기본값 = 물리 CPU 코어 수**(논리 코어 아님; psutil 없으면
-OS 조회 → 마지막엔 logical//2). 각 worker 는 자신의 env(self-play 포함)+로컬 model 을
-갖고, 매 iteration 마다 driver 가 weights/obs_rms 를 broadcast → 병렬 수집 → driver 에서
-update(GPU 가능).
-
-```powershell
-... claude_code\train.py --num-workers 6 ...      # 명시 (기본은 물리 코어 수)
-... claude_code\train.py --num-workers 1 ...      # 단일 프로세스(Ray 미사용)
-... claude_code\train.py --device cuda ...         # 큰 모델: driver update 를 GPU 로
-```
-
-측정(이 머신, 물리 6코어, 3072 step/iter, self-play+claude16): 단일 **~15.5s/iter** →
-6-worker **~3.4s/iter (약 4.5×)**. worker 는 CPU 추론, driver 만 `--device cuda` 로 GPU
-update. `--num-workers 1` 이면 Ray 없이 단일 프로세스 경로를 씁니다.
-
-> 주의: obs_rms 는 driver 가 authoritative 로 관리(worker batch 통계를 병합), 각 worker 는
-> broadcast 된 obs_rms 로 정규화. reward 스케일러는 worker 별로 유지됩니다(분포 동일해 수렴).
-
-### 보상/관측을 claude_code 에서 직접 정의 (기본값)
-
-`train.py` 는 **기본적으로 `claude_code/my_reward.py` 와 `claude_code/my_observation.py`
-를 사용**합니다(플래그 불필요). 이 두 파일을 편집하면 학습 보상/관측이 바뀝니다.
-
-```powershell
-D:\other_programs\anaconda3\envs\aip\python.exe claude_code\train.py `
-  --output-name team01 --output-tag v1          # 그냥 실행하면 my_reward + my_observation 사용
-```
-
-프레임워크 기본 보상(`src/dogfight/envs/reward.py`)·tactical16 관측을 쓰려면 빈 값을 줍니다:
-
-```powershell
-... claude_code\train.py --reward-module "" --observation-module "" ...
-```
-
-> 현재 `my_reward.py`:
-> - **종료**: 상대 격추/고도이탈 → +10, 내 격추/고도이탈 → −10
-> - **보조(매 step, 양측 생존 중)**: `(상대 HP감소 − 내 HP감소) × 10` (피해 유도 shaping)
->
-> 긴 episode(200s) 에서는 rollout 당 episode 수가 적어지므로 `--rollout-steps` 를
-> 크게(예: 4096) 두는 것을 권장합니다.
-
-- **보상**(`my_reward.py`): `MY_REWARD_CONFIG`(계수) + `compute_reward(...) -> (total, components)`.
-  학습에만 영향(추론/제출에는 무관). 계수만 바꾸려면 `env_utils.STANDARD_ENV_CONFIG["reward"]`
-  를 수정해도 됩니다.
-- **관측**(`my_observation.py`): `OBSERVATION_SIZE` + `build_observation(...)`. 학습·로컬검증·
-  제출이 **모두** 같은 함수를 사용합니다. 사용한 모듈 경로는 번들 `metadata.json` 에
-  기록되고, `evaluate.py`/`submission.py` 가 이를 읽어 동일 관측을 재구성하므로 학습과
-  추론 입력이 일치합니다. 관측 **차원**을 바꾸면 기존 번들과 호환되지 않으니 재학습해야
-  합니다.
-
-> 검증: custom 보상+관측으로 학습한 번들에 대해, 학습 중 결정론적 평가 return 과
-> `evaluate.py` return 이 동일하게 나오는 것을 확인했습니다(학습↔추론 관측 일치).
-
-### 제출환경 state 재구성 (HP·고도·속도)
-
-대결 서버 추론에서는 위치·자세·속도(state 0~8)만 들어오고 HP·고도·속도(KCAS)·WEZ 는
-0 입니다. `my_observation.py` 의 `StateReconstructor` 가 이를 복원합니다:
-
-- **고도** = `-D` (= `-state[2]`)  ← 위치
-- **속도(TAS)** = `||(u,v,w)||` (= `||state[6:9]||`)  ← 속도
-- **거리/ATA/AA/LOS** = `geo_info` 계산  ← 위치·자세
-- **HP** = 매 RL-step `rate(r,theta,t) * DT_PER_STEP` 누적  ← 대결 서버 damage 공식
-  (`damage_rate()`. r=거리[ft], theta=ATA)
-
-**시간 게이팅** (대결 서버 규칙, `damage_rate` 에 반영):
-
-| tier | 범위 | 각도 | 계수 | 활성화 |
-|---|---|---|---|---|
-| 1 | 500~3000 ft | ±1° | 1.0·(3000−r)/2500 | 0s~ (항상) |
-| 2 | 500~3500 ft | ±2° | 0.3·(3500−r)/3000 | **100s 부터** |
-| 3 | 500~4000 ft | ±3° | 0.1·(4000−r)/3500 | **150s 부터** |
-
-**delta_t 보정**: 학습 env 의 `update_damage` 는 `계수 × env._delta_t(=1/60)` 를 매 sim
-sub-step 적용하고, RL-step = `step_ratio(=6)` sub-step 이므로 **`DT_PER_STEP = 6/60 =
-0.1 s`** (코드+실측으로 추출). 재구성도 `HP -= rate × 0.1` 로 동일하게 시간적분하므로,
-tier-1 구간에서 **재구성 HP 가 env real HP 와 근접**(검증: 평균차 ≈ 0.044).
-
-### 학습 env 의 시간 게이팅 3-tier damage (`TierGatedDogFightEnv`)
-
-**원본 프레임워크 env**(`single_agent_env.py`)는 `wez` 가 `__init__` 에서 한 번 설정 후
-안 바뀌어 **항상 tier-1 만** 적용합니다(시간 게이팅 없음 — 코드 + 실측으로 확인).
-매뉴얼의 시간 게이팅(tier2 100s, tier3 150s)은 대결 서버 규칙입니다.
-
-그래서 `claude_code/env_utils.py` 의 **`make_env` 는 기본적으로 `TierGatedDogFightEnv`**
-(원본을 상속해 `update_damage` 만 오버라이드)를 사용해, 대결 서버와 동일한 **시간 게이팅
-3-tier damage** 를 학습 env 에 적용합니다(`my_observation.damage_rate` 와 동일 공식).
-`max_engage_time=200s` 라 episode 가 100s/150s 를 넘어 tier-2/3 가 실제로 발생합니다.
-원본 단일-tier 로 비교하려면 `make_env(..., time_gated_damage=False)`.
-
-검증(`verify_tier_damage.py`, 결정론적): tier2 기하(r=3200ft,ATA=1.5°)는 t=50s→0,
-t=120s→0.0005; tier3 기하(r=3800ft,ATA=2.5°)는 t=120s→0, t=160s→0.000095. base env 는
-이 기하에서 항상 0(단일-tier). tier env 값은 공식 × delta_t 와 정확히 일치.
-
-`build_observation` 은 이 재구성값으로 16-D 관측을 만들어, 학습·검증·제출에서 16개
-feature 가 **모두 유효**합니다(기존엔 5개가 추론에서 -1 고정이었음).
-
-HP 누적은 **RL-step 당 정확히 1회** 갱신되어야 하므로(`advance_reconstructor`), 학습은
-`ppo.py`, 추론은 `MLPActionProvider.compute_action` 에서 호출하고 `build_observation`
-은 읽기만 합니다. 따라서 학습·평가·제출의 누적 빈도가 일치합니다(검증: recon 관측
-번들의 학습 중 결정론적 평가 return 과 `evaluate.py` return 이 동일).
-
-**검증 명령**:
-
-```powershell
-D:\other_programs\anaconda3\envs\aip\python.exe claude_code\verify_reconstruction.py
-```
-
-학습 env 실측 결과: 고도 평균오차 ≈ **2.3 m**(7000m 중), 속도 평균오차 ≈ **0.03 m/s**,
-표적 HP 재구성 vs env real HP 평균차 ≈ **0.044** → 위치·자세·속도만으로 거의 정확히
-복원됨(`DT_PER_STEP` 보정으로 tier-1 HP 도 근접). 제출 서버는 시간 게이팅된 3-tier 라
-재구성값이 그쪽과 맞습니다.
-
-> 좌표계 주의: 고도는 학습 NED(D=아래 양수) 기준 `-D` 입니다. 라이브 서버가 z 를
-> "고도(위 양수)"로 준다면 `my_observation.ALT_SIGN` 을 `+1.0` 으로 바꾸세요.
-
-학습:
-```powershell
-D:\other_programs\anaconda3\envs\aip\python.exe claude_code\train.py `
-  --observation-module claude_code.my_observation `
-  --output-name team01 --output-tag recon_v1
-```
-
-## 2) 로컬 검증
-
-```powershell
-D:\other_programs\anaconda3\envs\aip\python.exe claude_code\evaluate.py `
-  --bundle-dir artifacts\models\team01\ppo_mlp_v1 `
-  --episodes 5 --target-mode fixed
-```
-
-## 3) 대결 서버 제출
-
-`submission.py` 상단의 `TEAM_NAME`, `SERVER_IP`, `BUNDLE_DIR` 를 설정 후:
-
-```powershell
-D:\other_programs\anaconda3\envs\aip\python.exe claude_code\submission.py
-```
-
-`ACTION_REPEAT=6` 은 학습 `step_ratio=6` 과 맞춘 값으로, 원본 제출과 동일하게
-6개 PlaneInfo pair마다 정책을 한 번 호출합니다.
-
-## 번들 형식
-
-```text
-artifacts/models/<name>/<tag>/
-├── metadata.json          # 관측 모드, MLP 구조(hidden/activation), throttle 변환 규칙 등
-└── policy_weights.pkl.gz  # gzip 압축된 MLPActorCritic.state_dict()
-```
-
-원본 RLlib 번들은 `policy_weights.pkl.gz` 에 RLModule state 를 담지만, claude_code
-번들은 PyTorch `state_dict` 를 담습니다. `submission.py` 가 이 형식을 직접
-읽으므로 대결 서버 연결에 RLlib 가 전혀 필요 없습니다. (따라서 원본
-`run_unreal_inference.py` / `run_local_dogfight.py` 의 RLlib backend 로는 직접
-로드되지 않으며, claude_code 의 `submission.py` / `evaluate.py` 를 사용합니다.)
-
-## action 변환 (학습 ↔ 추론 일치)
-
-정책은 4차원 raw 값을 출력하고, 환경과 추론 양쪽에서 동일하게 변환됩니다
-(`model.policy_action_to_command`, 원본 `DogFightEnv._to_sim_action` 와 동일):
-
-- roll, pitch, rudder → `[-1, 1]` clip
-- throttle → `(a + 1) / 2` 로 `[0, 1]` 변환
-
-## 알아둘 점: 학습 ↔ 추론 관측 차이 (프레임워크 공통)
-
-이 차이는 claude_code 만의 문제가 아니라 **원본 RL 제출도 동일하게 겪는**
-프레임워크 고유 특성입니다.
-
-- 학습 시 관측은 JSBSim 전체 상태(속도 KCAS, 고도, Health, WEZ 등 포함)로
-  `tactical16` 을 만듭니다.
-- 대결 서버 추론 시 관측은 `PlaneInfo`(위치/자세/속도 9개 값)만으로 구성되므로,
-  `tactical16` 중 KCAS·ALT·HEALTH·target HEALTH·WEZ 플래그 항목은 기본값(정규화 후
-  대부분 `-1`)이 됩니다. 이는 원본 `ProviderCommandPolicy` + `plane_info_to_state`
-  경로를 그대로 사용하기 때문입니다.
-
-상대 기하(ATA/AA/LOS, 상대 위치)는 양쪽에서 동일하게 채워지므로 추적 정책의 핵심
-신호는 보존됩니다. 이 항목들에 과도하게 의존하지 않는 관측/정책 설계가 전이에
-유리합니다.
+| `--iterations` | 150 | 학습 iteration 수 |
+| `--rollout-steps` | 100000 | iteration 당 수집 step 수(전체 worker 합) |
+| `--lr` | 1e-4 | actor 학습률 (1e-3 이상은 이 환경에서 붕괴 위험) |
+| `--gamma` | 0.97 | 할인율 |
+| `--gae-lambda` | 0.95 | GAE λ |
+| `--clip-coef` | 0.2 | PPO 클립 계수 |
+| `--update-epochs` | 4 | 수집 batch 당 업데이트 epoch 수 |
+| `--minibatch-size` | 512 | 미니배치 크기 |
+| `--ent-coef` | 0.0001 | 엔트로피 보너스(탐험) |
+| `--target-kl` | 0.05 | approx_kl 초과 시 epoch 조기 종료 |
+| `--hidden` | 512,512,512 | actor MLP hidden 크기 |
+| `--activation` | tanh | 활성화(`tanh`/`relu`/`elu`) |
+| `--action-bins` | 7 | 행동 채널당 이산 카테고리 수(균등 분할) |
+| `--critic-hidden` / `--critic-activation` / `--critic-lr` | (actor 와 동일) | critic 전용 구조·학습률(별개 네트워크) |
+| `--num-workers` | 물리 코어 수 | Ray 병렬 worker 수. 1 이면 단일 프로세스 |
+| `--device` | cpu | driver update 디바이스(큰 모델은 `cuda`, worker 는 항상 CPU) |
+| `--no-normalize-obs` | (off) | 관측 정규화 끄기 |
+| **보상/관측** | | |
+| `--reward-module` | claude_code.my_reward | 보상 모듈(빈 값이면 프레임워크 기본 보상) |
+| `--observation-module` | claude_code.my_observation | 관측 모듈(빈 값이면 tactical16) |
+| `--distance-reward-scale` | None(→0.001) | 거리 접근 shaping 계수. **phase2 에서 0 으로 끔** |
+| `--aim-reward-scale` | 0.5 | 조준 dense shaping(potential-based) 계수. 0 이면 끔 |
+| **상대/phase** | | |
+| `--self-play` / `--no-self-play` | self-play on | 상대를 학습 중 정책으로 / 스크립트 상대로 |
+| `--target-mode` | loiter | `--no-self-play` 일 때 스크립트 상대(`loiter`/`fixed`/`behavior_tree`/`autopilot`) |
+| `--resume-from` | "" | snapshot(.pt) 에서 actor+critic+obs_rms 이어받기(phase2) |
+| `--frozen-opponent` | (off) | self-play 상대를 학습 시작 시점 정책으로 **고정** |
+| **평가/저장** | | |
+| `--eval-interval` | 5 | 평가 주기(iter). N iter 전 self 상대 승률>0.5 면 best 번들 저장 |
+| `--eval-games` | 20 | 평가 1회당 대결 판 수 |
+| `--output-name` / `--output-tag` | team01 / ppo_mlp_v1 | 번들·로그 저장 경로 이름 |
+
+> `loiter`(선회·고도유지, 자기파괴 없음)가 학습 신호가 깨끗해 스크립트 상대 기본값입니다.
+> `fixed`/`autopilot` 은 표적이 스스로 추락해 무승부로 끝나므로 학습 시연엔 부적합합니다.
+
+---
+
+## 4. 현재 보상 식 (`my_reward.py`)
+
+한 step 의 총 보상 = **damage + distance + aim + terminal** 4개 성분의 합입니다.
+
+**계수(`MY_REWARD_CONFIG`)**: `win_reward=+10`, `loss_reward=-10`, `damage_scale=10`,
+`distance_reward_scale=0.001`, `aim_reward_scale=0.0`(→ CLI 기본 0.5), `aim_range_m=3000`.
+
+1. **damage (주 보상)** — 양측 HP>0 인 매 step:
+   `r_damage = (표적 HP감소 × 1.0 − 내 HP감소 × 0.0) × 10`
+   → 사실상 **표적에 입힌 damage rate × 10** (내 피해는 가중치 0). step 당 대략 0 ~ +1.0.
+
+2. **distance (거리 접근 shaping)** — 직전 RL-step 대비 거리가 `d[m]` 줄면:
+   `r_distance = d × 0.001` (멀어지면 음수). phase2 에서 `--distance-reward-scale 0` 로 끔.
+
+3. **aim (조준 dense shaping, potential-based)** — `--aim-reward-scale` 로 켬(기본 0.5):
+   포텐셜 `Φ = (1+cos ATA)/2 × clip(1 − dist/3000, 0, 1)` 로 두고
+   `r_aim = (Φ_now − Φ_prev) × aim_scale`.
+   **텔레스코핑**이라 episode 총합이 `±aim_scale` 로 bounded → damage 보다 항상 작은
+   **보조 보상**으로만 작용(최적 정책을 바꾸지 않음, reward hacking 방지).
+
+4. **terminal (종료)** — `terminated` 일 때:
+   상대 격추/최소고도 이탈 → `+10`, 내 격추/최소고도 이탈 → `−10`.
+
+> **HP-tiebreak 는 보상이 아니라 평가에서만**: 무승부(timeout) 시 HP 가 낮은 쪽이 패로
+> 판정됩니다(`evaluation.py`). 보상 식에는 들어가지 않습니다.
+
+---
+
+## 5. 관측 벡터 (34-D, `my_observation.py` / `claude34r`)
+
+각도는 **sin/cos 분리**, 상대 위치 Δ는 **signed-log**(`sign(x)·ln(|x|+1)`, 정규화 없음),
+속도는 **스칼라 속력 + 3축(NED)** 를 함께 제공. 나머지는 대체로 `[-1,1]` 정규화.
+
+| idx | feature | idx | feature |
+|---|---|---|---|
+| 0–1 | roll sin/cos | 17–18 | aspect angle sin/cos |
+| 2–3 | pitch sin/cos | 19–20 | LOS azimuth sin/cos |
+| 4–5 | yaw sin/cos | 21–22 | LOS elevation sin/cos |
+| 6 | speed (TAS, 0–600) | 23 | target HP |
+| 7–9 | 내 속도 vel N/E/D (NED 재구성) | 24 | 내가 입히는 damage rate |
+| 10 | altitude (1000–15000m) | 25 | 내가 받는 damage rate |
+| 11 | 내 HP | 26 | pursuit score |
+| 12–14 | 상대위치 ΔN/E/D (signed-log) | 27 | 표적 speed |
+| 15–16 | ATA(antenna train angle) sin/cos | 28–30 | 표적 속도 N/E/D (NED 재구성) |
+| | | 31 | slant range (0–2000m) |
+| | | 32 | closure rate (접근 +, 이탈 −) |
+| | | 33 | aim_sharp = `exp(−(ATA/3°)²)` (1–3° 콘 고분해능) |
+
+> **핵심**: 대결 서버 추론에서는 위치·자세·속도(state 0~8)만 들어오고 속도(KCAS)·고도·HP·
+> WEZ 는 0 입니다. `StateReconstructor` 가 고도=`−D`, 속력=`‖u,v,w‖`, HP=damage 공식 누적,
+> 기하=`geo_info` 로 **복원**하므로 학습·추론의 관측이 일치합니다. 3축 속도는 raw 성분
+> (학습=body / 추론=world 프레임 불일치) 대신 **속력+자세로 NED 재구성**해 train/test 를 맞춥니다.
+
+---
+
+## 6. 모델 구조 (`MLPDiscreteActorCritic`)
+
+- **이산(discrete) 정책**: 행동 4채널(roll / pitch / yaw · rudder / throttle) 각각을
+  `num_bins`(기본 7)개 균등 분할 카테고리로 두고, **채널별 독립 Categorical** 로 샘플.
+  (최대 엔트로피 = 4·ln 7 ≈ 7.78.)
+- **actor**: `obs(34) → MLP(512,512,512, tanh) → 4×7 로짓`.
+- **critic**: **actor 와 파라미터를 공유하지 않는 별개 MLP** `obs(34) → … → 1`,
+  **별도 optimizer** 로 독립 업데이트. 구조·학습률도 `--critic-*` 로 따로 설정 가능.
+- 이산 카테고리 index → `[-1,1]` 연속 행동값으로 변환 후, roll/pitch/rudder 는 clip,
+  throttle 은 `(a+1)/2` 로 `[0,1]` 변환(원본 `DogFightEnv._to_sim_action` 과 동일).
+- 저장은 원본과 같은 **2-파일 번들**: `metadata.json`(구조·관측모듈·정규화 통계) +
+  `policy_weights.pkl.gz`(state_dict).
+
+---
+
+## 7. 학습 로그 읽는 법
+
+`ppo_training_log.csv` 컬럼 + iteration 출력:
+
+- `return` / `len` : 평균 episode 합산 보상 / 길이(탐험 on rollout 기준)
+- `damage` / `dist` / `aim` : 보상 성분별 평균(어느 신호로 배우는지 확인)
+- `ent` : 정책 엔트로피(탐험 정도), `kl` : approx_kl(trust region)
+- `ev` : value function explained variance(가치함수 학습 지표; 보상이 희소하면 낮음)
+- `EVAL vs iterN` : `--eval-interval` 마다 **탐험 끈 결정론적 정책**으로 N iter 전 self 와 대결한 승률/전적. **승률>0.5 면 best 번들로 저장**.
+
+---
+
+## 8. 지금까지 적용한 아이디어 정리
+
+**관측 설계**
+- 각도 **sin/cos 분리**(순환성 보존), 상대위치 Δ **signed-log**(정규화 없이 부호+로그 압축)
+- **NED 속도 재구성**(속력+자세) — 학습(body)/추론(world) 프레임 불일치 제거 → train/test 일치
+- 제출환경 미제공 항목(속도·고도·HP·WEZ) **StateReconstructor 로 복원** → 34-D 전부 유효
+- damage 조준 보강 feature: 표적 속도, 명시 slant range, closure rate, 고분해능 `aim_sharp`
+
+**보상 설계**
+- 표적에 입힌 damage 중심(내 피해 가중치 0), 종료 ±10
+- **거리 접근 shaping**(phase1) + **potential-based 조준 shaping**(텔레스코핑 → damage 에 종속, 최적 정책 불변)
+- HP-tiebreak 는 보상이 아니라 **평가 판정**에서만
+
+**학습 구조**
+- 순수 PyTorch PPO(GAE + clipped surrogate), **actor/critic 완전 분리**(별 네트워크·별 optimizer)
+- **이산 정책**(채널별 Categorical, 7 bins) — 연속 가우시안 대비 안정적 탐험
+- 관측 running mean/std 정규화(통계 번들 저장 → 추론 동일 적용), per-minibatch advantage 정규화, approx_kl 조기 종료
+- **Ray 병렬 rollout**(worker=물리 코어 수, driver 가 weights/obs_rms broadcast)
+- **self-play**(기본) + `--frozen-opponent` 로 상대 고정
+- **2-phase 학습**: phase1(거리 shaping) → phase2(`--resume-from` 이어받아 거리 off + 고정 상대)
+- **WEZ 3-tier 시간 게이팅**(tier1 항상 / tier2 100s / tier3 150s, 콘 1°/2°/3° 고정)을 학습 env(`TierGatedDogFightEnv`)에도 반영해 대결 서버 규칙과 일치
+- best-model saving: 결정론적 평가 승률>0.5 iteration 만 번들로 저장(마지막 출렁임 방지)
+
+**제거/정리한 것** (실험 후 불필요/해로워서 삭제): LR 선형 감쇠, WEZ 콘 커리큘럼,
+value-function 클리핑, 보상 스케일링(RewardScaler), env 의 max_separation 무승부/리셋.
