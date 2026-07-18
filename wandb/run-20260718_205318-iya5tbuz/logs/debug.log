@@ -17,3 +17,9 @@ config: {'iterations': 500, 'rollout_steps': 50000, 'lr': 0.0001, 'gamma': 0.97,
 2026-07-18 20:53:19,094 INFO    MainThread:26844 [wandb_run.py:_redirect():2540] Wrapping output streams.
 2026-07-18 20:53:19,094 INFO    MainThread:26844 [wandb_run.py:_redirect():2563] Redirects installed.
 2026-07-18 20:53:19,097 INFO    MainThread:26844 [wandb_init.py:init():1016] run started, returning control to user process
+2026-07-18 23:17:01,793 INFO    MainThread:26844 [wandb_run.py:_finish():2383] finishing run leetm2021-postech/AIP contest/iya5tbuz
+2026-07-18 23:17:01,794 INFO    MainThread:26844 [wandb_run.py:_atexit_cleanup():2588] got exitcode: 0
+2026-07-18 23:17:01,794 INFO    MainThread:26844 [wandb_run.py:_restore():2570] restore
+2026-07-18 23:17:01,794 INFO    MainThread:26844 [wandb_run.py:_restore():2576] restore done
+2026-07-18 23:17:03,276 INFO    wandb-AsyncioManager-main:26844 [service_client.py:_forward_responses():122] [no run ID] Reached EOF.
+2026-07-18 23:17:03,276 INFO    wandb-AsyncioManager-main:26844 [mailbox.py:close():154] [no run ID] Closing mailbox, abandoning 1 handles.
