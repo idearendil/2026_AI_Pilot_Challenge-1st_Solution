@@ -24,7 +24,8 @@ for _p in (ROOT, ROOT / "src"):
 
 from claude_code.model import make_actor_critic, discrete_indices_to_continuous
 from claude_code.normalizers import RunningMeanStd
-from claude_code.ppo import PPOConfig, PPOTrainer, IterationStats, compute_gae, OBS_CLIP
+from claude_code.ppo import (PPOConfig, PPOTrainer, IterationStats, compute_gae, OBS_CLIP,
+                             rollout_outcome, _outcome_counts, _outcome_counts_by_opp)
 
 
 def physical_cpu_count() -> int:
@@ -154,6 +155,55 @@ def _make_worker_cls():
                 self._frozen_opp_model, frozen_rms, self.env._observation_fn,
                 self.env._observation_mode, sr, "cpu", explore=True)
 
+        def _build_opp_provider(self, state_dict, mean, var, count, explore=True):
+            """broadcast 받은 state+rms 로 frozen opponent SelfPlayProvider 생성(worker)."""
+            from claude_code.env_utils import STANDARD_ENV_CONFIG
+            from claude_code.self_play import SelfPlayProvider
+            m = make_actor_critic(**self._model_kwargs)
+            m.load_state_dict({k: torch.as_tensor(v) for k, v in state_dict.items()})
+            m.eval()
+            rms = None
+            if self.obs_rms is not None:
+                rms = RunningMeanStd(shape=(self.obs_dim,))
+                rms.mean = np.asarray(mean, dtype=np.float64)
+                rms.var = np.asarray(var, dtype=np.float64)
+                rms.count = float(count)
+            sr = int(STANDARD_ENV_CONFIG["step_ratio"])
+            return SelfPlayProvider(
+                m, rms, self.env._observation_fn, self.env._observation_mode,
+                sr, "cpu", explore=explore)
+
+        def pool_init(self, state_dict, mean, var, count, weights, pool_max, seed):
+            """opponent pool 초기화(후보 1개 = 초기 정책). target provider 를 pool 로 교체."""
+            from claude_code.self_play import PoolSelfPlayProvider
+            self._pool_max = max(1, int(pool_max))
+            prov = self._build_opp_provider(state_dict, mean, var, count)
+            self._pool_provider = PoolSelfPlayProvider([prov], weights, seed=int(seed))
+            self.env._target_action_provider = self._pool_provider
+
+        def pool_add(self, state_dict, mean, var, count):
+            """현재 정책 frozen copy 를 pool 에 추가(초과 시 oldest 제거) + env 리셋."""
+            prov = self._build_opp_provider(state_dict, mean, var, count)
+            providers = list(self._pool_provider.providers)
+            providers.append(prov)
+            if len(providers) > self._pool_max:
+                providers.pop(0)
+            self._pool_provider.set_pool(providers)
+            if self._reset_recon is not None:
+                self._reset_recon()
+            obs, _ = self.env.reset()
+            if self._reset_recon is not None:
+                self._reset_recon()
+            self._next_obs = np.asarray(obs, dtype=np.float32)
+            self._next_done = False
+            self._ep_return = 0.0
+            self._ep_len = 0
+
+        def pool_set_weights(self, weights):
+            """opponent 샘플링 가중치 갱신."""
+            if getattr(self, "_pool_provider", None) is not None:
+                self._pool_provider.set_weights(weights)
+
         def _norm(self, obs):
             if self.obs_rms is None:
                 return np.asarray(obs, dtype=np.float32)
@@ -168,7 +218,8 @@ def _make_worker_cls():
             rew_buf = np.zeros(n_steps, dtype=np.float32)
             done_buf = np.zeros(n_steps, dtype=np.float32)
             val_buf = np.zeros(n_steps, dtype=np.float32)
-            ep_returns, ep_lengths, ep_components = [], [], []
+            ep_returns, ep_lengths, ep_components, ep_outcomes = [], [], [], []
+            ep_opp_indices = []
 
             for t in range(n_steps):
                 raw = self._next_obs
@@ -198,6 +249,11 @@ def _make_worker_cls():
                     comp = info.get("ep_reward_components")
                     if isinstance(comp, dict):
                         ep_components.append(dict(comp))
+                    oc = rollout_outcome(info)
+                    if oc is not None:
+                        ep_outcomes.append(oc)
+                        prov = getattr(self.env, "_target_action_provider", None)
+                        ep_opp_indices.append(int(getattr(prov, "last_index", 0)))
                     self._ep_return = 0.0
                     self._ep_len = 0
                     if self._reset_recon is not None:
@@ -215,7 +271,8 @@ def _make_worker_cls():
                 "obs": obs_buf, "actions": act_buf, "logp": logp_buf,
                 "advantages": adv, "returns": ret, "values": val_buf,
                 "ep_returns": ep_returns, "ep_lengths": ep_lengths,
-                "ep_components": ep_components,
+                "ep_components": ep_components, "ep_outcomes": ep_outcomes,
+                "ep_opp_indices": ep_opp_indices,
                 "rms_mean": (raw_buf.mean(0) if self.obs_rms is not None else None),
                 "rms_var": (raw_buf.var(0) if self.obs_rms is not None else None),
                 "rms_count": n_steps,
@@ -347,7 +404,9 @@ class ParallelPPOTrainer:
         ep_returns = [x for r in results for x in r["ep_returns"]]
         ep_lengths = [x for r in results for x in r["ep_lengths"]]
         ep_components = [x for r in results for x in r["ep_components"]]
-        return batch, ep_returns, ep_lengths, ep_components
+        ep_outcomes = [x for r in results for x in r.get("ep_outcomes", [])]
+        ep_opp_indices = [x for r in results for x in r.get("ep_opp_indices", [])]
+        return batch, ep_returns, ep_lengths, ep_components, ep_outcomes, ep_opp_indices
 
     # 업데이트 로직은 PPOTrainer.update 재사용
     def update(self, batch):
@@ -381,12 +440,49 @@ class ParallelPPOTrainer:
         ray.get([w.set_frozen_opponent.remote(ref, rms_mean, rms_var, rms_count)
                  for w in self.workers])
 
+    def _current_state_rms(self):
+        state = {k: v.detach().cpu().numpy() for k, v in self.model.state_dict().items()}
+        mean = self.obs_rms.mean if self.obs_rms is not None else None
+        var = self.obs_rms.var if self.obs_rms is not None else None
+        count = self.obs_rms.count if self.obs_rms is not None else 0.0
+        return state, mean, var, count
+
+    def install_opponent_pool(self, pool_max: int = 5) -> None:
+        """모든 worker 의 opponent pool 초기화(후보 1개 = 현재 정책). broadcast.
+
+        학습 시작 시 1회 호출. worker 별로 다른 seed 를 줘서 opponent 샘플 순서가
+        분산되게 한다(pool 다양성).
+        """
+        import ray
+        self._pool_max = max(1, int(pool_max))
+        state, mean, var, count = self._current_state_rms()
+        ref = ray.put(state)
+        ray.get([
+            w.pool_init.remote(ref, mean, var, count, [1.0], self._pool_max,
+                               self.cfg.seed + 101 + i)
+            for i, w in enumerate(self.workers)
+        ])
+
+    def pool_add_current(self) -> None:
+        """현재 정책 frozen copy 를 모든 worker 의 pool 에 추가(초과 시 oldest 제거)."""
+        import ray
+        state, mean, var, count = self._current_state_rms()
+        ref = ray.put(state)
+        ray.get([w.pool_add.remote(ref, mean, var, count) for w in self.workers])
+
+    def pool_set_weights(self, weights) -> None:
+        """모든 worker 의 opponent 샘플링 가중치 갱신(broadcast)."""
+        import ray
+        wl = list(weights)
+        ray.get([w.pool_set_weights.remote(wl) for w in self.workers])
+
     def train(self, on_iteration=None):
         import time
         history = []
         for it in range(1, self.cfg.total_iterations + 1):
             t0 = time.time()
-            batch, ep_returns, ep_lengths, ep_components = self.collect_rollout()
+            (batch, ep_returns, ep_lengths, ep_components,
+             ep_outcomes, ep_opp_indices) = self.collect_rollout()
             pl, vl, ent, kl, ev = self.update(batch)
 
             mean_ret = float(np.mean(ep_returns)) if ep_returns else float("nan")
@@ -395,6 +491,8 @@ class ParallelPPOTrainer:
             if ep_components:
                 for key in ("pursuit", "damage", "distance", "aim", "terminal", "safety", "step"):
                     comp_means[key] = float(np.mean([c.get(key, 0.0) for c in ep_components]))
+            comp_means.update(_outcome_counts(ep_outcomes))
+            comp_means["per_opp"] = _outcome_counts_by_opp(ep_opp_indices, ep_outcomes)
             stats = IterationStats(
                 iteration=it, global_step=self.global_step, mean_return=mean_ret,
                 mean_length=mean_len, completed_episodes=len(ep_returns),

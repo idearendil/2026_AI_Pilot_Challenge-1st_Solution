@@ -1,0 +1,116 @@
+_wandb:
+    value:
+        cli_version: 0.28.1
+        e:
+            q7c7ee9app04weoa9vp139028472w6fg:
+                args:
+                    - --output-name
+                    - team01
+                    - --output-tag
+                    - ppo_phase1
+                codePath: claude_code\train.py
+                codePathLocal: claude_code\train.py
+                cpu_count: 6
+                cpu_count_logical: 12
+                cudaVersion: "13.1"
+                disk:
+                    /:
+                        total: "499797454848"
+                        used: "360221831168"
+                email: leetm2021@postech.ac.kr
+                executable: D:\other_programs\anaconda3\envs\aip\python.exe
+                git:
+                    commit: 047ea9335994d8ab0105ede5f4f2861b29e64dda
+                    remote: https://github.com/idearendil/Release.git
+                gpu: NVIDIA GeForce RTX 3070 Ti
+                gpu_count: 1
+                gpu_nvidia:
+                    - architecture: Ampere
+                      cudaCores: 6144
+                      memoryTotal: "8589934592"
+                      name: NVIDIA GeForce RTX 3070 Ti
+                      uuid: GPU-62a5a7d7-54b9-0497-640f-30583c3b185b
+                host: MAGI3
+                memory:
+                    total: "34191097856"
+                os: Windows-10-10.0.26200-SP0
+                program: D:\AIP_LIB_claude\DogFightEnv\Release\claude_code\train.py
+                python: CPython 3.11.15
+                root: D:\AIP_LIB_claude\DogFightEnv\Release
+                startedAt: "2026-07-17T03:32:50.231702Z"
+                writerId: q7c7ee9app04weoa9vp139028472w6fg
+        m: []
+        python_version: 3.11.15
+        t:
+            "1":
+                - 1
+                - 30
+            "2":
+                - 1
+                - 30
+            "3":
+                - 2
+                - 13
+                - 16
+                - 61
+            "4": 3.11.15
+            "5": 0.28.1
+            "8":
+                - 3
+            "12": 0.28.1
+            "13": windows-amd64
+act_dim:
+    value: 4
+action_bins:
+    value: 7
+activation:
+    value: tanh
+clip_coef:
+    value: 0.2
+damage_scale:
+    value: 10
+ent_coef:
+    value: 0.0001
+frozen_opponent:
+    value: false
+gae_lambda:
+    value: 0.95
+gamma:
+    value: 0.97
+hidden:
+    value: 512,512,512
+iterations:
+    value: 300
+lr:
+    value: 0.0001
+minibatch_size:
+    value: 512
+num_workers:
+    value: 6
+obs_dim:
+    value: 42
+observation_module:
+    value: claude_code.my_observation
+resume_from:
+    value: ""
+reward_module:
+    value: claude_code.my_reward
+reward_overrides:
+    value:
+        aim_reward_scale: 0.5
+rollout_steps:
+    value: 100000
+self_play:
+    value: true
+selfplay_ema_alpha:
+    value: 0.05
+selfplay_gate_threshold:
+    value: 0.6
+target_kl:
+    value: 0.05
+target_mode:
+    value: loiter
+update_epochs:
+    value: 4
+vf_coef:
+    value: 0.5

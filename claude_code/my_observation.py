@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""claude_code 관측 모듈.
+"""claude_code 관측 모듈 (multi-frame).
 
 이 파일은 학습, 평가, self-play, 제출 코드가 사용하는 외부 계약을 유지한다.
 
@@ -7,6 +7,41 @@
   - _RECON은 모듈 전역 singleton이다.
   - reset_reconstructor()/advance_reconstructor()는 RL step마다 한 번만 호출한다.
   - build_observation()은 reconstructor 값을 읽기만 한다.
+
+관측 구조 (claude141r)
+----------------------
+관측은 두 블록으로 나뉜다.
+
+  1) frame-invariant 스칼라 블록 (27개): 속력, HP, 에너지고도차, 슬랜트 거리,
+     closure, 교전 기하각(ATA/AA/LOS az·el의 sin/cos), 조준/거리 margin, 시간 등.
+     좌표계와 무관한 값이라 한 번만 넣는다.
+
+  2) frame-expressed 벡터 블록 (114개): 아래 7개 방향 벡터를 6개 좌표계 성분으로
+     각각 표현한다. 퇴화(정보 없는) 조합은 제외한다.
+
+방향 벡터 (7):
+  gravity     : 월드 아래 방향(중력) 단위벡터  → 자세를 절대 기준으로 인지
+  los         : 표적 상대위치(시선) 단위벡터
+  own_vel     : 내 속도 벡터 (정규화 /600)
+  tgt_vel     : 표적 속도 벡터 (정규화 /600)
+  rel_vel     : 상대 속도 벡터 (정규화 /600)
+  own_omega   : 내 각속도 ω (tanh /4)
+  tgt_omega   : 표적 각속도 ω (tanh /4)
+
+좌표계 (6):
+  world   : 월드 절대 좌표계(NED)
+  mybody  : 내 전투기 body frame (x 기수전방/y 오른쪽날개/z 아래)
+  oppbody : 상대 전투기 body frame
+  myvel   : 내 선속도 좌표계 (x=속도방향, roll은 중력으로 고정)
+  oppvel  : 상대 선속도 좌표계
+  los     : 두 기체를 잇는 직선을 x축으로 하는 좌표계 (roll은 중력으로 고정)
+
+퇴화 조합(제외):
+  gravity@world (=상수 [0,0,1]), los@los (=상수 [1,0,0]),
+  own_vel@myvel (=(|v|,0,0)), tgt_vel@oppvel (=(|v|,0,0))
+
+각속도를 좌표계로 만들 수는 없다(회전이 없으면 축이 정의되지 않고, 나머지 두 축을
+고정할 기준이 없다). 대신 각속도 '벡터'를 위 6개 좌표계 성분으로 다시 표현한다.
 
 state 입력 계약
 ---------------
@@ -26,23 +61,19 @@ state 입력 계약
   NED frame  : N+ 북쪽, E+ 동쪽, D+ 아래
   Body frame : x+ 기수 전방, y+ 오른쪽 날개, z+ 아래
 
-중요: state[6:9]는 body-frame 속도 u/v/w로 직접 사용한다. 예전처럼 speed,
-pitch, yaw로 NED 속도를 재구성하는 경로는 의도적으로 쓰지 않는다. NED 속도가
-필요할 때만 rotation matrix로 body 속도를 NED로 변환한다.
+중요: state[6:9]는 body-frame 속도 u/v/w로 직접 사용한다. NED 속도가 필요할 때만
+rotation matrix로 body 속도를 NED로 변환한다.
 
 damage 재구성
 -------------
 서버가 HP를 직접 주지 않아도 된다. StateReconstructor는 현재 거리, ATA, episode
 시간을 사용해 같은 3-tier cone-damage rule을 적분한다. 하위 tier가 우선이다.
-예를 들어 150초 이후라도 더 좁은 tier1 거리/각도 조건을 만족하면 tier1 damage를
-먼저 적용한다.
 
-ownship p/q/r 재구성
---------------------
-ownship p/q/r만 추정한다. StateReconstructor.advance()에서 직전 자세와 현재 자세를
-사용한다. 추정은 상대 rotation의 SO(3) log를 사용하므로 yaw가 179 deg -> -179 deg로
-wrap되어도 인위적인 spike가 생기지 않는다. target p/q/r은 이 42차원 observation에
-포함하지 않는다.
+p/q/r 재구성
+------------
+ownship과 target 양쪽의 body p/q/r을 각각 추정한다. advance()에서 직전 자세와 현재
+자세로 상대 rotation의 SO(3) log를 취해 yaw wrap에도 spike가 없다. own_pqr_est /
+tgt_pqr_est는 각각 해당 기체의 body frame 성분이다.
 """
 from __future__ import annotations
 
@@ -98,59 +129,82 @@ TIER2_MAX_RANGE_FT = 3500.0
 TIER3_MAX_RANGE_FT = 4000.0
 EPISODE_MAX_TIME_SEC = 200.0
 
-OBSERVATION_MODE = "claude42r"
-OBSERVATION_SIZE = 42
+# ── frame-invariant 스칼라 블록 (좌표계와 무관, 한 번만) ──────────────────────
+SCALAR_FEATURE_NAMES = [
+    "own_speed_norm",
+    "target_speed_norm",
+    "AoA_tanh",
+    "sideslip_tanh",
+    "altitude_margin_low_tanh",
+    "vertical_speed_norm",
+    "own_hp_norm",
+    "target_hp_norm",
+    "hp_diff",
+    "energy_advantage_softsign",
+    "slant_range_norm",
+    "closure_rate_norm",
+    "sin_ATA",
+    "cos_ATA",
+    "sin_AA",
+    "cos_AA",
+    "sin_LOS_azimuth",
+    "cos_LOS_azimuth",
+    "sin_LOS_elevation",
+    "cos_LOS_elevation",
+    "aim_sharp",
+    "aim_margin_active_tanh",
+    "enemy_aim_sharp",
+    "enemy_aim_margin_active_tanh",
+    "range_margin_near_tanh",
+    "range_margin_far_active_tanh",
+    "time_norm",
+]
 
-# ── 42-D observation feature 요약 (build_observation 참고) ────────────────────
-# 모든 값은 대략 [-1,1] 범위로 scaling되며, 마지막에 전체 clip은 하지 않는다.
-# 표현 기준: body = ownship body frame(x 기수전방/y 오른쪽날개/z 아래), NED = 월드.
-#
-#   idx  feature                     설명
-#   ---  --------------------------  -----------------------------------------
-#    0   gravity_body_x              중력벡터를 ownship body frame으로 표현(어디가
-#    1   gravity_body_y              아래인가 → 자세를 절대 기준으로 인지). 단위벡터.
-#    2   gravity_body_z
-#    3   own_speed_norm              내 속력 |u,v,w| / 600
-#    4   own_vel_body_x_norm         내 body 속도 u(기수 전방) / 600
-#    5   own_vel_body_y_norm         내 body 속도 v(오른쪽 날개) / 600
-#    6   own_vel_body_z_norm         내 body 속도 w(아래) / 600
-#    7   own_p_est_tanh              내 롤레이트 p (자세 history의 SO(3) log 추정) tanh(/4)
-#    8   own_q_est_tanh              내 피치레이트 q, 〃
-#    9   own_r_est_tanh              내 요레이트 r, 〃
-#   10   AoA_tanh                    받음각 arctan2(w,u) tanh(/30°)
-#   11   sideslip_tanh               옆미끄럼각 arctan2(v,·) tanh(/15°)
-#   12   altitude_margin_low_tanh    최소고도(300m) 마진 tanh. 0이면 정확히 hard-deck.
-#   13   vertical_speed_norm         상승률(NED, 상승=+) / 100
-#   14   own_hp_norm                 내 HP(재구성) [0,1]
-#   15   target_speed_norm           표적 속력 / 600
-#   16   target_hp_norm              표적 HP(재구성) [0,1]
-#   17   hp_diff                     내 HP - 표적 HP  (우세 +, 열세 -)
-#   18   energy_advantage_softsign   에너지고도차(고도+v²/2g) softsign(/5000m)
-#   19   rel_pos_body_x_softsign     표적 상대위치를 body frame으로 → 앞/뒤 softsign(/1000m)
-#   20   rel_pos_body_y_softsign     〃 좌/우
-#   21   rel_pos_body_z_softsign     〃 위/아래
-#   22   rel_vel_body_x_norm         표적 상대속도(body frame) 앞/뒤 / 600
-#   23   rel_vel_body_y_norm         〃 좌/우
-#   24   rel_vel_body_z_norm         〃 위/아래
-#   25   slant_range_norm            표적까지 거리 / 2500m
-#   26   closure_rate_norm           접근율(LOS 투영, 접근=+) / 1000
-#   27   sin_ATA \                    ATA(내 기수→표적 이탈각) sin/cos
-#   28   cos_ATA /
-#   29   sin_AA  \                    AA(표적 기준 내 aspect angle) sin/cos
-#   30   cos_AA  /
-#   31   sin_LOS_azimuth \            LOS 방위각 sin/cos
-#   32   cos_LOS_azimuth /
-#   33   sin_LOS_elevation \          LOS 고각 sin/cos
-#   34   cos_LOS_elevation /
-#   35   aim_sharp                   내 조준 예리도 exp(-(ATA/3°)²) → [-1,1] (표적이 내 콘 안?)
-#   36   aim_margin_active_tanh      현재 활성 tier 콘 기준 조준 여유 tanh (양수=콘 안)
-#   37   enemy_aim_sharp             적의 조준 예리도 exp(-(적ATA/3°)²) → 피격 위험 인지
-#   38   enemy_aim_margin_active_tanh 적 콘 기준 내 피격 여유 tanh (양수=적 콘 안=위험)
-#   39   range_margin_near_tanh      활성 damage 밴드 near-edge 여유 tanh (너무 가까운가)
-#   40   range_margin_far_active_tanh 활성 damage 밴드 far-edge 여유 tanh (너무 먼가)
-#   41   time_norm                   episode 경과시간 / 200s (0s→-1, 200s→+1)
-#
-# 시간 게이팅(tier2 100s, tier3 150s)에 따라 35~40의 active envelope가 넓어진다.
+# ── frame-expressed 벡터 블록 ────────────────────────────────────────────────
+# 6개 좌표계. 순서 고정(관측 index 규약).
+FRAME_NAMES = ["world", "mybody", "oppbody", "myvel", "oppvel", "los"]
+
+# (key, scale_kind, 제외할 frame 집합)
+#   scale_kind: "unit"  → 단위벡터 성분 그대로
+#               "vel"   → normalize(comp, -600, 600)
+#               "omega" → tanh(comp / PQR_SCALE_RAD_S)
+VECTOR_SPECS = [
+    ("gravity",   "unit",  frozenset({"world"})),   # world 에선 상수 [0,0,1]
+    ("los",       "unit",  frozenset({"los"})),      # los frame 에선 상수 [1,0,0]
+    ("own_vel",   "vel",   frozenset({"myvel"})),    # myvel frame 에선 (|v|,0,0)
+    ("tgt_vel",   "vel",   frozenset({"oppvel"})),   # oppvel frame 에선 (|v|,0,0)
+    ("rel_vel",   "vel",   frozenset()),
+    ("own_omega", "omega", frozenset()),
+    ("tgt_omega", "omega", frozenset()),
+]
+
+
+def _vector_layout():
+    """(key, scale_kind, frame) 리스트. build_observation 과 이름 생성이 공유한다."""
+    layout = []
+    for key, kind, skip in VECTOR_SPECS:
+        for fr in FRAME_NAMES:
+            if fr in skip:
+                continue
+            layout.append((key, kind, fr))
+    return layout
+
+
+_VEC_LAYOUT = _vector_layout()
+
+
+def _all_feature_names():
+    names = list(SCALAR_FEATURE_NAMES)
+    for key, _kind, fr in _VEC_LAYOUT:
+        for ax in ("x", "y", "z"):
+            names.append(f"{key}__{fr}_{ax}")
+    return names
+
+
+FEATURE_NAMES = _all_feature_names()
+
+OBSERVATION_MODE = "claude141r"
+OBSERVATION_SIZE = len(FEATURE_NAMES)
 
 # Gym/model metadata에 기록할 observation space bound다.
 # 전체 observation을 마지막에 clip하는 용도로 사용하지 않는다.
@@ -250,6 +304,33 @@ def _body_to_ned_matrix(roll_deg, pitch_deg, yaw_deg):
     return _ned_to_body_matrix(roll_deg, pitch_deg, yaw_deg).T
 
 
+def _dir_frame(x_axis_ned):
+    """방향 벡터 x_axis_ned를 x축으로, 중력을 기준으로 roll을 고정한 좌표계를 만든다.
+
+    반환 R은 R_ned_to_frame (행 = frame 축의 NED 표현). frame_component = R @ v_ned.
+    frame 규약은 body와 동일(x 전방, y 오른쪽, z 아래). x축이 중력과 거의 평행하면
+    (수직 비행) 북 → 동 순으로 fallback 기준축을 쓴다. x축 크기가 0이면 항등.
+    """
+    x = np.asarray(x_axis_ned, dtype=np.float64)
+    nx = np.linalg.norm(x)
+    if nx < 1e-8:
+        return np.eye(3, dtype=np.float64)
+    x = x / nx
+    down = np.array([0.0, 0.0, 1.0], dtype=np.float64)
+    z = down - np.dot(down, x) * x
+    if np.linalg.norm(z) < 1e-6:
+        ref = np.array([1.0, 0.0, 0.0], dtype=np.float64)   # north
+        z = ref - np.dot(ref, x) * x
+        if np.linalg.norm(z) < 1e-6:
+            ref = np.array([0.0, 1.0, 0.0], dtype=np.float64)  # east
+            z = ref - np.dot(ref, x) * x
+    z = z / np.linalg.norm(z)
+    y = np.cross(z, x)
+    y = y / np.linalg.norm(y)
+    z = np.cross(x, y)
+    return np.vstack([x, y, z])
+
+
 def _log_so3(r_mat):
     tr = float(np.trace(r_mat))
     cos_theta = (tr - 1.0) * 0.5
@@ -267,10 +348,20 @@ def _log_so3(r_mat):
     ], dtype=np.float64) * (theta / denom)
 
 
+def _estimate_pqr(prev_att, curr_att, dt):
+    """직전/현재 자세(roll,pitch,yaw deg)에서 body p/q/r [rad/s]을 추정한다."""
+    if prev_att is None:
+        return np.zeros(3, dtype=np.float64)
+    r_prev = _body_to_ned_matrix(prev_att[0], prev_att[1], prev_att[2])
+    r_curr = _body_to_ned_matrix(curr_att[0], curr_att[1], curr_att[2])
+    r_delta = r_prev.T @ r_curr
+    return _log_so3(r_delta) / max(dt, 1e-8)
+
+
 class StateReconstructor:
     """RL step마다 정확히 한 번 갱신되는 상태 재구성기.
 
-    advance()는 HP damage를 적분하고, episode 시간을 진행시키며, ownship 자세
+    advance()는 HP damage를 적분하고, episode 시간을 진행시키며, ownship/target 자세
     history에서 body p/q/r을 추정한다. build_observation()은 이 값들을 읽기만 해야
     한다. RL step 하나에서 advance()가 두 번 호출되면 damage와 시간이 중복 누적된다.
     """
@@ -290,7 +381,9 @@ class StateReconstructor:
         self.last_ata_own = 180.0
         self.last_ata_tgt = 180.0
         self.prev_own_att = None
+        self.prev_tgt_att = None
         self.own_pqr_est = np.zeros(3, dtype=np.float64)
+        self.tgt_pqr_est = np.zeros(3, dtype=np.float64)
 
     def advance(self, own_state, tgt_state) -> None:
         own = np.asarray(own_state, dtype=np.float64)
@@ -312,28 +405,16 @@ class StateReconstructor:
         self.last_ata_own = ata_own
         self.last_ata_tgt = ata_tgt
 
-        curr_att = np.array([
-            own[StateIndex.ROLL],
-            own[StateIndex.PITCH],
-            own[StateIndex.YAW],
+        curr_own_att = np.array([
+            own[StateIndex.ROLL], own[StateIndex.PITCH], own[StateIndex.YAW],
         ], dtype=np.float64)
-        if self.prev_own_att is None:
-            self.own_pqr_est[:] = 0.0
-        else:
-            r_prev = _body_to_ned_matrix(
-                self.prev_own_att[0],
-                self.prev_own_att[1],
-                self.prev_own_att[2],
-            )
-            r_curr = _body_to_ned_matrix(
-                curr_att[0],
-                curr_att[1],
-                curr_att[2],
-            )
-            r_delta = r_prev.T @ r_curr
-            rotvec = _log_so3(r_delta)
-            self.own_pqr_est = rotvec / max(self.dt, 1e-8)
-        self.prev_own_att = curr_att
+        curr_tgt_att = np.array([
+            tgt[StateIndex.ROLL], tgt[StateIndex.PITCH], tgt[StateIndex.YAW],
+        ], dtype=np.float64)
+        self.own_pqr_est = _estimate_pqr(self.prev_own_att, curr_own_att, self.dt)
+        self.tgt_pqr_est = _estimate_pqr(self.prev_tgt_att, curr_tgt_att, self.dt)
+        self.prev_own_att = curr_own_att
+        self.prev_tgt_att = curr_tgt_att
 
         self.t_sec += self.dt
 
@@ -357,13 +438,12 @@ def advance_reconstructor(own_state, tgt_state) -> None:
 
 def build_observation(ownship_state, target_state, geo_info, wez_config=None,
                       reconstructor=None) -> np.ndarray:
-    """42차원 claude42r observation을 만든다.
+    """claude141r multi-frame observation을 만든다.
 
     wez_config는 기존 외부 signature 호환을 위해 받지만 이 observation에서는 쓰지
     않는다. damage envelope feature는 고정 서버 rule과 재구성 episode 시간을 사용한다.
     """
     rec = reconstructor if reconstructor is not None else _RECON
-    obs = np.zeros(OBSERVATION_SIZE, dtype=np.float32)
 
     own = np.asarray(ownship_state, dtype=np.float64)
     tgt = np.asarray(target_state, dtype=np.float64)
@@ -381,12 +461,14 @@ def build_observation(ownship_state, target_state, geo_info, wez_config=None,
 
     r_ned_to_body_own = _ned_to_body_matrix(own_roll, own_pitch, own_yaw)
     r_body_to_ned_own = r_ned_to_body_own.T
-    r_body_to_ned_tgt = _body_to_ned_matrix(tgt_roll, tgt_pitch, tgt_yaw)
+    r_ned_to_body_tgt = _ned_to_body_matrix(tgt_roll, tgt_pitch, tgt_yaw)
+    r_body_to_ned_tgt = r_ned_to_body_tgt.T
 
     own_vel_body = np.asarray(own[6:9], dtype=np.float64)
     tgt_vel_body = np.asarray(tgt[6:9], dtype=np.float64)
     own_vel_ned = r_body_to_ned_own @ own_vel_body
     tgt_vel_ned = r_body_to_ned_tgt @ tgt_vel_body
+    rel_vel_ned = tgt_vel_ned - own_vel_ned
 
     own_speed = float(np.linalg.norm(own_vel_body))
     target_speed = float(np.linalg.norm(tgt_vel_body))
@@ -399,25 +481,7 @@ def build_observation(ownship_state, target_state, geo_info, wez_config=None,
     az, el = geo_info._get_los_angle(ownship_state, target_state)
     enemy_ata = geo_info._get_antenna_train_angle(target_state, ownship_state, False)
 
-    # 0-2: ownship body frame으로 표현한 gravity vector.
-    gravity_body = r_ned_to_body_own @ np.array([0.0, 0.0, 1.0], dtype=np.float64)
-    obs[0] = float(gravity_body[0])
-    obs[1] = float(gravity_body[1])
-    obs[2] = float(gravity_body[2])
-
-    # 3-6: ownship 속력과 raw body-frame 속도 u/v/w.
-    obs[3] = normalize(own_speed, 0.0, MAX_SPEED)
-    obs[4] = normalize(float(own_vel_body[0]), BODY_VEL_MIN, BODY_VEL_MAX)
-    obs[5] = normalize(float(own_vel_body[1]), BODY_VEL_MIN, BODY_VEL_MAX)
-    obs[6] = normalize(float(own_vel_body[2]), BODY_VEL_MIN, BODY_VEL_MAX)
-
-    # 7-9: StateReconstructor.advance()가 추정한 ownship p/q/r.
-    own_pqr = np.asarray(rec.own_pqr_est, dtype=np.float64)
-    obs[7] = _tanh_scale(float(own_pqr[0]), PQR_SCALE_RAD_S)
-    obs[8] = _tanh_scale(float(own_pqr[1]), PQR_SCALE_RAD_S)
-    obs[9] = _tanh_scale(float(own_pqr[2]), PQR_SCALE_RAD_S)
-
-    # 10-11: body 속도에서 추정한 공력 각도.
+    # ── frame-invariant 스칼라 블록 (SCALAR_FEATURE_NAMES 순서와 정확히 일치) ──
     u, v, w = own_vel_body
     if own_speed < 1.0:
         aoa_deg = 0.0
@@ -425,78 +489,103 @@ def build_observation(ownship_state, target_state, geo_info, wez_config=None,
     else:
         aoa_deg = float(np.degrees(np.arctan2(w, u)))
         sideslip_deg = float(np.degrees(np.arctan2(v, np.sqrt(u * u + w * w))))
-    obs[10] = _tanh_scale(aoa_deg, AOA_SCALE_DEG)
-    obs[11] = _tanh_scale(sideslip_deg, SIDESLIP_SCALE_DEG)
 
-    # 12: hard-deck margin. 0이면 정확히 MIN_ALTITUDE_M에 있다는 뜻이다.
-    obs[12] = float(np.tanh((own_alt - MIN_ALTITUDE_M) / ALTITUDE_DANGER_SCALE_M))
-
-    # 13: NED 기준 vertical speed. 양수면 상승 중이다.
     vertical_speed = -float(own_vel_ned[2])
-    obs[13] = normalize(vertical_speed, -VERTICAL_SPEED_SCALE, VERTICAL_SPEED_SCALE)
 
-    # 14-18: HP, target 속력, energy-height 우세/열세.
-    obs[14] = normalize(float(rec.hp_own), 0.0, 1.0)
-    obs[15] = normalize(target_speed, 0.0, MAX_SPEED)
-    obs[16] = normalize(float(rec.hp_tgt), 0.0, 1.0)
-    obs[17] = float(rec.hp_own - rec.hp_tgt)
     own_energy_height = own_alt + own_speed ** 2 / (2.0 * G)
     target_energy_height = target_alt + target_speed ** 2 / (2.0 * G)
     energy_advantage = own_energy_height - target_energy_height
-    obs[18] = _softsign_scale(energy_advantage, ENERGY_ADVANTAGE_SCALE_M)
 
-    # 19-21: ownship body frame 기준 target 상대 위치.
-    rel_pos_body = r_ned_to_body_own @ delta_ned
-    obs[19] = _softsign_scale(float(rel_pos_body[0]), REL_POS_SCALE_M)
-    obs[20] = _softsign_scale(float(rel_pos_body[1]), REL_POS_SCALE_M)
-    obs[21] = _softsign_scale(float(rel_pos_body[2]), REL_POS_SCALE_M)
-
-    # 22-24: ownship body frame 기준 상대 속도.
-    rel_vel_ned = tgt_vel_ned - own_vel_ned
-    rel_vel_body = r_ned_to_body_own @ rel_vel_ned
-    obs[22] = normalize(float(rel_vel_body[0]), REL_VEL_MIN, REL_VEL_MAX)
-    obs[23] = normalize(float(rel_vel_body[1]), REL_VEL_MIN, REL_VEL_MAX)
-    obs[24] = normalize(float(rel_vel_body[2]), REL_VEL_MIN, REL_VEL_MAX)
-
-    # 25-26: 거리와 closure. closure > 0이면 서로 접근 중이다.
-    obs[25] = normalize(float(distance), 0.0, MAX_RANGE_M)
     dist_norm = float(np.linalg.norm(delta_ned))
     if dist_norm > 1e-6:
         los_unit_ned = delta_ned / dist_norm
         closure = float(np.dot(own_vel_ned - tgt_vel_ned, los_unit_ned))
     else:
+        los_unit_ned = np.zeros(3, dtype=np.float64)
         closure = 0.0
-    obs[26] = normalize(closure, -MAX_CLOSURE_SPEED, MAX_CLOSURE_SPEED)
 
-    # 27-34: 교전 기하각을 sin/cos pair로 표현.
-    obs[27], obs[28] = _sincos(ata)
-    obs[29], obs[30] = _sincos(aa)
-    obs[31], obs[32] = _sincos(az)
-    obs[33], obs[34] = _sincos(el)
+    sin_ata, cos_ata = _sincos(ata)
+    sin_aa, cos_aa = _sincos(aa)
+    sin_az, cos_az = _sincos(az)
+    sin_el, cos_el = _sincos(el)
 
-    # 35-38: 현재 active damage cone 기준 조준 품질과 피격 위험.
-    obs[35] = float(2.0 * np.exp(-((float(ata) / 3.0) ** 2)) - 1.0)
+    aim_sharp = float(2.0 * np.exp(-((float(ata) / 3.0) ** 2)) - 1.0)
     active_cone_deg, active_max_range_ft = _active_damage_envelope(float(rec.t_sec))
     aim_margin_raw = (active_cone_deg - abs(float(ata))) / max(active_cone_deg, 1e-6)
-    obs[36] = float(np.tanh(aim_margin_raw))
-    obs[37] = float(2.0 * np.exp(-((float(enemy_ata) / 3.0) ** 2)) - 1.0)
+    enemy_aim_sharp = float(2.0 * np.exp(-((float(enemy_ata) / 3.0) ** 2)) - 1.0)
     enemy_aim_margin_raw = (
         active_cone_deg - abs(float(enemy_ata))
     ) / max(active_cone_deg, 1e-6)
-    obs[38] = float(np.tanh(enemy_aim_margin_raw))
 
-    # 39-40: 현재 active damage envelope 기준 near/far range margin.
     min_damage_range_m = MIN_DAMAGE_RANGE_FT * FEET_TO_METER
     active_max_range_m = active_max_range_ft * FEET_TO_METER
     active_span_m = max(active_max_range_m - min_damage_range_m, 1e-6)
     range_margin_near_raw = (float(distance) - min_damage_range_m) / active_span_m
     range_margin_far_raw = (active_max_range_m - float(distance)) / active_span_m
-    obs[39] = float(np.tanh(range_margin_near_raw))
-    obs[40] = float(np.tanh(range_margin_far_raw))
 
-    # 41: episode 시간. 0s -> -1, EPISODE_MAX_TIME_SEC -> +1.
-    obs[41] = normalize(float(rec.t_sec), 0.0, EPISODE_MAX_TIME_SEC)
+    scalars = [
+        normalize(own_speed, 0.0, MAX_SPEED),
+        normalize(target_speed, 0.0, MAX_SPEED),
+        _tanh_scale(aoa_deg, AOA_SCALE_DEG),
+        _tanh_scale(sideslip_deg, SIDESLIP_SCALE_DEG),
+        float(np.tanh((own_alt - MIN_ALTITUDE_M) / ALTITUDE_DANGER_SCALE_M)),
+        normalize(vertical_speed, -VERTICAL_SPEED_SCALE, VERTICAL_SPEED_SCALE),
+        normalize(float(rec.hp_own), 0.0, 1.0),
+        normalize(float(rec.hp_tgt), 0.0, 1.0),
+        float(rec.hp_own - rec.hp_tgt),
+        _softsign_scale(energy_advantage, ENERGY_ADVANTAGE_SCALE_M),
+        normalize(float(distance), 0.0, MAX_RANGE_M),
+        normalize(closure, -MAX_CLOSURE_SPEED, MAX_CLOSURE_SPEED),
+        sin_ata, cos_ata,
+        sin_aa, cos_aa,
+        sin_az, cos_az,
+        sin_el, cos_el,
+        aim_sharp,
+        float(np.tanh(aim_margin_raw)),
+        enemy_aim_sharp,
+        float(np.tanh(enemy_aim_margin_raw)),
+        float(np.tanh(range_margin_near_raw)),
+        float(np.tanh(range_margin_far_raw)),
+        normalize(float(rec.t_sec), 0.0, EPISODE_MAX_TIME_SEC),
+    ]
 
+    # ── frame-expressed 벡터 블록 (_VEC_LAYOUT 순서와 정확히 일치) ────────────
+    own_omega_ned = r_body_to_ned_own @ np.asarray(rec.own_pqr_est, dtype=np.float64)
+    tgt_omega_ned = r_body_to_ned_tgt @ np.asarray(rec.tgt_pqr_est, dtype=np.float64)
+
+    frames = {
+        "world": np.eye(3, dtype=np.float64),
+        "mybody": r_ned_to_body_own,
+        "oppbody": r_ned_to_body_tgt,
+        "myvel": _dir_frame(own_vel_ned),
+        "oppvel": _dir_frame(tgt_vel_ned),
+        "los": _dir_frame(delta_ned),
+    }
+    ned_vecs = {
+        "gravity": np.array([0.0, 0.0, 1.0], dtype=np.float64),
+        "los": los_unit_ned,
+        "own_vel": own_vel_ned,
+        "tgt_vel": tgt_vel_ned,
+        "rel_vel": rel_vel_ned,
+        "own_omega": own_omega_ned,
+        "tgt_omega": tgt_omega_ned,
+    }
+
+    vec_feats = []
+    for key, kind, fr in _VEC_LAYOUT:
+        comp = frames[fr] @ ned_vecs[key]
+        if kind == "unit":
+            vec_feats.extend((float(comp[0]), float(comp[1]), float(comp[2])))
+        elif kind == "vel":
+            vec_feats.extend(
+                normalize(float(comp[i]), REL_VEL_MIN, REL_VEL_MAX) for i in range(3)
+            )
+        else:  # omega
+            vec_feats.extend(
+                _tanh_scale(float(comp[i]), PQR_SCALE_RAD_S) for i in range(3)
+            )
+
+    obs = np.asarray(scalars + vec_feats, dtype=np.float32)
     obs = np.nan_to_num(obs, nan=0.0, posinf=10.0, neginf=-10.0)
     return obs.astype(np.float32)
 
@@ -505,61 +594,19 @@ def describe_observation() -> dict:
     return {
         "mode": OBSERVATION_MODE,
         "size": OBSERVATION_SIZE,
-        "features": [
-            "gravity_body_x",
-            "gravity_body_y",
-            "gravity_body_z",
-            "own_speed_norm",
-            "own_vel_body_x_norm",
-            "own_vel_body_y_norm",
-            "own_vel_body_z_norm",
-            "own_p_est_tanh",
-            "own_q_est_tanh",
-            "own_r_est_tanh",
-            "AoA_tanh",
-            "sideslip_tanh",
-            "altitude_margin_low_tanh",
-            "vertical_speed_norm",
-            "own_hp_norm",
-            "target_speed_norm",
-            "target_hp_norm",
-            "hp_diff",
-            "energy_advantage_softsign",
-            "rel_pos_body_x_softsign",
-            "rel_pos_body_y_softsign",
-            "rel_pos_body_z_softsign",
-            "rel_vel_body_x_norm",
-            "rel_vel_body_y_norm",
-            "rel_vel_body_z_norm",
-            "slant_range_norm",
-            "closure_rate_norm",
-            "sin_ATA",
-            "cos_ATA",
-            "sin_AA",
-            "cos_AA",
-            "sin_LOS_azimuth",
-            "cos_LOS_azimuth",
-            "sin_LOS_elevation",
-            "cos_LOS_elevation",
-            "aim_sharp",
-            "aim_margin_active_tanh",
-            "enemy_aim_sharp",
-            "enemy_aim_margin_active_tanh",
-            "range_margin_near_tanh",
-            "range_margin_far_active_tanh",
-            "time_norm",
-        ],
+        "frames": list(FRAME_NAMES),
+        "vectors": [k for k, _, _ in VECTOR_SPECS],
+        "features": list(FEATURE_NAMES),
         "description": (
-            "claude42r 42-D observation. 현재 state[6:9]는 body-frame 속도 "
-            "u/v/w로 처리한다. speed + attitude로 NED 속도를 재구성하지 않는다. "
-            "ownship p/q/r은 StateReconstructor에서 SO(3) log로 추정한다. "
-            "target p/q/r은 사용하지 않는다. 상대 위치는 ownship body frame에서 "
-            "표현하고 softsign으로 scaling한다. energy advantage는 energy-height "
-            "차이를 softsign으로 scaling한 값이다. 고도 feature는 300m hard-deck "
-            "margin을 tanh scaling한 값이다. 조준/range margin은 episode 시간에 "
-            "따른 active damage envelope을 사용한다. observation 전체에 대한 마지막 "
-            "clip은 적용하지 않는다. OBSERVATION_LOW/HIGH는 observation space bound일 "
-            "뿐 실제 clipping 값이 아니다."
+            "claude141r multi-frame observation. frame-invariant 스칼라 27개 + "
+            "7개 방향 벡터(중력/LOS/내속도/표적속도/상대속도/내ω/표적ω)를 6개 "
+            "좌표계(world/mybody/oppbody/myvel/oppvel/los)로 표현한 114개. "
+            "퇴화 조합(gravity@world, los@los, own_vel@myvel, tgt_vel@oppvel)은 "
+            "제외한다. 속도 좌표계와 LOS 좌표계는 x축을 해당 방향에 두고 roll은 "
+            "중력으로 고정한다. 각속도는 좌표계로 만들 수 없어 각속도 벡터를 6개 "
+            "좌표계 성분으로 재표현한다. ownship/target p/q/r은 자세 history의 SO(3) "
+            "log로 각각 추정한다. observation 전체에 대한 마지막 clip은 적용하지 "
+            "않는다. OBSERVATION_LOW/HIGH는 space bound일 뿐 실제 clipping 값이 아니다."
         ),
     }
 
@@ -569,6 +616,9 @@ __all__ = [
     "OBSERVATION_SIZE",
     "OBSERVATION_LOW",
     "OBSERVATION_HIGH",
+    "FEATURE_NAMES",
+    "FRAME_NAMES",
+    "VECTOR_SPECS",
     "build_observation",
     "describe_observation",
     "StateReconstructor",

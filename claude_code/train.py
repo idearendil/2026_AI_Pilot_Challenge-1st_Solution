@@ -14,11 +14,17 @@ from __future__ import annotations
 
 import argparse
 import csv
+import os
 import sys
 from pathlib import Path
 
 import numpy as np
 import torch
+
+# wandb API key. 환경변수 WANDB_API_KEY 가 있으면 그것을 우선 사용한다.
+# 주의: 이 키가 소스에 하드코딩돼 있으므로 이 파일을 외부(공개 repo 등)에 commit/push
+# 하지 않도록 유의할 것. 팀 공유 시엔 각자 환경변수로 넣는 방식을 권장.
+_WANDB_API_KEY = "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"
 
 # Release 루트/ src import 경로 등록 (단독 실행 대비).
 ROOT = Path(__file__).resolve().parents[1]
@@ -34,7 +40,7 @@ from claude_code.ppo import PPOConfig, PPOTrainer, IterationStats
 
 def parse_args():
     p = argparse.ArgumentParser(description="claude_code standalone PPO trainer for DogFight 1v1")
-    p.add_argument("--iterations", type=int, default=150)
+    p.add_argument("--iterations", type=int, default=300)
     p.add_argument("--rollout-steps", type=int, default=100000)
     p.add_argument("--lr", type=float, default=1e-4)
     p.add_argument("--gamma", type=float, default=0.97)
@@ -75,11 +81,22 @@ def parse_args():
     p.add_argument("--frozen-opponent", action="store_true",
                    help="self-play 상대를 학습 시작 시점의 actor net 으로 고정(학습 agent 와 분리). "
                         "phase2(--resume-from)와 함께 쓰면 상대=phase1 마지막 net 으로 고정.")
-    p.add_argument("--eval-interval", type=int, default=5,
-                   help="평가 주기(iter). 현재 정책 vs eval-interval iter 전 정책. 최고 성능 정책을 번들로 저장.")
-    p.add_argument("--eval-games", type=int, default=20,
-                   help="평가 1회당 stochastic 대결 판 수 (멀티프로세스 분배)")
+    # (구) 주기적 20판 evaluation 은 제거됨. 대신 매 iter rollout 게임의 opponent 대비
+    # 승률로 EMA 를 갱신하고, EMA 가 임계값을 넘으면 opponent 를 현재 정책으로 승격한다.
+    p.add_argument("--eval-interval", type=int, default=0, help="(미사용; 호환용)")
+    p.add_argument("--eval-games", type=int, default=20, help="(미사용; 호환용)")
     p.add_argument("--eval-episodes", type=int, default=2, help="(미사용; 호환용)")
+    p.add_argument("--selfplay-gate-threshold", type=float, default=0.6,
+                   help="opponent pool: 모든 후보에 대한 EMA 승률 중 '최소값'이 이 값 이상이면 "
+                        "현재 actor net 을 pool 에 새 후보로 추가(새 후보 EMA=0.5). "
+                        "(--frozen-opponent 이면 무시=영구 고정)")
+    p.add_argument("--selfplay-ema-alpha", type=float, default=0.05,
+                   help="opponent 별 EMA 계수 α. ema_i = (1-α)·ema_i + α·(이번 iter 후보 i 상대 raw 승률). 초기 ema=0.5.")
+    p.add_argument("--pool-size", type=int, default=5,
+                   help="opponent pool 최대 크기. 초과 시 가장 오래 전에 추가된 후보를 제거(FIFO).")
+    p.add_argument("--pool-sample-temp", type=float, default=0.3,
+                   help="opponent 샘플링 softmax 온도 τ. weight_i ∝ exp(-ema_i/τ) → EMA 낮은 후보가 "
+                        "더 자주 뽑힘. 작을수록 최저 EMA 후보를 강하게 선호.")
     p.add_argument("--seed", type=int, default=0)
     # loiter: 표적이 선회하며 고도를 유지(자기파괴 없음) → episode 가 timeout(terminal=0)
     # 으로 끝나므로 return 이 ownship 의 추격/사격 성과로만 결정돼 학습 신호가 깨끗하다.
@@ -102,6 +119,13 @@ def parse_args():
     p.add_argument("--output-name", default="team01")
     p.add_argument("--output-tag", default="ppo_mlp_v1")
     p.add_argument("--artifacts-dir", default="artifacts")
+    # wandb 로깅 (기본 켜짐). 네트워크/키 문제로 실패하면 경고만 내고 학습은 계속된다.
+    p.add_argument("--wandb", dest="wandb", action="store_true", default=True,
+                   help="wandb 로깅 사용 (기본 켜짐)")
+    p.add_argument("--no-wandb", dest="wandb", action="store_false", help="wandb 로깅 끄기")
+    p.add_argument("--wandb-project", default="AIP contest", help="wandb 프로젝트명")
+    p.add_argument("--wandb-run-name", default="",
+                   help="wandb run 이름 (비우면 output-name/output-tag)")
     return p.parse_args()
 
 
@@ -118,6 +142,17 @@ def main():
     if args.aim_reward_scale is not None:
         reward_overrides["aim_reward_scale"] = args.aim_reward_scale
     reward_overrides = reward_overrides or None
+    # "opponent 에게 준 damage" 원값 복원용 damage_scale (my_reward: r_damage = 준damage×scale,
+    # 받은damage 가중치 0 이므로 준damage = damage_reward / scale).
+    dmg_scale = 10.0
+    try:
+        if args.reward_module == "claude_code.my_reward":
+            from claude_code.my_reward import MY_REWARD_CONFIG
+            dmg_scale = float(MY_REWARD_CONFIG.get("damage_scale", 10.0))
+        if reward_overrides and "damage_scale" in reward_overrides:
+            dmg_scale = float(reward_overrides["damage_scale"])
+    except Exception:
+        dmg_scale = 10.0
     env_kwargs = dict(
         overrides={"target_mode": args.target_mode},
         reward_module=args.reward_module,
@@ -171,31 +206,17 @@ def main():
         env.close()   # driver 는 rollout env 를 step 하지 않음 (worker 가 가짐)
         trainer = ParallelPPOTrainer(env_kwargs, cfg, args.num_workers,
                                      args.self_play, obs_dim, act_dim)
-        if args.self_play:
-            print("[claude_code/PPO] 상대 = SELF-PLAY (worker 별 같은 actor network, stochastic)")
     else:
         trainer = PPOTrainer(env, cfg)
-        if args.self_play:
-            from claude_code.self_play import SelfPlayProvider
-            sr = int(STANDARD_ENV_CONFIG["step_ratio"])
-            env._target_action_provider = SelfPlayProvider(
-                trainer.model, trainer.obs_rms, env._observation_fn,
-                env._observation_mode, sr, cfg.device, explore=True)
-            print("[claude_code/PPO] 상대 = SELF-PLAY (학습 중인 같은 actor network, stochastic)")
-        else:
-            print(f"[claude_code/PPO] 상대 = 스크립트 target_mode={args.target_mode}")
+    # gated self-play 상대는 resume(weights 확정) 후에 '현재 정책의 frozen copy' 로 설치한다.
+    if args.self_play:
+        print("[claude_code/PPO] 상대 = OPPONENT POOL self-play (매 게임 pool 에서 EMA 낮은 "
+              f"후보 우대 샘플링, min-EMA≥{args.selfplay_gate_threshold:.2f} 시 현재 정책 추가; 둘 다 stochastic)")
+    else:
+        print(f"[claude_code/PPO] 상대 = 스크립트 target_mode={args.target_mode}")
 
-    # 평가 환경: 병렬 모드는 worker 가 자체 env 로 평가하므로 driver eval_env 불필요.
-    # 단일 프로세스 모드에서만 별도 평가 env 를 만든다(rollout env 와 분리).
+    # 주기적 evaluation 은 제거됨(gated self-play 가 매 iter rollout 승률로 진척을 측정).
     eval_env = None
-    if not parallel:
-        eval_env = make_env(
-            overrides={"target_mode": args.target_mode},
-            reward_module=args.reward_module,
-            observation_module=args.observation_module,
-            reward_overrides=reward_overrides,
-            runner_index="eval",
-        )
 
     bundle_dir = Path(args.artifacts_dir) / "models" / args.output_name / args.output_tag
     base_metadata = {
@@ -214,6 +235,43 @@ def main():
                        ("step_ratio", "max_engage_time", "episode_step_limit")},
     }
     best = {"return": -float("inf"), "win_rate": -1.0, "iter": -1, "saved": False}
+
+    # ── wandb 초기화 (실패해도 학습은 계속) ──────────────────────────────────
+    wb = None
+    if args.wandb:
+        try:
+            import wandb
+            if not os.environ.get("WANDB_API_KEY"):
+                os.environ["WANDB_API_KEY"] = _WANDB_API_KEY
+            run_name = args.wandb_run_name or f"{args.output_name}/{args.output_tag}"
+            wandb.init(
+                project=args.wandb_project, name=run_name,
+                config={
+                    "iterations": args.iterations, "rollout_steps": args.rollout_steps,
+                    "lr": args.lr, "gamma": args.gamma, "gae_lambda": args.gae_lambda,
+                    "clip_coef": args.clip_coef, "update_epochs": args.update_epochs,
+                    "minibatch_size": args.minibatch_size, "ent_coef": args.ent_coef,
+                    "vf_coef": args.vf_coef, "target_kl": args.target_kl,
+                    "hidden": args.hidden, "activation": args.activation,
+                    "action_bins": args.action_bins, "num_workers": args.num_workers,
+                    "self_play": bool(args.self_play), "target_mode": args.target_mode,
+                    "frozen_opponent": bool(args.frozen_opponent),
+                    "selfplay_gate_threshold": (None if args.frozen_opponent
+                                                else args.selfplay_gate_threshold),
+                    "selfplay_ema_alpha": args.selfplay_ema_alpha,
+                    "pool_size": (1 if args.frozen_opponent else max(1, int(args.pool_size))),
+                    "pool_sample_temp": args.pool_sample_temp,
+                    "reward_module": args.reward_module,
+                    "observation_module": args.observation_module,
+                    "reward_overrides": reward_overrides, "resume_from": args.resume_from,
+                    "obs_dim": obs_dim, "act_dim": act_dim, "damage_scale": dmg_scale,
+                },
+            )
+            wb = wandb
+            print(f"[claude_code/PPO] wandb 로깅 활성: project='{args.wandb_project}' run='{run_name}'")
+        except Exception as e:  # 네트워크/키 문제 등 → 로깅 없이 진행
+            print(f"[claude_code/PPO] wandb 초기화 실패({e}) → wandb 로깅 없이 진행")
+            wb = None
 
     # 매 iter actor network snapshot 저장 디렉토리 (평가 상대 + 재현용).
     from claude_code import evaluation
@@ -244,27 +302,38 @@ def main():
         print(f"[claude_code/PPO] resume: {resume_path} 에서 actor+critic+obs_rms 로드 "
               f"(이어서 학습; optimizer 모멘트는 새로 시작)")
 
-    # self-play 상대를 '학습 시작 시점(resume 면 phase1 마지막) actor net' 으로 고정.
-    # resume 직후(초기 weights 확정) 캡처해야 하므로 iter0 snapshot 직전에 설정한다.
-    if args.frozen_opponent and args.self_play:
-        if parallel:
-            rms = trainer.obs_rms
-            trainer.set_frozen_opponent(
-                {k: v.detach().cpu().numpy() for k, v in trainer.model.state_dict().items()},
-                rms.mean if rms is not None else None,
-                rms.var if rms is not None else None,
-                rms.count if rms is not None else 0.0)
+    # gated self-play: 초기 opponent = '학습 시작 시점(resume 면 phase1 마지막) 정책' 의
+    # frozen deep-copy(=iter0). resume 로 weights 가 확정된 뒤 설치해야 하므로 여기서 1회 설치한다.
+    # 이후 매 iter EMA 승률이 임계값을 넘으면 on_iteration 에서 현재 정책으로 승격한다.
+    # --frozen-opponent 이면 임계값을 무한대로 둬서 영구 고정(승격 안 함).
+    gate_threshold = float("inf") if args.frozen_opponent else float(args.selfplay_gate_threshold)
+    pool_max = 1 if args.frozen_opponent else max(1, int(args.pool_size))
+
+    def _pool_weights(emas) -> list:
+        """EMA 낮은 후보가 더 자주 뽑히도록 softmax(-ema/τ) 가중치."""
+        e = np.asarray(emas, dtype=np.float64)
+        if e.size <= 1:
+            return [1.0] * int(e.size or 1)
+        logits = -e / max(float(args.pool_sample_temp), 1e-6)
+        logits -= logits.max()
+        w = np.exp(logits)
+        return (w / w.sum()).tolist()
+
+    if args.self_play:
+        trainer.install_opponent_pool(pool_max)
+        trainer.pool_set_weights([1.0])
+        base_metadata["selfplay_gate_threshold"] = (None if args.frozen_opponent
+                                                    else args.selfplay_gate_threshold)
+        base_metadata["selfplay_ema_alpha"] = args.selfplay_ema_alpha
+        base_metadata["frozen_opponent"] = bool(args.frozen_opponent)
+        base_metadata["pool_size"] = pool_max
+        base_metadata["pool_sample_temp"] = args.pool_sample_temp
+        if args.frozen_opponent:
+            print("[claude_code/PPO] opponent = 학습 시작 시점 정책으로 영구 고정(pool 크기 1, 추가 없음)")
         else:
-            import copy
-            from claude_code.self_play import SelfPlayProvider
-            sr = int(STANDARD_ENV_CONFIG["step_ratio"])
-            frozen_model = copy.deepcopy(trainer.model).eval()
-            frozen_rms = copy.deepcopy(trainer.obs_rms) if trainer.obs_rms is not None else None
-            env._target_action_provider = SelfPlayProvider(
-                frozen_model, frozen_rms, env._observation_fn,
-                env._observation_mode, sr, cfg.device, explore=True)
-        base_metadata["frozen_opponent"] = True
-        print("[claude_code/PPO] self-play 상대 = 학습 시작 시점 actor net 으로 고정(frozen)")
+            print(f"[claude_code/PPO] opponent pool 초기화 = iter0 정책 1개 (최대 {pool_max}개, "
+                  f"EMA α={args.selfplay_ema_alpha}, 추가 임계 min-EMA≥{args.selfplay_gate_threshold:.2f}, "
+                  f"초기 EMA=0.5, 샘플 τ={args.pool_sample_temp})")
 
     # iter 0 = 학습 시작 직전 network (resume 면 불러온 가중치, 아니면 완전 초기화).
     evaluation.save_snapshot(_snap_path(0), trainer.model, trainer.obs_rms, model_kwargs)
@@ -293,7 +362,13 @@ def main():
         "iteration", "global_step", "mean_return", "mean_length", "completed_episodes",
         "policy_loss", "value_loss", "entropy", "approx_kl", "explained_variance",
         "ep_pursuit", "ep_damage", "ep_distance", "ep_aim", "ep_terminal", "elapsed_sec",
+        "win", "loss", "draw", "raw_win_rate",
+        "ema_mean", "ema_min", "pool_size", "opp_added",
     ])
+
+    # opponent pool EMA 상태. 각 후보 {gen, ema}. 초기 후보 1개(gen0, ema0.5).
+    pool = [{"gen": 0, "ema": 0.5}]
+    pool_state = {"next_gen": 1, "n_added": 0}
 
     def on_iteration(s: IterationStats):
         pursuit = s.extra.get("pursuit", float("nan"))
@@ -301,12 +376,51 @@ def main():
         distance = s.extra.get("distance", float("nan"))
         aim = s.extra.get("aim", float("nan"))
         terminal = s.extra.get("terminal", float("nan"))
+
+        # 이번 iter rollout 게임들의 opponent 대비 승패 집계.
+        wins = int(s.extra.get("win", 0))
+        losses = int(s.extra.get("loss", 0))
+        draws = int(s.extra.get("draw", 0))
+        decided = wins + losses + draws
+        raw_wr = (wins / decided) if decided > 0 else float("nan")
+
+        # opponent 별 EMA 갱신 + 조건부 pool 추가. 우리팀·opponent 모두 stochastic rollout.
+        per_opp = s.extra.get("per_opp", {}) or {}
+        added = False
+        if args.self_play:
+            alpha = args.selfplay_ema_alpha
+            # 이번 iter 에 실제로 게임이 있었던 후보만 EMA 갱신(안 뽑힌 후보는 유지).
+            for i, entry in enumerate(pool):
+                d = per_opp.get(i)
+                if d and d.get("decided", 0) > 0:
+                    entry["ema"] = (1.0 - alpha) * entry["ema"] + alpha * d["raw_win_rate"]
+            # 모든 후보 EMA 중 '최소값'이 임계값 이상이면 현재 정책을 새 후보로 추가.
+            emas = [e["ema"] for e in pool]
+            if emas and min(emas) >= gate_threshold:
+                trainer.pool_add_current()
+                pool.append({"gen": pool_state["next_gen"], "ema": 0.5})
+                pool_state["next_gen"] += 1
+                if len(pool) > pool_max:
+                    pool.pop(0)
+                pool_state["n_added"] += 1
+                _save_best(s, {"mean_return": s.mean_return, "win_rate": raw_wr})
+                added = True
+            # 다음 iteration 을 위한 샘플링 가중치 갱신(EMA 낮은 후보 우대).
+            trainer.pool_set_weights(_pool_weights([e["ema"] for e in pool]))
+
+        emas = [e["ema"] for e in pool]
+        ema_mean = float(np.mean(emas)) if emas else float("nan")
+        ema_min = float(np.min(emas)) if emas else float("nan")
+        promoted = added   # 하위 print/wandb 호환
+
         writer.writerow([
             s.iteration, s.global_step, f"{s.mean_return:.4f}", f"{s.mean_length:.1f}",
             s.completed_episodes, f"{s.policy_loss:.5f}", f"{s.value_loss:.5f}",
             f"{s.entropy:.4f}", f"{s.approx_kl:.5f}", f"{s.explained_variance:.4f}",
             f"{pursuit:.4f}", f"{damage:.4f}", f"{distance:.4f}", f"{aim:.4f}",
             f"{terminal:.4f}", f"{s.elapsed_sec:.2f}",
+            wins, losses, draws, f"{raw_wr:.4f}",
+            f"{ema_mean:.4f}", f"{ema_min:.4f}", len(pool), int(added),
         ])
         log_file.flush()
 
@@ -314,41 +428,58 @@ def main():
         evaluation.save_snapshot(_snap_path(s.iteration), trainer.model,
                                  trainer.obs_rms, model_kwargs)
 
-        eval_msg = ""
-        is_last = s.iteration == args.iterations
-        if args.eval_interval > 0 and (s.iteration % args.eval_interval == 0 or is_last):
-            # 상대 = eval_interval iter 전의 self (없으면 iter 0).
-            opp_iter = max(0, s.iteration - args.eval_interval)
-            opp_path = _snap_path(opp_iter)
-            if opp_path.exists():
-                opp_state, opp_kwargs, opp_rms = evaluation.load_snapshot(opp_path)
-                base_seed = 500000 + s.iteration * 1000
-                if parallel:
-                    summary = trainer.evaluate_vs(
-                        opp_state, opp_kwargs, opp_rms,
-                        args.eval_games, True, base_seed)
-                else:
-                    summary = trainer.evaluate_vs(
-                        eval_env, opp_state, opp_kwargs, opp_rms,
-                        args.eval_games, True, base_seed)
-                eval_ret = summary["mean_return"]
-                # 최고 승률 여부와 무관하게, 5 iter 전의 self 를 상대로 승률이
-                # 0.5 를 넘으면 best 모델로 저장(덮어쓰기).
-                saved = summary["win_rate"] > 0.5
-                if saved:
-                    _save_best(s, summary)
-                eval_msg = (
-                    f" | EVAL vs iter{opp_iter} ret {eval_ret:7.3f} "
-                    f"W/L/D {summary['win']}/{summary['loss']}/{summary['draw']} "
-                    f"(wr {summary['win_rate']:.2f}, n={summary['n']})"
-                    f"{' *SAVED(wr>0.5)*' if saved else ''}")
+        # opponent 에게 준 damage(원값) 평균 = damage_reward / damage_scale (받은damage 가중치 0).
+        damage_dealt = (damage / dmg_scale) if (dmg_scale and damage == damage) else float("nan")
+
+        if wb is not None:
+            try:
+                log_dict = {
+                    "iteration": s.iteration,
+                    "global_step": s.global_step,
+                    "train/mean_return": s.mean_return,
+                    "train/mean_length": s.mean_length,
+                    "train/completed_episodes": s.completed_episodes,
+                    "loss/policy_loss": s.policy_loss,
+                    "loss/value_loss": s.value_loss,
+                    "loss/entropy": s.entropy,
+                    "policy/entropy": s.entropy,          # 현재 정책 entropy
+                    "metrics/approx_kl": s.approx_kl,
+                    "metrics/explained_variance": s.explained_variance,
+                    "selfplay/raw_win_rate": raw_wr,
+                    "selfplay/ema_mean": ema_mean,
+                    "selfplay/ema_min": ema_min,
+                    "selfplay/pool_size": len(pool),
+                    "selfplay/n_added": pool_state["n_added"],
+                    "selfplay/opp_added": int(added),
+                    "selfplay/wins": wins,
+                    "selfplay/losses": losses,
+                    "selfplay/draws": draws,
+                    "reward/damage_reward": damage,
+                    "reward/distance_reward": distance,
+                    "reward/termination_reward": terminal,
+                    "reward/aim_reward": aim,
+                    "damage/dealt_per_episode": damage_dealt,
+                }
+                # 후보별 EMA (슬롯 0=가장 오래된 후보 … pool_max-1). 빈 슬롯은 로깅 생략.
+                for i in range(pool_max):
+                    if i < len(pool):
+                        log_dict[f"selfplay/pool_ema_slot{i}"] = pool[i]["ema"]
+                wb.log(log_dict, step=s.iteration)
+            except Exception as e:
+                print(f"[claude_code/PPO] wandb.log 실패({e})", flush=True)
+
+        sp_msg = ""
+        if args.self_play:
+            sp_msg = (f" | pool{len(pool)} W/L/D {wins}/{losses}/{draws} "
+                      f"raw_wr {raw_wr:.2f} ema[min {ema_min:.3f} mean {ema_mean:.3f}]"
+                      f"{' *POOL+ (added current, best saved)*' if added else ''}")
 
         print(
             f"iter {s.iteration:3d} | step {s.global_step:7d} | "
             f"return {s.mean_return:8.3f} | len {s.mean_length:6.1f} | "
             f"damage {damage:6.3f} | dist {distance:6.3f} | aim {aim:6.3f} | "
             f"ent {s.entropy:6.3f} | kl {s.approx_kl:.4f} | ev {s.explained_variance:6.3f}"
-            f"{eval_msg}",
+            f"{sp_msg}",
             flush=True,
         )
 
@@ -361,10 +492,15 @@ def main():
             eval_env.close()
         if hasattr(trainer, "close"):
             trainer.close()   # Ray shutdown (병렬 모드)
+        if wb is not None:
+            try:
+                wb.finish()
+            except Exception:
+                pass
 
     obs_norm = trainer.obs_rms.state_dict() if trainer.obs_rms is not None else None
     if not best["saved"]:
-        # 평가에서 승률 0.5 초과가 한 번도 없었던(또는 eval_interval<=0) 경우 최종 정책 저장.
+        # opponent 승격이 한 번도 없었던 경우(EMA 가 임계값에 도달 못함) 최종 정책을 저장.
         save_bundle(trainer.model, bundle_dir, obs_norm=obs_norm, extra_metadata=base_metadata)
 
     # best 와 별개로, 맨 마지막 iteration 의 파라미터를 항상 '_final' 번들로 저장.
@@ -377,10 +513,10 @@ def main():
     print(f"\n[claude_code/PPO] 번들 저장 완료: {bundle_dir}")
     print(f"[claude_code/PPO] 최종 iteration 번들: {final_bundle_dir} (iter {args.iterations})")
     if best["saved"]:
-        print(f"  - 선택된 iteration: {best['iter']} "
-              f"(past-self 승률 {best['win_rate']:.2f} > 0.5, mean return {best['return']:.3f})")
+        print(f"  - best = 마지막 pool 추가 시점 iteration {best['iter']} "
+              f"(추가 당시 raw 승률 {best['win_rate']:.2f}, mean return {best['return']:.3f})")
     else:
-        print("  - 평가에서 승률 0.5 초과가 없어 최종 iteration 정책을 저장")
+        print("  - pool 추가가 없어(min-EMA<임계값) 최종 iteration 정책을 best 로 저장")
     print("  - metadata.json")
     print("  - policy_weights.pkl.gz")
 

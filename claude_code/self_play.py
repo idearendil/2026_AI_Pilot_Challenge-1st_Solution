@@ -87,4 +87,67 @@ class SelfPlayProvider(ActionProvider):
         return None
 
 
-__all__ = ["SelfPlayProvider"]
+class PoolSelfPlayProvider(ActionProvider):
+    """opponent pool 에서 매 episode 하나를 (가중) 샘플링해 상대로 쓰는 provider.
+
+    pool 은 SelfPlayProvider 리스트(오래된→최신 순). env.reset 이 부르는 reset()마다
+    weights 로 index 하나를 뽑아 그 sub-provider 로 해당 episode 를 진행한다.
+
+    compute_action 은 episode 시작(reset) 시 고정한 sub-provider 객체(_active)에
+    위임한다. 따라서 iteration 경계에서 pool 이 바뀌어도(추가/제거) 진행 중이던
+    episode 는 원래 상대로 일관되게 끝난다. last_index 는 방금 진행한 episode 가 쓴
+    opponent 의 (샘플 당시) pool index 로, 승패를 opponent 별로 귀속할 때 쓴다.
+
+    가중치는 'EMA 승률이 낮은 opponent 일수록 크게' 주어 자주 뽑히게 한다(호출부에서
+    softmax(-ema/τ) 등으로 계산해 set_weights 로 전달).
+    """
+
+    def __init__(self, providers, weights=None, seed: int = 0):
+        self.providers = list(providers)
+        self.weights = None if weights is None else np.asarray(weights, dtype=np.float64)
+        self._rng = np.random.default_rng(int(seed))
+        self.current = 0
+        self.last_index = 0
+        self._active = self.providers[0] if self.providers else None
+
+    def set_pool(self, providers, weights=None) -> None:
+        self.providers = list(providers)
+        if weights is not None:
+            self.weights = np.asarray(weights, dtype=np.float64)
+        if self.current >= len(self.providers):
+            self.current = max(0, len(self.providers) - 1)
+
+    def set_weights(self, weights) -> None:
+        self.weights = None if weights is None else np.asarray(weights, dtype=np.float64)
+
+    def _sample_index(self) -> int:
+        n = len(self.providers)
+        if n <= 1:
+            return 0
+        w = self.weights
+        if (w is None or len(w) != n or not np.all(np.isfinite(w))
+                or np.any(w < 0) or float(w.sum()) <= 1e-12):
+            p = None                      # weights 이상하면 균등 샘플
+        else:
+            p = np.asarray(w, dtype=np.float64) / float(w.sum())
+        return int(self._rng.choice(n, p=p))
+
+    def reset(self, context: ActionContext | None = None) -> None:
+        self.current = self._sample_index()
+        self.last_index = self.current
+        self._active = self.providers[self.current] if self.providers else None
+        if self._active is not None:
+            self._active.reset(context)
+
+    def compute_action(self, context: ActionContext) -> ActionResult:
+        return self._active.compute_action(context)
+
+    def close(self) -> None:
+        for p in self.providers:
+            try:
+                p.close()
+            except Exception:
+                pass
+
+
+__all__ = ["SelfPlayProvider", "PoolSelfPlayProvider"]

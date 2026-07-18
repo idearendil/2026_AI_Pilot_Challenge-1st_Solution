@@ -38,6 +38,61 @@ def compute_gae(rewards, values, dones, last_value, last_done, gamma, gae_lambda
     return adv, adv + values
 
 
+def rollout_outcome(info) -> Optional[str]:
+    """rollout 의 done-step info 로 승패 판정(ownship 관점). info 없으면 None.
+
+    evaluation._game_outcome 과 동일한 규칙:
+      1) terminal 보상 성분(±10: 격추/추락) 부호로 우선 판정.
+      2) terminal=0(timeout 등) 이면 최종 체력 비교로 tiebreak.
+    """
+    if not isinstance(info, dict):
+        return None
+    comp = info.get("ep_reward_components")
+    terminal = float(comp.get("terminal", 0.0)) if isinstance(comp, dict) else 0.0
+    if terminal > 1e-6:
+        return "win"
+    if terminal < -1e-6:
+        return "loss"
+    own_hp = float(info.get("ownship_health", 1.0))
+    tgt_hp = float(info.get("target_health", 1.0))
+    if own_hp > tgt_hp + 1e-9:
+        return "win"
+    if own_hp < tgt_hp - 1e-9:
+        return "loss"
+    return "draw"
+
+
+def _outcome_counts(outcomes) -> dict:
+    """승패 리스트 → {win, loss, draw, decided, raw_win_rate} (IterationStats.extra 용)."""
+    wins = outcomes.count("win")
+    losses = outcomes.count("loss")
+    draws = outcomes.count("draw")
+    n = wins + losses + draws
+    return {
+        "win": wins, "loss": losses, "draw": draws, "decided": n,
+        "raw_win_rate": (wins / n) if n > 0 else float("nan"),
+    }
+
+
+def _outcome_counts_by_opp(indices, outcomes) -> dict:
+    """(opponent index, 승패) → {index: {win, loss, draw, decided, raw_win_rate}}.
+
+    opponent pool 각 후보별로 이번 iteration rollout 게임 승패를 집계한다. index 는
+    샘플 당시 pool 위치(0=가장 오래된 후보). 병렬 수집에서도 모든 worker 가 동일
+    순서의 pool 을 broadcast 받으므로 index 의미가 일치한다.
+    """
+    by: dict = {}
+    for idx, oc in zip(indices, outcomes):
+        d = by.setdefault(int(idx), {"win": 0, "loss": 0, "draw": 0})
+        if oc in d:
+            d[oc] += 1
+    for d in by.values():
+        n = d["win"] + d["loss"] + d["draw"]
+        d["decided"] = n
+        d["raw_win_rate"] = (d["win"] / n) if n > 0 else float("nan")
+    return by
+
+
 @dataclass
 class PPOConfig:
     total_iterations: int = 50
@@ -153,6 +208,8 @@ class PPOTrainer:
         ep_returns: list[float] = []
         ep_lengths: list[int] = []
         ep_components: list[dict] = []
+        ep_outcomes: list[str] = []   # 각 완료 episode 의 승패("win"/"loss"/"draw")
+        ep_opp_indices: list[int] = []  # 각 완료 episode 가 쓴 opponent 의 pool index
 
         for t in range(T):
             norm_obs = self._normalize_obs(self._next_obs, update=True)
@@ -187,6 +244,11 @@ class PPOTrainer:
                 comp = info.get("ep_reward_components")
                 if isinstance(comp, dict):
                     ep_components.append(dict(comp))
+                oc = rollout_outcome(info)
+                if oc is not None:
+                    ep_outcomes.append(oc)
+                    prov = getattr(self.env, "_target_action_provider", None)
+                    ep_opp_indices.append(int(getattr(prov, "last_index", 0)))
                 self._ep_return = 0.0
                 self._ep_len = 0
                 # 새 에피소드 전에 HP=1 로 리셋 → env.reset 의 관측이 올바른 HP 로 빌드됨.
@@ -218,7 +280,7 @@ class PPOTrainer:
             "returns": torch.as_tensor(ret_buf, device=device),
             "values": torch.as_tensor(val_buf, device=device),
         }
-        return batch, ep_returns, ep_lengths, ep_components
+        return batch, ep_returns, ep_lengths, ep_components, ep_outcomes, ep_opp_indices
 
     def _compute_gae(self, rewards, values, dones, last_value, last_done):
         return compute_gae(rewards, values, dones, last_value, last_done,
@@ -291,6 +353,66 @@ class PPOTrainer:
 
         return last_pl, last_vl, last_ent, last_kl, explained_var
 
+    # ── gated self-play: opponent pool (frozen deep-copy 후보들) ───────────────
+    def _make_opp_provider(self, model, rms, explore: bool = True):
+        """현재 env 설정에 맞는 frozen opponent SelfPlayProvider 생성."""
+        from claude_code.self_play import SelfPlayProvider
+        from claude_code.env_utils import STANDARD_ENV_CONFIG
+        sr = int(STANDARD_ENV_CONFIG["step_ratio"])
+        return SelfPlayProvider(
+            model, rms, self.env._observation_fn, self.env._observation_mode,
+            sr, self.cfg.device, explore=explore)
+
+    def install_opponent_pool(self, pool_max: int = 5, explore: bool = True) -> None:
+        """opponent pool 초기화: 후보 1개(= 현재 정책의 frozen deep-copy)로 시작.
+
+        학습 시작 시(초기 후보=iter0) 1회 호출. 이후 pool_add_current 로 후보를 추가한다.
+        env 의 target provider 를 PoolSelfPlayProvider 로 교체한다.
+        """
+        import copy
+        from claude_code.self_play import PoolSelfPlayProvider
+        self._pool_max = max(1, int(pool_max))
+        self._opp_explore = bool(explore)
+        m = copy.deepcopy(self.model).eval()
+        rms = copy.deepcopy(self.obs_rms) if self.obs_rms is not None else None
+        prov = self._make_opp_provider(m, rms, explore)
+        self._pool_provider = PoolSelfPlayProvider([prov], [1.0], seed=self.cfg.seed)
+        self.env._target_action_provider = self._pool_provider
+
+    def pool_set_weights(self, weights) -> None:
+        """opponent 샘플링 가중치 갱신(다음 episode reset 부터 적용). EMA 낮을수록 크게."""
+        if getattr(self, "_pool_provider", None) is not None:
+            self._pool_provider.set_weights(weights)
+
+    def pool_add_current(self) -> int:
+        """현재 정책+obs_rms 의 frozen deep-copy 를 pool 에 추가(초과 시 가장 오래된 후보 제거).
+
+        pool 구성이 바뀌므로 진행 중이던 rollout episode 를 폐기하고 env 를 리셋해
+        다음 episode 부터 새 구성으로 opponent 를 샘플/귀속하게 한다.
+        """
+        import copy
+        m = copy.deepcopy(self.model).eval()
+        rms = copy.deepcopy(self.obs_rms) if self.obs_rms is not None else None
+        prov = self._make_opp_provider(m, rms, getattr(self, "_opp_explore", True))
+        providers = list(self._pool_provider.providers)
+        providers.append(prov)
+        if len(providers) > self._pool_max:
+            providers.pop(0)
+        self._pool_provider.set_pool(providers)
+        self._reset_rollout_env()
+        return len(providers)
+
+    def _reset_rollout_env(self) -> None:
+        if self._reset_recon is not None:
+            self._reset_recon()
+        obs, _ = self.env.reset()
+        if self._reset_recon is not None:
+            self._reset_recon()
+        self._next_obs = np.asarray(obs, dtype=np.float32)
+        self._next_done = False
+        self._ep_return = 0.0
+        self._ep_len = 0
+
     # ── past-self stochastic 평가 (단일 프로세스) ────────────────────────────
     def evaluate_vs(self, env, opp_state, opp_model_kwargs, opp_rms_dict,
                     n_games, stochastic, base_seed):
@@ -335,7 +457,8 @@ class PPOTrainer:
         history: list[IterationStats] = []
         for it in range(1, self.cfg.total_iterations + 1):
             t0 = time.time()
-            batch, ep_returns, ep_lengths, ep_components = self.collect_rollout()
+            (batch, ep_returns, ep_lengths, ep_components,
+             ep_outcomes, ep_opp_indices) = self.collect_rollout()
             pl, vl, ent, kl, ev = self.update(batch)
 
             mean_ret = float(np.mean(ep_returns)) if ep_returns else float("nan")
@@ -345,6 +468,8 @@ class PPOTrainer:
                 for key in ("pursuit", "damage", "distance", "aim", "terminal", "safety", "step"):
                     vals = [c.get(key, 0.0) for c in ep_components]
                     comp_means[key] = float(np.mean(vals))
+            comp_means.update(_outcome_counts(ep_outcomes))
+            comp_means["per_opp"] = _outcome_counts_by_opp(ep_opp_indices, ep_outcomes)
             stats = IterationStats(
                 iteration=it,
                 global_step=self.global_step,
@@ -365,4 +490,5 @@ class PPOTrainer:
         return history
 
 
-__all__ = ["PPOConfig", "PPOTrainer", "IterationStats", "compute_gae"]
+__all__ = ["PPOConfig", "PPOTrainer", "IterationStats", "compute_gae",
+           "rollout_outcome", "_outcome_counts", "_outcome_counts_by_opp"]
