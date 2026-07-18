@@ -74,6 +74,14 @@ def _outcome_counts(outcomes) -> dict:
     }
 
 
+ALT_TERM_OWNSHIP = "ownship altitude below min"   # 우리 기체 고도 하락 종료 end_condition
+
+
+def _count_altitude_terms(end_conditions) -> int:
+    """완료 episode 의 end_condition 목록에서 '우리 기체 고도 하락' 종료 횟수."""
+    return sum(1 for c in end_conditions if c == ALT_TERM_OWNSHIP)
+
+
 def _outcome_counts_by_opp(indices, outcomes) -> dict:
     """(opponent index, 승패) → {index: {win, loss, draw, decided, raw_win_rate}}.
 
@@ -216,6 +224,7 @@ class PPOTrainer:
         ep_components: list[dict] = []
         ep_outcomes: list[str] = []   # 각 완료 episode 의 승패("win"/"loss"/"draw")
         ep_opp_indices: list[int] = []  # 각 완료 episode 가 쓴 opponent 의 pool index
+        ep_end_conditions: list[str] = []  # 각 완료 episode 의 종료 사유(end_condition)
 
         for t in range(T):
             norm_obs = self._normalize_obs(self._next_obs, update=True)
@@ -247,6 +256,8 @@ class PPOTrainer:
             if done:
                 ep_returns.append(self._ep_return)
                 ep_lengths.append(self._ep_len)
+                ep_end_conditions.append(
+                    str(info.get("end_condition", "")) if isinstance(info, dict) else "")
                 comp = info.get("ep_reward_components")
                 if isinstance(comp, dict):
                     ep_components.append(dict(comp))
@@ -286,7 +297,8 @@ class PPOTrainer:
             "returns": torch.as_tensor(ret_buf, device=device),
             "values": torch.as_tensor(val_buf, device=device),
         }
-        return batch, ep_returns, ep_lengths, ep_components, ep_outcomes, ep_opp_indices
+        return (batch, ep_returns, ep_lengths, ep_components, ep_outcomes,
+                ep_opp_indices, ep_end_conditions)
 
     def _compute_gae(self, rewards, values, dones, last_value, last_done):
         return compute_gae(rewards, values, dones, last_value, last_done,
@@ -503,7 +515,7 @@ class PPOTrainer:
         for it in range(int(start_iteration), self.cfg.total_iterations + 1):
             t0 = time.time()
             (batch, ep_returns, ep_lengths, ep_components,
-             ep_outcomes, ep_opp_indices) = self.collect_rollout()
+             ep_outcomes, ep_opp_indices, ep_end_conditions) = self.collect_rollout()
             pl, vl, ent, kl, ev = self.update(batch)
 
             mean_ret = float(np.mean(ep_returns)) if ep_returns else float("nan")
@@ -515,6 +527,7 @@ class PPOTrainer:
                     comp_means[key] = float(np.mean(vals))
             comp_means.update(_outcome_counts(ep_outcomes))
             comp_means["per_opp"] = _outcome_counts_by_opp(ep_opp_indices, ep_outcomes)
+            comp_means["alt_term"] = _count_altitude_terms(ep_end_conditions)
             stats = IterationStats(
                 iteration=it,
                 global_step=self.global_step,
@@ -536,4 +549,5 @@ class PPOTrainer:
 
 
 __all__ = ["PPOConfig", "PPOTrainer", "IterationStats", "compute_gae",
-           "rollout_outcome", "_outcome_counts", "_outcome_counts_by_opp"]
+           "rollout_outcome", "_outcome_counts", "_outcome_counts_by_opp",
+           "_count_altitude_terms"]

@@ -90,8 +90,8 @@ def load_train_state(path):
 
 def parse_args():
     p = argparse.ArgumentParser(description="claude_code standalone PPO trainer for DogFight 1v1")
-    p.add_argument("--iterations", type=int, default=300)
-    p.add_argument("--rollout-steps", type=int, default=100000)
+    p.add_argument("--iterations", type=int, default=500)
+    p.add_argument("--rollout-steps", type=int, default=50000)
     p.add_argument("--lr", type=float, default=1e-4)
     p.add_argument("--gamma", type=float, default=0.97)
     p.add_argument("--gae-lambda", type=float, default=0.95)
@@ -476,7 +476,7 @@ def main():
             "policy_loss", "value_loss", "entropy", "approx_kl", "explained_variance",
             "ep_pursuit", "ep_damage", "ep_distance", "ep_aim", "ep_terminal", "elapsed_sec",
             "win", "loss", "draw", "raw_win_rate",
-            "ema_mean", "ema_min", "pool_size", "opp_added",
+            "ema_mean", "ema_min", "pool_size", "opp_added", "altitude_term",
         ])
 
     # 마지막으로 완료한 iteration 추적(학습 종료 시 최종 checkpoint 저장에 사용).
@@ -495,6 +495,8 @@ def main():
         draws = int(s.extra.get("draw", 0))
         decided = wins + losses + draws
         raw_wr = (wins / decided) if decided > 0 else float("nan")
+        # 이번 iter 에서 우리 기체 고도 하락으로 종료된 episode 수.
+        alt_term = int(s.extra.get("alt_term", 0))
 
         # opponent 별 EMA 갱신 + 조건부 pool 추가. 우리팀·opponent 모두 stochastic rollout.
         per_opp = s.extra.get("per_opp", {}) or {}
@@ -534,7 +536,7 @@ def main():
             f"{pursuit:.4f}", f"{damage:.4f}", f"{distance:.4f}", f"{aim:.4f}",
             f"{terminal:.4f}", f"{s.elapsed_sec:.2f}",
             wins, losses, draws, f"{raw_wr:.4f}",
-            f"{ema_mean:.4f}", f"{ema_min:.4f}", len(pool), int(added),
+            f"{ema_mean:.4f}", f"{ema_min:.4f}", len(pool), int(added), alt_term,
         ])
         log_file.flush()
 
@@ -580,6 +582,7 @@ def main():
                     "selfplay/wins": wins,
                     "selfplay/losses": losses,
                     "selfplay/draws": draws,
+                    "train/altitude_termination": alt_term,   # 고도 하락으로 종료된 episode 수
                     "reward/damage_reward": damage,
                     "reward/distance_reward": distance,
                     "reward/termination_reward": terminal,
@@ -604,7 +607,8 @@ def main():
             f"iter {s.iteration:3d} | step {s.global_step:7d} | "
             f"return {s.mean_return:8.3f} | len {s.mean_length:6.1f} | "
             f"damage {damage:6.3f} | dist {distance:6.3f} | aim {aim:6.3f} | "
-            f"ent {s.entropy:6.3f} | kl {s.approx_kl:.4f} | ev {s.explained_variance:6.3f}"
+            f"ent {s.entropy:6.3f} | kl {s.approx_kl:.4f} | ev {s.explained_variance:6.3f} | "
+            f"altT {alt_term}"
             f"{sp_msg}",
             flush=True,
         )

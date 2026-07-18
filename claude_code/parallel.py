@@ -25,7 +25,8 @@ for _p in (ROOT, ROOT / "src"):
 from claude_code.model import make_actor_critic, discrete_indices_to_continuous
 from claude_code.normalizers import RunningMeanStd
 from claude_code.ppo import (PPOConfig, PPOTrainer, IterationStats, compute_gae, OBS_CLIP,
-                             rollout_outcome, _outcome_counts, _outcome_counts_by_opp)
+                             rollout_outcome, _outcome_counts, _outcome_counts_by_opp,
+                             _count_altitude_terms)
 
 
 def physical_cpu_count() -> int:
@@ -229,6 +230,7 @@ def _make_worker_cls():
             val_buf = np.zeros(n_steps, dtype=np.float32)
             ep_returns, ep_lengths, ep_components, ep_outcomes = [], [], [], []
             ep_opp_indices = []
+            ep_end_conditions = []
 
             for t in range(n_steps):
                 raw = self._next_obs
@@ -255,6 +257,8 @@ def _make_worker_cls():
                 if done:
                     ep_returns.append(self._ep_return)
                     ep_lengths.append(self._ep_len)
+                    ep_end_conditions.append(
+                        str(info.get("end_condition", "")) if isinstance(info, dict) else "")
                     comp = info.get("ep_reward_components")
                     if isinstance(comp, dict):
                         ep_components.append(dict(comp))
@@ -282,6 +286,7 @@ def _make_worker_cls():
                 "ep_returns": ep_returns, "ep_lengths": ep_lengths,
                 "ep_components": ep_components, "ep_outcomes": ep_outcomes,
                 "ep_opp_indices": ep_opp_indices,
+                "ep_end_conditions": ep_end_conditions,
                 "rms_mean": (raw_buf.mean(0) if self.obs_rms is not None else None),
                 "rms_var": (raw_buf.var(0) if self.obs_rms is not None else None),
                 "rms_count": n_steps,
@@ -415,7 +420,9 @@ class ParallelPPOTrainer:
         ep_components = [x for r in results for x in r["ep_components"]]
         ep_outcomes = [x for r in results for x in r.get("ep_outcomes", [])]
         ep_opp_indices = [x for r in results for x in r.get("ep_opp_indices", [])]
-        return batch, ep_returns, ep_lengths, ep_components, ep_outcomes, ep_opp_indices
+        ep_end_conditions = [x for r in results for x in r.get("ep_end_conditions", [])]
+        return (batch, ep_returns, ep_lengths, ep_components, ep_outcomes,
+                ep_opp_indices, ep_end_conditions)
 
     # 업데이트 로직은 PPOTrainer.update 재사용
     def update(self, batch):
@@ -517,7 +524,7 @@ class ParallelPPOTrainer:
         for it in range(int(start_iteration), self.cfg.total_iterations + 1):
             t0 = time.time()
             (batch, ep_returns, ep_lengths, ep_components,
-             ep_outcomes, ep_opp_indices) = self.collect_rollout()
+             ep_outcomes, ep_opp_indices, ep_end_conditions) = self.collect_rollout()
             pl, vl, ent, kl, ev = self.update(batch)
 
             mean_ret = float(np.mean(ep_returns)) if ep_returns else float("nan")
@@ -528,6 +535,7 @@ class ParallelPPOTrainer:
                     comp_means[key] = float(np.mean([c.get(key, 0.0) for c in ep_components]))
             comp_means.update(_outcome_counts(ep_outcomes))
             comp_means["per_opp"] = _outcome_counts_by_opp(ep_opp_indices, ep_outcomes)
+            comp_means["alt_term"] = _count_altitude_terms(ep_end_conditions)
             stats = IterationStats(
                 iteration=it, global_step=self.global_step, mean_return=mean_ret,
                 mean_length=mean_len, completed_episodes=len(ep_returns),

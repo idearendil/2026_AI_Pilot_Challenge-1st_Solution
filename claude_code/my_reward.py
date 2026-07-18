@@ -1,9 +1,11 @@
 # -*- coding: utf-8 -*-
 """[편집 가능] claude_code 보상 함수.
 
-규칙:
-  - [종료] 상대 HP<=0 또는 상대가 최소고도(=300m≈1000ft) 이하로 종료  →  +win_reward(10)
-  - [종료] 내 HP<=0   또는 내가  최소고도 이하로 종료                  →  +loss_reward(-10)
+규칙(종료 보상 3분리):
+  - [종료·HP] 상대 HP<=0 으로 종료(내가 이김)          →  +win_reward(10)
+              내 HP<=0   으로 종료(상대가 이김)         →  +loss_reward(-10)
+  - [종료·고도] 내 고도가 최소고도(=300m≈1000ft) 이하로 종료  →  ownship_alt_reward(-20)
+                상대 고도가 최소고도 이하로 종료             →  target_alt_reward(+1)
   - [보조] 양측이 살아있는(HP>0) 매 step:
            reward += (상대 HP 감소량 - 본인 HP 감소량) * damage_scale(10)
            (HP 감소량 = 이번 step 에 입은 damage = 함수 인자 target_damage / ownship_damage)
@@ -40,8 +42,10 @@ from dogfight.sim.state_schema import StateIndex
 import math
 
 MY_REWARD_CONFIG = {
-    "win_reward": 10.0,
-    "loss_reward": -10.0,
+    "win_reward": 10.0,       # 상대 HP<=0 으로 종료(내가 이김)
+    "loss_reward": -10.0,     # 내 HP<=0 으로 종료(상대가 이김)
+    "ownship_alt_reward": -20.0,   # 내 고도가 최소고도 이하로 떨어져 종료
+    "target_alt_reward": 1.0,      # 상대 고도가 최소고도 이하로 떨어져 종료
     "damage_scale": 10.0,   # (상대 HP감소 - 내 HP감소) * 이 값, 양측 생존 중 매 step
     "distance_reward_scale": 0.001,   # 직전 step 대비 줄어든 거리[m] * 이 값
     # 조준 dense shaping(potential-based) 계수. 0 이면 끔. damage 보다 작게 유지(보조 보상).
@@ -89,7 +93,7 @@ def compute_reward(
     # target_damage / ownship_damage = 이번 step 에 각 기체가 입은 damage(=HP 감소량).
     r_damage = 0.0
     if own_hp > 0.0 and tgt_hp > 0.0:
-        r_damage = (float(target_damage) * 1.0 - float(ownship_damage) * 0.0) * float(
+        r_damage = (float(target_damage) * 1.0 - float(ownship_damage) * 0.5) * float(
             reward_config.get("damage_scale", 10.0)
         )
 
@@ -122,15 +126,20 @@ def compute_reward(
             r_aim = (cur_aim_pot - _prev_aim_pot) * aim_scale
         _prev_aim_pot = cur_aim_pot
 
-    # [종료] 기존 ±10 그대로
+    # [종료] 3분리: (1) HP 승/패 ±10  (2) 내 고도 하락 -20  (3) 상대 고도 하락 +1
     r_terminal = 0.0
     if terminated:
-        target_lost = tgt_hp <= 0.0 or end_condition == _TARGET_ALT_END
-        ownship_lost = own_hp <= 0.0 or end_condition == _OWNSHIP_ALT_END
-        if target_lost:
+        # (1) HP 로 승부가 난 경우: 내가 이김 +10 / 상대가 이김 -10
+        if tgt_hp <= 0.0:
             r_terminal += float(reward_config.get("win_reward", 10.0))
-        if ownship_lost:
+        if own_hp <= 0.0:
             r_terminal += float(reward_config.get("loss_reward", -10.0))
+        # (2) 내 고도가 최소고도 이하로 떨어져 종료 → -20
+        if end_condition == _OWNSHIP_ALT_END:
+            r_terminal += float(reward_config.get("ownship_alt_reward", -10.0))
+        # (3) 상대 고도가 최소고도 이하로 떨어져 종료 → +1
+        if end_condition == _TARGET_ALT_END:
+            r_terminal += float(reward_config.get("target_alt_reward", 5.0))
 
     total = r_damage + r_distance + r_aim + r_terminal
     return float(total), {"damage": r_damage, "distance": r_distance,
