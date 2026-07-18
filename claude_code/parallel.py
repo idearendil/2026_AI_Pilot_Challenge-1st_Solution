@@ -204,6 +204,15 @@ def _make_worker_cls():
             if getattr(self, "_pool_provider", None) is not None:
                 self._pool_provider.set_weights(weights)
 
+        def pool_set_all(self, state_dicts, means, vars_, counts, weights, pool_max, seed):
+            """checkpoint 의 opponent pool 전체를 복원(worker). state_dicts 는 오래된→최신."""
+            from claude_code.self_play import PoolSelfPlayProvider
+            self._pool_max = max(1, int(pool_max))
+            provs = [self._build_opp_provider(st, mn, vr, ct)
+                     for st, mn, vr, ct in zip(state_dicts, means, vars_, counts)]
+            self._pool_provider = PoolSelfPlayProvider(provs, weights, seed=int(seed))
+            self.env._target_action_provider = self._pool_provider
+
         def _norm(self, obs):
             if self.obs_rms is None:
                 return np.asarray(obs, dtype=np.float32)
@@ -476,10 +485,36 @@ class ParallelPPOTrainer:
         wl = list(weights)
         ray.get([w.pool_set_weights.remote(wl) for w in self.workers])
 
-    def train(self, on_iteration=None):
+    def snapshot_current(self) -> dict:
+        """현재 정책 weights + obs_rms 통계를 checkpoint 용 dict 로 반환(numpy)."""
+        state, mean, var, count = self._current_state_rms()
+        rms = None if self.obs_rms is None else {
+            "mean": np.asarray(mean, dtype=np.float64),
+            "var": np.asarray(var, dtype=np.float64),
+            "count": float(count),
+        }
+        return {"state": state, "rms": rms}
+
+    def set_opponent_pool(self, entries, weights, pool_max) -> None:
+        """checkpoint 의 opponent pool 전체를 모든 worker 에 복원(broadcast)."""
+        import ray
+        self._pool_max = max(1, int(pool_max))
+        states = [e["state"] for e in entries]
+        means = [(e["rms"]["mean"] if e.get("rms") else None) for e in entries]
+        vars_ = [(e["rms"]["var"] if e.get("rms") else None) for e in entries]
+        counts = [(e["rms"]["count"] if e.get("rms") else 0.0) for e in entries]
+        sref = ray.put(states)
+        wl = list(weights)
+        ray.get([
+            w.pool_set_all.remote(sref, means, vars_, counts, wl, self._pool_max,
+                                  self.cfg.seed + 101 + i)
+            for i, w in enumerate(self.workers)
+        ])
+
+    def train(self, on_iteration=None, start_iteration: int = 1):
         import time
         history = []
-        for it in range(1, self.cfg.total_iterations + 1):
+        for it in range(int(start_iteration), self.cfg.total_iterations + 1):
             t0 = time.time()
             (batch, ep_returns, ep_lengths, ep_components,
              ep_outcomes, ep_opp_indices) = self.collect_rollout()

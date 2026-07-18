@@ -163,6 +163,12 @@ class PPOTrainer:
         self.obs_dim = obs_dim
         self.act_dim = act_dim
         self.global_step = 0
+        # 재개(resume)/pool 후보 재생성 시 동일 구조로 모델을 만들기 위한 kwargs.
+        self._model_kwargs = dict(
+            obs_dim=obs_dim, act_dim=act_dim, hidden=tuple(config.hidden),
+            activation=config.activation, num_bins=config.num_bins,
+            critic_hidden=(tuple(config.critic_hidden) if config.critic_hidden else None),
+            critic_activation=config.critic_activation)
 
         # 정규화기 (관측만 — 보상 스케일링 없음)
         self.obs_rms = RunningMeanStd(shape=(obs_dim,)) if config.normalize_obs else None
@@ -384,6 +390,44 @@ class PPOTrainer:
         if getattr(self, "_pool_provider", None) is not None:
             self._pool_provider.set_weights(weights)
 
+    def snapshot_current(self) -> dict:
+        """현재 정책 weights + obs_rms 통계를 checkpoint 용 dict 로 반환(numpy)."""
+        state = {k: v.detach().cpu().numpy() for k, v in self.model.state_dict().items()}
+        rms = None if self.obs_rms is None else {
+            "mean": np.asarray(self.obs_rms.mean, dtype=np.float64),
+            "var": np.asarray(self.obs_rms.var, dtype=np.float64),
+            "count": float(self.obs_rms.count),
+        }
+        return {"state": state, "rms": rms}
+
+    def _make_opp_provider_from(self, state, rms_dict, explore=True):
+        """checkpoint 의 (state_dict, rms) 로 frozen opponent SelfPlayProvider 재생성."""
+        m = make_actor_critic(**self._model_kwargs)
+        m.load_state_dict({k: torch.as_tensor(v) for k, v in state.items()})
+        m.eval()
+        rms = None
+        if rms_dict is not None and self.obs_rms is not None:
+            rms = RunningMeanStd(shape=(self.obs_dim,))
+            rms.mean = np.asarray(rms_dict["mean"], dtype=np.float64)
+            rms.var = np.asarray(rms_dict["var"], dtype=np.float64)
+            rms.count = float(rms_dict["count"])
+        return self._make_opp_provider(m, rms, explore)
+
+    def set_opponent_pool(self, entries, weights, pool_max, explore=True) -> None:
+        """checkpoint 의 opponent pool 전체를 그대로 복원(단일 프로세스).
+
+        entries: [{"state": state_dict(np), "rms": {mean,var,count}|None}, ...] (오래된→최신).
+        """
+        from claude_code.self_play import PoolSelfPlayProvider
+        self._pool_max = max(1, int(pool_max))
+        self._opp_explore = bool(explore)
+        provs = [self._make_opp_provider_from(e["state"], e.get("rms"), explore) for e in entries]
+        if not provs:  # 방어: 최소 1개(현재 정책)
+            snap = self.snapshot_current()
+            provs = [self._make_opp_provider_from(snap["state"], snap["rms"], explore)]
+        self._pool_provider = PoolSelfPlayProvider(provs, weights, seed=self.cfg.seed)
+        self.env._target_action_provider = self._pool_provider
+
     def pool_add_current(self) -> int:
         """현재 정책+obs_rms 의 frozen deep-copy 를 pool 에 추가(초과 시 가장 오래된 후보 제거).
 
@@ -453,9 +497,10 @@ class PPOTrainer:
         return evaluation.summarize(results)
 
     # ── 메인 루프 ────────────────────────────────────────────────────────────
-    def train(self, on_iteration: Optional[Callable[[IterationStats], None]] = None):
+    def train(self, on_iteration: Optional[Callable[[IterationStats], None]] = None,
+              start_iteration: int = 1):
         history: list[IterationStats] = []
-        for it in range(1, self.cfg.total_iterations + 1):
+        for it in range(int(start_iteration), self.cfg.total_iterations + 1):
             t0 = time.time()
             (batch, ep_returns, ep_lengths, ep_components,
              ep_outcomes, ep_opp_indices) = self.collect_rollout()

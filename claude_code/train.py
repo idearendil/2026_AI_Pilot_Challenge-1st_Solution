@@ -37,6 +37,56 @@ from claude_code.model import save_bundle
 from claude_code.parallel import physical_cpu_count
 from claude_code.ppo import PPOConfig, PPOTrainer, IterationStats
 
+TRAIN_CKPT_FORMAT = "claude_code_ppo_train_ckpt"
+TRAIN_CKPT_VERSION = 1
+
+
+def save_train_state(path, *, trainer, pool, pool_state, pool_max, iteration,
+                     global_step, best, model_kwargs) -> None:
+    """전체 학습 상태를 하나의 .pt 로 원자적 저장(중단돼도 이어서 학습 가능).
+
+    저장: model(actor+critic) state_dict, actor/critic optimizer state, obs_rms,
+    opponent pool(각 후보 actor net state + EMA + gen), pool 메타(next_gen 등),
+    global_step, iteration(=직전 완료 iteration), best 추적. iteration+1 부터 재개한다.
+    """
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    obs_rms = None
+    if trainer.obs_rms is not None:
+        obs_rms = {
+            "mean": np.asarray(trainer.obs_rms.mean, dtype=np.float64),
+            "var": np.asarray(trainer.obs_rms.var, dtype=np.float64),
+            "count": float(trainer.obs_rms.count),
+        }
+    ckpt = {
+        "format": TRAIN_CKPT_FORMAT,
+        "version": TRAIN_CKPT_VERSION,
+        "iteration": int(iteration),
+        "global_step": int(global_step),
+        "model_kwargs": dict(model_kwargs),
+        "model_state": {k: v.detach().cpu() for k, v in trainer.model.state_dict().items()},
+        "actor_opt": trainer.actor_opt.state_dict(),
+        "critic_opt": trainer.critic_opt.state_dict(),
+        "obs_rms": obs_rms,
+        "pool_max": int(pool_max),
+        "next_gen": int(pool_state["next_gen"]),
+        "n_added": int(pool_state["n_added"]),
+        # 각 후보: EMA + actor net(+critic; state_dict 전체) + obs_rms 스냅샷.
+        "pool": [{"gen": int(e["gen"]), "ema": float(e["ema"]),
+                  "state": e["state"], "rms": e.get("rms")} for e in pool],
+        "best": dict(best),
+    }
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    torch.save(ckpt, str(tmp))
+    os.replace(str(tmp), str(path))   # 원자적 교체 → 저장 중 중단돼도 기존 ckpt 보존
+
+
+def load_train_state(path):
+    ckpt = torch.load(str(path), map_location="cpu", weights_only=False)
+    if ckpt.get("format") != TRAIN_CKPT_FORMAT:
+        raise ValueError(f"train-state checkpoint 형식이 아님: {path}")
+    return ckpt
+
 
 def parse_args():
     p = argparse.ArgumentParser(description="claude_code standalone PPO trainer for DogFight 1v1")
@@ -78,6 +128,13 @@ def parse_args():
     p.add_argument("--resume-from", default="",
                    help="이어서 학습할 snapshot(.pt) 경로. actor+critic 가중치+obs_rms 를 불러와 "
                         "그 상태에서 학습 시작(phase1 → phase2). optimizer 모멘트는 새로 시작.")
+    p.add_argument("--resume-state", default="",
+                   help="전체 학습 상태 checkpoint(.pt) 에서 이어서 학습. model(actor+critic)+optimizer+"
+                        "obs_rms+opponent pool(모든 후보 net & EMA)+global_step+iteration 을 복원해 "
+                        "직전 iteration 다음부터 --iterations 까지 계속한다. (--resume-from 보다 우선)")
+    p.add_argument("--checkpoint-path", default="",
+                   help="매 iteration 직전/학습 종료 시 저장할 전체 학습 상태 .pt 경로. "
+                        "비우면 claude_code/models/<name>/<tag>/train_state.pt 에 저장.")
     p.add_argument("--frozen-opponent", action="store_true",
                    help="self-play 상대를 학습 시작 시점의 actor net 으로 고정(학습 agent 와 분리). "
                         "phase2(--resume-from)와 함께 쓰면 상대=phase1 마지막 net 으로 고정.")
@@ -281,11 +338,44 @@ def main():
     def _snap_path(it: int) -> Path:
         return snapshot_dir / f"iter_{it:04d}.pt"
 
+    # 전체 학습 상태 checkpoint 경로 (매 iteration 직전/학습 종료 시 저장).
+    ckpt_path = Path(args.checkpoint_path) if args.checkpoint_path else (snapshot_dir / "train_state.pt")
+
+    # 전체 학습 상태(train-state) 이어가기 (--resume-state, 우선). model(actor+critic)+
+    # optimizer+obs_rms+opponent pool+global_step+iteration 을 복원해 직전 iteration 다음부터
+    # 계속한다. 아래 pool 설치 블록에서 pool 도 checkpoint 값으로 복원한다.
+    resume_ckpt = None
+    start_iter = 1
+    if args.resume_state:
+        resume_ckpt = load_train_state(args.resume_state)
+        for k in ("obs_dim", "act_dim", "num_bins"):
+            if resume_ckpt["model_kwargs"].get(k) != model_kwargs.get(k):
+                raise ValueError(
+                    f"resume-state 구조 불일치: {k} ckpt={resume_ckpt['model_kwargs'].get(k)} != "
+                    f"현재={model_kwargs.get(k)}. 같은 네트워크 구조로만 이어서 학습 가능.")
+        trainer.model.load_state_dict(
+            {k: torch.as_tensor(v) for k, v in resume_ckpt["model_state"].items()})
+        trainer.actor_opt.load_state_dict(resume_ckpt["actor_opt"])
+        trainer.critic_opt.load_state_dict(resume_ckpt["critic_opt"])
+        if resume_ckpt["obs_rms"] is not None and trainer.obs_rms is not None:
+            trainer.obs_rms.mean = np.asarray(resume_ckpt["obs_rms"]["mean"], dtype=np.float64)
+            trainer.obs_rms.var = np.asarray(resume_ckpt["obs_rms"]["var"], dtype=np.float64)
+            trainer.obs_rms.count = float(resume_ckpt["obs_rms"]["count"])
+        trainer.global_step = int(resume_ckpt["global_step"])
+        start_iter = int(resume_ckpt["iteration"]) + 1
+        best.update(dict(resume_ckpt.get("best", {})))
+        base_metadata["resumed_state"] = str(args.resume_state)
+        print(f"[claude_code/PPO] resume-state: {args.resume_state} 복원 "
+              f"(iter {resume_ckpt['iteration']} 완료 → iter {start_iter}부터, "
+              f"step={trainer.global_step}, pool={len(resume_ckpt['pool'])}개, "
+              f"model+optimizer+obs_rms 포함)")
+
     # phase 이어가기: snapshot 에서 actor+critic 가중치 + obs_rms 를 그대로 불러온다.
     # (snapshot 은 model.state_dict() 전체 = actor+critic 둘 다 포함하므로 value net 도 이어짐.)
     # load_state_dict 는 in-place 라 self-play SelfPlayProvider 의 model 참조에도 즉시 반영되고,
     # 병렬 모드는 학습 시작 시 driver→worker broadcast 로 전파된다. optimizer 모멘트는 새로 시작.
-    if args.resume_from:
+    # (--resume-state 가 있으면 그쪽이 우선이므로 --resume-from 은 무시한다.)
+    if args.resume_from and resume_ckpt is None:
         resume_path = Path(args.resume_from)
         state_dict, snap_kwargs, snap_rms = evaluation.load_snapshot(resume_path)
         for k in ("obs_dim", "act_dim", "num_bins"):
@@ -308,6 +398,8 @@ def main():
     # --frozen-opponent 이면 임계값을 무한대로 둬서 영구 고정(승격 안 함).
     gate_threshold = float("inf") if args.frozen_opponent else float(args.selfplay_gate_threshold)
     pool_max = 1 if args.frozen_opponent else max(1, int(args.pool_size))
+    if resume_ckpt is not None:
+        pool_max = int(resume_ckpt["pool_max"])   # checkpoint 의 pool 구성을 그대로 이어감
 
     def _pool_weights(emas) -> list:
         """EMA 낮은 후보가 더 자주 뽑히도록 softmax(-ema/τ) 가중치."""
@@ -319,9 +411,31 @@ def main():
         w = np.exp(logits)
         return (w / w.sum()).tolist()
 
+    # opponent pool EMA/net 메타데이터(train.py 소유, checkpoint 저장 대상).
+    #   각 후보: {"gen", "ema", "state"(actor+critic net np), "rms"(obs_rms 스냅샷)}.
+    pool: list = []
+    pool_state = {"next_gen": 1, "n_added": 0}
+
     if args.self_play:
-        trainer.install_opponent_pool(pool_max)
-        trainer.pool_set_weights([1.0])
+        if resume_ckpt is not None:
+            # checkpoint 의 pool(모든 후보 net + EMA) 을 그대로 복원.
+            pool = [{"gen": int(e["gen"]), "ema": float(e["ema"]),
+                     "state": e["state"], "rms": e.get("rms")}
+                    for e in resume_ckpt["pool"]]
+            pool_state = {"next_gen": int(resume_ckpt["next_gen"]),
+                          "n_added": int(resume_ckpt["n_added"])}
+            trainer.set_opponent_pool(pool, _pool_weights([e["ema"] for e in pool]), pool_max)
+            print(f"[claude_code/PPO] opponent pool 복원: {len(pool)}개 후보 "
+                  f"(gen {[e['gen'] for e in pool]}, ema {[round(e['ema'],3) for e in pool]})")
+        else:
+            trainer.install_opponent_pool(pool_max)
+            snap = trainer.snapshot_current()
+            pool = [{"gen": 0, "ema": 0.5, "state": snap["state"], "rms": snap["rms"]}]
+            pool_state = {"next_gen": 1, "n_added": 0}
+            trainer.pool_set_weights(_pool_weights([0.5]))
+            print(f"[claude_code/PPO] opponent pool 초기화 = iter0 정책 1개 (최대 {pool_max}개, "
+                  f"EMA α={args.selfplay_ema_alpha}, 추가 임계 min-EMA≥{args.selfplay_gate_threshold:.2f}, "
+                  f"초기 EMA=0.5, 샘플 τ={args.pool_sample_temp})")
         base_metadata["selfplay_gate_threshold"] = (None if args.frozen_opponent
                                                     else args.selfplay_gate_threshold)
         base_metadata["selfplay_ema_alpha"] = args.selfplay_ema_alpha
@@ -330,10 +444,6 @@ def main():
         base_metadata["pool_sample_temp"] = args.pool_sample_temp
         if args.frozen_opponent:
             print("[claude_code/PPO] opponent = 학습 시작 시점 정책으로 영구 고정(pool 크기 1, 추가 없음)")
-        else:
-            print(f"[claude_code/PPO] opponent pool 초기화 = iter0 정책 1개 (최대 {pool_max}개, "
-                  f"EMA α={args.selfplay_ema_alpha}, 추가 임계 min-EMA≥{args.selfplay_gate_threshold:.2f}, "
-                  f"초기 EMA=0.5, 샘플 τ={args.pool_sample_temp})")
 
     # iter 0 = 학습 시작 직전 network (resume 면 불러온 가중치, 아니면 완전 초기화).
     evaluation.save_snapshot(_snap_path(0), trainer.model, trainer.obs_rms, model_kwargs)
@@ -356,19 +466,21 @@ def main():
     log_dir = Path(args.artifacts_dir) / "logs" / args.output_name / args.output_tag
     log_dir.mkdir(parents=True, exist_ok=True)
     log_path = log_dir / "ppo_training_log.csv"
-    log_file = log_path.open("w", newline="", encoding="utf-8")
+    # resume-state 로 이어갈 때 기존 CSV 에 append(헤더 재기록 안 함).
+    csv_append = resume_ckpt is not None and log_path.exists()
+    log_file = log_path.open("a" if csv_append else "w", newline="", encoding="utf-8")
     writer = csv.writer(log_file)
-    writer.writerow([
-        "iteration", "global_step", "mean_return", "mean_length", "completed_episodes",
-        "policy_loss", "value_loss", "entropy", "approx_kl", "explained_variance",
-        "ep_pursuit", "ep_damage", "ep_distance", "ep_aim", "ep_terminal", "elapsed_sec",
-        "win", "loss", "draw", "raw_win_rate",
-        "ema_mean", "ema_min", "pool_size", "opp_added",
-    ])
+    if not csv_append:
+        writer.writerow([
+            "iteration", "global_step", "mean_return", "mean_length", "completed_episodes",
+            "policy_loss", "value_loss", "entropy", "approx_kl", "explained_variance",
+            "ep_pursuit", "ep_damage", "ep_distance", "ep_aim", "ep_terminal", "elapsed_sec",
+            "win", "loss", "draw", "raw_win_rate",
+            "ema_mean", "ema_min", "pool_size", "opp_added",
+        ])
 
-    # opponent pool EMA 상태. 각 후보 {gen, ema}. 초기 후보 1개(gen0, ema0.5).
-    pool = [{"gen": 0, "ema": 0.5}]
-    pool_state = {"next_gen": 1, "n_added": 0}
+    # 마지막으로 완료한 iteration 추적(학습 종료 시 최종 checkpoint 저장에 사용).
+    progress = {"last_iter": start_iter - 1, "last_step": trainer.global_step}
 
     def on_iteration(s: IterationStats):
         pursuit = s.extra.get("pursuit", float("nan"))
@@ -398,7 +510,9 @@ def main():
             emas = [e["ema"] for e in pool]
             if emas and min(emas) >= gate_threshold:
                 trainer.pool_add_current()
-                pool.append({"gen": pool_state["next_gen"], "ema": 0.5})
+                snap = trainer.snapshot_current()   # 추가된 후보 net(+obs_rms) 을 checkpoint 용으로 보관
+                pool.append({"gen": pool_state["next_gen"], "ema": 0.5,
+                             "state": snap["state"], "rms": snap["rms"]})
                 pool_state["next_gen"] += 1
                 if len(pool) > pool_max:
                     pool.pop(0)
@@ -427,6 +541,18 @@ def main():
         # 매 iteration 의 actor network 를 snapshot 으로 저장(post-update 상태).
         evaluation.save_snapshot(_snap_path(s.iteration), trainer.model,
                                  trainer.obs_rms, model_kwargs)
+
+        # 전체 학습 상태 checkpoint 저장(= 다음 iteration 시작 직전 상태). 원자적 교체라
+        # 저장 도중 중단돼도 직전 checkpoint 가 보존된다. 이 파일로 이어서 학습 가능.
+        progress["last_iter"] = s.iteration
+        progress["last_step"] = s.global_step
+        try:
+            save_train_state(
+                ckpt_path, trainer=trainer, pool=pool, pool_state=pool_state,
+                pool_max=pool_max, iteration=s.iteration, global_step=s.global_step,
+                best=best, model_kwargs=model_kwargs)
+        except Exception as e:
+            print(f"[claude_code/PPO] train-state 저장 실패({e})", flush=True)
 
         # opponent 에게 준 damage(원값) 평균 = damage_reward / damage_scale (받은damage 가중치 0).
         damage_dealt = (damage / dmg_scale) if (dmg_scale and damage == damage) else float("nan")
@@ -484,7 +610,7 @@ def main():
         )
 
     try:
-        history = trainer.train(on_iteration=on_iteration)
+        history = trainer.train(on_iteration=on_iteration, start_iteration=start_iter)
     finally:
         log_file.close()
         env.close()
@@ -509,6 +635,18 @@ def main():
                 extra_metadata={**base_metadata,
                                 "selected_iteration": args.iterations,
                                 "source": "final_iteration"})
+
+    # 학습 종료 시 최종 전체 학습 상태 checkpoint 저장(다음 학습에서 --resume-state 로 이어감).
+    if args.self_play:
+        try:
+            save_train_state(
+                ckpt_path, trainer=trainer, pool=pool, pool_state=pool_state,
+                pool_max=pool_max, iteration=progress["last_iter"],
+                global_step=progress["last_step"], best=best, model_kwargs=model_kwargs)
+            print(f"[claude_code/PPO] 최종 학습 상태 checkpoint: {ckpt_path} "
+                  f"(iter {progress['last_iter']}까지; 다음에 --resume-state {ckpt_path} 로 이어서 학습)")
+        except Exception as e:
+            print(f"[claude_code/PPO] 최종 train-state 저장 실패({e})", flush=True)
 
     print(f"\n[claude_code/PPO] 번들 저장 완료: {bundle_dir}")
     print(f"[claude_code/PPO] 최종 iteration 번들: {final_bundle_dir} (iter {args.iterations})")
