@@ -8,13 +8,15 @@
   - reset_reconstructor()/advance_reconstructor()는 RL step마다 한 번만 호출한다.
   - build_observation()은 reconstructor 값을 읽기만 한다.
 
-관측 구조 (claude141r)
+관측 구조 (claude164r)
 ----------------------
 관측은 두 블록으로 나뉜다.
 
-  1) frame-invariant 스칼라 블록 (27개): 속력, HP, 에너지고도차, 슬랜트 거리,
-     closure, 교전 기하각(ATA/AA/LOS az·el의 sin/cos), 조준/거리 margin, 시간 등.
-     좌표계와 무관한 값이라 한 번만 넣는다.
+  1) frame-invariant 스칼라 블록 (50개): 속력, HP, 에너지고도차, 슬랜트 거리,
+     closure, 교전 기하각(ATA/AA/LOS az·el의 sin/cos), 조준/거리 margin, 시간,
+     나·상대 절대 자세(roll/pitch/yaw sin·cos), 나·상대 속도축 뱅크각 μ(sin·cos),
+     연료(나·상대), 순간 damage rate(가함·받음), pursuit_score, 절대 고도(나·상대,
+     고고도까지 선형) 등. 좌표계와 무관해 한 번만 넣는다.
 
   2) frame-expressed 벡터 블록 (114개): 아래 7개 방향 벡터를 6개 좌표계 성분으로
      각각 표현한다. 퇴화(정보 없는) 조합은 제외한다.
@@ -115,8 +117,18 @@ AOA_SCALE_DEG = 30.0
 SIDESLIP_SCALE_DEG = 15.0
 MIN_ALTITUDE_M = 300.0
 ALTITUDE_DANGER_SCALE_M = 300.0
+MAX_ALTITUDE_M = 15000.0            # 절대 고도 정규화 상한(고고도 해상도 보존, 선형)
 ENERGY_ADVANTAGE_SCALE_M = 5000.0
 REL_POS_SCALE_M = 1000.0
+PURSUIT_ATA_SCALE_DEG = 30.0        # pursuit_score: |ATA| 이 이 값이면 조준 factor=0
+PURSUIT_RANGE_M = 3000.0            # pursuit_score: 거리 이 값이면 거리 factor=0
+
+# 연료 재구성(서버 추론에선 fuel=0 으로 들어오므로 HP 처럼 관측에 넣지 않고 재구성한다).
+# 만탱크=1.0 에서 시작해 속도(≈throttle 대리)에 비례해 아주 천천히 감소한다. 학습/추론이
+# 동일한 관측값(속도+시간)으로 계산하므로 train/test 가 일치한다. 실측 소모율(~300m/s
+# 순항에서 20s 동안 약 0.16% 감소)에 맞춰 계수를 잡았다(1 episode 안에선 거의 상수).
+FUEL_BURN_PER_SEC = 8.0e-5          # 기준 속도에서의 초당 연료 소모(비율)
+FUEL_REF_SPEED = 300.0             # 연료 소모를 1.0 배로 보는 기준 속력[m/s]
 
 TIER2_START_SEC = 100.0
 TIER3_START_SEC = 150.0
@@ -158,6 +170,30 @@ SCALAR_FEATURE_NAMES = [
     "range_margin_near_tanh",
     "range_margin_far_active_tanh",
     "time_norm",
+    # ── 복원/추가 feature ──
+    "own_roll_sin",
+    "own_roll_cos",
+    "own_pitch_sin",
+    "own_pitch_cos",
+    "own_yaw_sin",
+    "own_yaw_cos",
+    "target_roll_sin",
+    "target_roll_cos",
+    "target_pitch_sin",
+    "target_pitch_cos",
+    "target_yaw_sin",
+    "target_yaw_cos",
+    "own_vel_bank_sin",
+    "own_vel_bank_cos",
+    "target_vel_bank_sin",
+    "target_vel_bank_cos",
+    "own_fuel_norm",
+    "target_fuel_norm",
+    "damage_rate_dealt",
+    "damage_rate_taken",
+    "pursuit_score",
+    "own_altitude_abs_norm",
+    "target_altitude_abs_norm",
 ]
 
 # ── frame-expressed 벡터 블록 ────────────────────────────────────────────────
@@ -203,7 +239,7 @@ def _all_feature_names():
 
 FEATURE_NAMES = _all_feature_names()
 
-OBSERVATION_MODE = "claude141r"
+OBSERVATION_MODE = "claude164r"
 OBSERVATION_SIZE = len(FEATURE_NAMES)
 
 # Gym/model metadata에 기록할 observation space bound다.
@@ -331,6 +367,20 @@ def _dir_frame(x_axis_ned):
     return np.vstack([x, y, z])
 
 
+def _bank_about_dir(r_body_to_ned, dir_ned) -> tuple[float, float]:
+    """방향벡터 dir_ned를 축으로 한 body 뱅크각 μ의 (sin, cos)를 반환한다.
+
+    dir_ned로 만든 _dir_frame(roll은 중력으로 고정)에서 body y축(오른쪽 날개)이
+    얼마나 기울어졌는지가 μ다. 날개 수평이면 μ=0, 오른쪽으로 뱅크하면 μ>0.
+    dir_ned가 속도벡터면 μ는 공력 뱅크각(양력벡터 방향), LOS면 LOS축 기준 뱅크각이다.
+    """
+    R = _dir_frame(dir_ned)   # R_ned_to_frame (행 = frame 축)
+    body_y_ned = np.asarray(r_body_to_ned, dtype=np.float64)[:, 1]
+    yv = R @ body_y_ned       # body 오른날개를 frame 성분으로: [전방, 오른쪽, 아래]
+    mu = float(np.arctan2(float(yv[2]), float(yv[1])))
+    return float(np.sin(mu)), float(np.cos(mu))
+
+
 def _log_so3(r_mat):
     tr = float(np.trace(r_mat))
     cos_theta = (tr - 1.0) * 0.5
@@ -374,6 +424,8 @@ class StateReconstructor:
     def reset(self) -> None:
         self.hp_own = 1.0
         self.hp_tgt = 1.0
+        self.fuel_own = 1.0
+        self.fuel_tgt = 1.0
         self.t_sec = 0.0
         self.last_dmg_dealt = 0.0
         self.last_dmg_taken = 0.0
@@ -398,6 +450,14 @@ class StateReconstructor:
 
         self.hp_tgt = max(0.0, self.hp_tgt - rate_dealt * self.dt)
         self.hp_own = max(0.0, self.hp_own - rate_taken * self.dt)
+
+        # 연료 재구성: 속도(≈throttle 대리)에 비례해 만탱크(1.0)에서 천천히 감소.
+        own_speed = float(np.linalg.norm(own[6:9]))
+        tgt_speed = float(np.linalg.norm(tgt[6:9]))
+        burn_own = FUEL_BURN_PER_SEC * (own_speed / FUEL_REF_SPEED)
+        burn_tgt = FUEL_BURN_PER_SEC * (tgt_speed / FUEL_REF_SPEED)
+        self.fuel_own = max(0.0, self.fuel_own - burn_own * self.dt)
+        self.fuel_tgt = max(0.0, self.fuel_tgt - burn_tgt * self.dt)
 
         self.last_dmg_dealt = rate_dealt
         self.last_dmg_taken = rate_taken
@@ -438,7 +498,7 @@ def advance_reconstructor(own_state, tgt_state) -> None:
 
 def build_observation(ownship_state, target_state, geo_info, wez_config=None,
                       reconstructor=None) -> np.ndarray:
-    """claude141r multi-frame observation을 만든다.
+    """claude164r multi-frame observation을 만든다.
 
     wez_config는 기존 외부 signature 호환을 위해 받지만 이 observation에서는 쓰지
     않는다. damage envelope feature는 고정 서버 rule과 재구성 episode 시간을 사용한다.
@@ -523,6 +583,21 @@ def build_observation(ownship_state, target_state, geo_info, wez_config=None,
     range_margin_near_raw = (float(distance) - min_damage_range_m) / active_span_m
     range_margin_far_raw = (active_max_range_m - float(distance)) / active_span_m
 
+    # ── 복원/추가 feature 계산 ──
+    own_roll_sin, own_roll_cos = _sincos(own_roll)
+    own_pitch_sin, own_pitch_cos = _sincos(own_pitch)
+    own_yaw_sin, own_yaw_cos = _sincos(own_yaw)
+    tgt_roll_sin, tgt_roll_cos = _sincos(tgt_roll)
+    tgt_pitch_sin, tgt_pitch_cos = _sincos(tgt_pitch)
+    tgt_yaw_sin, tgt_yaw_cos = _sincos(tgt_yaw)
+    own_vel_bank_sin, own_vel_bank_cos = _bank_about_dir(r_body_to_ned_own, own_vel_ned)
+    tgt_vel_bank_sin, tgt_vel_bank_cos = _bank_about_dir(r_body_to_ned_tgt, tgt_vel_ned)
+    dmg_dealt = float(rec.last_dmg_dealt)   # 내가 상대에 가하는 초당 damage rate [0,~1]
+    dmg_taken = float(rec.last_dmg_taken)   # 내가 받는 초당 damage rate [0,~1]
+    pursuit_ata_factor = max(0.0, 1.0 - abs(float(ata)) / PURSUIT_ATA_SCALE_DEG)
+    pursuit_range_factor = max(0.0, 1.0 - float(distance) / PURSUIT_RANGE_M)
+    pursuit_score = 2.0 * (pursuit_ata_factor * pursuit_range_factor) - 1.0
+
     scalars = [
         normalize(own_speed, 0.0, MAX_SPEED),
         normalize(target_speed, 0.0, MAX_SPEED),
@@ -547,6 +622,22 @@ def build_observation(ownship_state, target_state, geo_info, wez_config=None,
         float(np.tanh(range_margin_near_raw)),
         float(np.tanh(range_margin_far_raw)),
         normalize(float(rec.t_sec), 0.0, EPISODE_MAX_TIME_SEC),
+        # ── 복원/추가 feature (SCALAR_FEATURE_NAMES 뒷부분과 정확히 일치) ──
+        own_roll_sin, own_roll_cos,
+        own_pitch_sin, own_pitch_cos,
+        own_yaw_sin, own_yaw_cos,
+        tgt_roll_sin, tgt_roll_cos,
+        tgt_pitch_sin, tgt_pitch_cos,
+        tgt_yaw_sin, tgt_yaw_cos,
+        own_vel_bank_sin, own_vel_bank_cos,
+        tgt_vel_bank_sin, tgt_vel_bank_cos,
+        normalize(float(rec.fuel_own), 0.0, 1.0),
+        normalize(float(rec.fuel_tgt), 0.0, 1.0),
+        float(np.clip(2.0 * dmg_dealt - 1.0, -1.0, 1.0)),
+        float(np.clip(2.0 * dmg_taken - 1.0, -1.0, 1.0)),
+        float(pursuit_score),
+        normalize(own_alt, 0.0, MAX_ALTITUDE_M),
+        normalize(target_alt, 0.0, MAX_ALTITUDE_M),
     ]
 
     # ── frame-expressed 벡터 블록 (_VEC_LAYOUT 순서와 정확히 일치) ────────────
@@ -598,7 +689,9 @@ def describe_observation() -> dict:
         "vectors": [k for k, _, _ in VECTOR_SPECS],
         "features": list(FEATURE_NAMES),
         "description": (
-            "claude141r multi-frame observation. frame-invariant 스칼라 27개 + "
+            "claude164r multi-frame observation. frame-invariant 스칼라 50개 "
+            "(나·상대 절대 자세 sin/cos, 나·상대 속도축 뱅크각 μ sin/cos, 연료 나·상대, "
+            "순간 damage rate 2개, pursuit_score, 절대 고도 나·상대 포함) + "
             "7개 방향 벡터(중력/LOS/내속도/표적속도/상대속도/내ω/표적ω)를 6개 "
             "좌표계(world/mybody/oppbody/myvel/oppvel/los)로 표현한 114개. "
             "퇴화 조합(gravity@world, los@los, own_vel@myvel, tgt_vel@oppvel)은 "
