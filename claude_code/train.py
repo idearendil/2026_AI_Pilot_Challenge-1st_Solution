@@ -90,8 +90,8 @@ def load_train_state(path):
 
 def parse_args():
     p = argparse.ArgumentParser(description="claude_code standalone PPO trainer for DogFight 1v1")
-    p.add_argument("--iterations", type=int, default=500)
-    p.add_argument("--rollout-steps", type=int, default=50000)
+    p.add_argument("--iterations", type=int, default=1000)
+    p.add_argument("--rollout-steps", type=int, default=80000)
     p.add_argument("--lr", type=float, default=1e-4)
     p.add_argument("--gamma", type=float, default=0.97)
     p.add_argument("--gae-lambda", type=float, default=0.95)
