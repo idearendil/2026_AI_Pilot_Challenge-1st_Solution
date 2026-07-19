@@ -94,7 +94,7 @@ def compute_reward(
     r_damage = 0.0
     if own_hp > 0.0 and tgt_hp > 0.0:
         r_damage = (float(target_damage) * 1.0 - float(ownship_damage) * 0.5) * float(
-            reward_config.get("damage_scale", 10.0)
+            reward_config.get("damage_scale", 50.0)
         )
 
     # [보조] 거리 접근: 직전 RL-step 대비 거리가 줄어든 양(m) * distance_reward_scale.
@@ -105,7 +105,7 @@ def compute_reward(
     r_distance = 0.0
     if not new_episode:
         closed = _prev_distance_m - cur_distance   # 가까워졌으면 양수, 멀어졌으면 음수
-        r_distance = closed * float(reward_config.get("distance_reward_scale", 0.0001))
+        r_distance = closed * float(reward_config.get("distance_reward_scale", 0.00001))
     _prev_distance_m = cur_distance
     _prev_sim_time = cur_sim_time
 
