@@ -147,7 +147,7 @@ def parse_args():
                    help="opponent pool: 모든 후보에 대한 EMA 승률 중 '최소값'이 이 값 이상이면 "
                         "현재 actor net 을 pool 에 새 후보로 추가(새 후보 EMA=0.5). "
                         "(--frozen-opponent 이면 무시=영구 고정)")
-    p.add_argument("--selfplay-ema-alpha", type=float, default=0.05,
+    p.add_argument("--selfplay-ema-alpha", type=float, default=0.1,
                    help="opponent 별 EMA 계수 α. ema_i = (1-α)·ema_i + α·(이번 iter 후보 i 상대 raw 승률). 초기 ema=0.5.")
     p.add_argument("--pool-size", type=int, default=5,
                    help="opponent pool 최대 크기. 초과 시 가장 오래 전에 추가된 후보를 제거(FIFO).")
