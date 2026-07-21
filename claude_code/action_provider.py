@@ -23,10 +23,14 @@ from claude_code.model import (
 
 
 class MLPActionProvider(ActionProvider):
-    def __init__(self, bundle_dir: str | Path, device: str = "cpu", confidence: float = 0.9):
+    def __init__(self, bundle_dir: str | Path, device: str = "cpu", confidence: float = 0.9,
+                 stochastic: bool = False):
         self.bundle_dir = str(bundle_dir)
         self.device = device
         self.confidence = confidence
+        # True 면 학습 때와 동일하게 정책 분포에서 샘플링(리플레이 다양성용).
+        # 제출/평가 기본값은 False(argmax).
+        self.stochastic = bool(stochastic)
         self.model, self.metadata = load_bundle(bundle_dir, device=device)
         self.obs_dim = int(self.metadata.get("observation_size", 16))
         # 학습 때와 동일한 관측 정규화 적용 (없으면 항등).
@@ -65,7 +69,9 @@ class MLPActionProvider(ActionProvider):
 
         obs = self._normalize_obs(obs)
         obs_tensor = torch.as_tensor(obs, dtype=torch.float32, device=self.device).unsqueeze(0)
-        raw = self.model.act_deterministic(obs_tensor).squeeze(0).cpu().numpy()
+        act_fn = (self.model.act_stochastic if self.stochastic
+                  else self.model.act_deterministic)
+        raw = act_fn(obs_tensor).squeeze(0).cpu().numpy()
         # 이산 정책이면 카테고리 index → 연속값으로 변환.
         if hasattr(self.model, "num_bins"):
             raw = discrete_indices_to_continuous(raw, self.model.num_bins)

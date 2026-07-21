@@ -34,7 +34,7 @@ for _p in (ROOT, ROOT / "src"):
 
 from claude_code.env_utils import make_env, STANDARD_ENV_CONFIG
 from claude_code.model import save_bundle
-from claude_code.parallel import physical_cpu_count
+from claude_code.parallel import logical_cpu_count
 from claude_code.ppo import PPOConfig, PPOTrainer, IterationStats
 
 TRAIN_CKPT_FORMAT = "claude_code_ppo_train_ckpt"
@@ -91,21 +91,22 @@ def load_train_state(path):
 def parse_args():
     p = argparse.ArgumentParser(description="claude_code standalone PPO trainer for DogFight 1v1")
     p.add_argument("--iterations", type=int, default=1000)
-    p.add_argument("--rollout-steps", type=int, default=80000)
+    p.add_argument("--rollout-steps", type=int, default=50000)
     p.add_argument("--lr", type=float, default=1e-4)
     p.add_argument("--gamma", type=float, default=0.97)
     p.add_argument("--gae-lambda", type=float, default=0.95)
     p.add_argument("--clip-coef", type=float, default=0.2)
     p.add_argument("--update-epochs", type=int, default=4)
     p.add_argument("--minibatch-size", type=int, default=512)
-    p.add_argument("--ent-coef", type=float, default=0.0001)
+    p.add_argument("--ent-coef", type=float, default=0.00005)
     p.add_argument("--vf-coef", type=float, default=0.5)
     p.add_argument("--target-kl", type=float, default=0.05)
     p.add_argument("--hidden", default="512,512,512", help="actor hidden 크기, 예: 256,256")
     p.add_argument("--activation", default="tanh", choices=["tanh", "relu", "elu"])
     p.add_argument("--log-std-init", type=float, default=-1.0, help="(이산 정책에서는 미사용)")
-    p.add_argument("--action-bins", type=int, default=7,
-                   help="각 행동 채널(roll/pitch/yaw/throttle)의 이산 카테고리 수 (균등 분할)")
+    p.add_argument("--action-bins", type=int, default=21,
+                   help="각 행동 채널(roll/pitch/yaw/throttle)의 이산 카테고리 수 (균등 분할). "
+                        "홀수여야 가운데 index=(n-1)/2 가 정확히 중립(0.0)이 된다.")
     # critic 을 actor 와 완전히 분리된 네트워크로 (구조/학습률 독립). 비우면 actor 와 동일.
     p.add_argument("--critic-hidden", default="", help="critic 전용 hidden (비우면 actor 와 동일)")
     p.add_argument("--critic-activation", default="", choices=["", "tanh", "relu", "elu"],
@@ -122,9 +123,9 @@ def parse_args():
     p.add_argument("--distance-reward-scale", type=float, default=None,
                    help="my_reward 의 distance_reward_scale 덮어쓰기. phase2 에서 거리 항을 "
                         "끄려면 0 을 준다. None 이면 모듈 기본값(0.001) 사용.")
-    p.add_argument("--aim-reward-scale", type=float, default=0.5,
-                   help="조준 dense shaping(potential-based) 계수. damage 보다 작게(보조). "
-                        "예 0.5. 0 이면 끔. None 이면 모듈 기본값(0.0=off) 사용.")
+    p.add_argument("--aim-reward-scale", type=float, default=None,
+                   help="my_reward 의 aim_reward_scale 덮어쓰기. 직전 step 대비 줄어든 "
+                        "|ATA|[deg] * 이 값. 0 이면 끔. None 이면 모듈 기본값(0.02) 사용.")
     p.add_argument("--resume-from", default="",
                    help="이어서 학습할 snapshot(.pt) 경로. actor+critic 가중치+obs_rms 를 불러와 "
                         "그 상태에서 학습 시작(phase1 → phase2). optimizer 모멘트는 새로 시작.")
@@ -168,9 +169,9 @@ def parse_args():
                    help="상대를 같은 actor network 로 조종 (기본값)")
     p.add_argument("--no-self-play", dest="self_play", action="store_false",
                    help="self-play 끄고 --target-mode 스크립트 상대 사용")
-    # Ray 병렬 데이터 수집. 기본 worker 수 = 물리 CPU 코어 수(논리 아님). 1 이면 단일 프로세스.
-    p.add_argument("--num-workers", type=int, default=physical_cpu_count(),
-                   help="Ray rollout worker 수 (기본=물리 코어 수). 1 이면 Ray 미사용")
+    # Ray 병렬 데이터 수집. 기본 worker 수 = 논리 CPU 수(하이퍼스레딩 포함). 1 이면 단일 프로세스.
+    p.add_argument("--num-workers", type=int, default=logical_cpu_count(),
+                   help="Ray rollout worker 수 (기본=논리 코어 수). 1 이면 Ray 미사용")
     p.add_argument("--device", default="cpu",
                    help="driver update 디바이스 (큰 모델은 cuda). worker 는 항상 CPU 추론")
     p.add_argument("--output-name", default="team01")

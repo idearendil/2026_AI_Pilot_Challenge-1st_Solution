@@ -10,6 +10,9 @@ ownship/target CSV + summary.json 리플레이 로그를 저장한다.
 모듈은 번들 메타에 기록된 값을 그대로 주입한다(학습/제출과 동일 관측 재구성). RL action
 은 학습/제출과 동일하게 step_ratio(=6) 동안 유지한다.
 
+action 선택은 기본이 **stochastic**(학습 때와 동일하게 정책 분포에서 샘플링)이며 --seed 로
+재현 가능하다. argmax 로 고정하려면 --deterministic 을 준다.
+
 예시 (학습한 번들 vs AIP_BASE_target.dll, 리플레이 저장):
   python claude_code/run_local_dogfight.py \
     --ownship-backend rl \
@@ -54,6 +57,8 @@ def parse_args():
     p.add_argument("--min-altitude", type=float, default=300.0)
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--save-log", action="store_true", help="tacview CSV + summary 로그 저장")
+    p.add_argument("--deterministic", action="store_true",
+                   help="rl action 을 argmax 로 고정(기본은 학습과 동일한 stochastic 샘플링)")
     return p.parse_args()
 
 
@@ -103,14 +108,19 @@ def _save_replay_log(env) -> str:
 def main():
     args = parse_args()
     step_ratio = int(STANDARD_ENV_CONFIG.get("step_ratio", 6))
+    # stochastic 샘플링은 torch RNG 를 쓰므로 --seed 로 재현 가능하게 고정한다.
+    import torch
+    torch.manual_seed(args.seed)
 
     # ownship 번들에서 관측 모듈을 읽어 env 에 동일 관측을 주입(학습/제출과 동일 재구성).
+    stochastic = not args.deterministic
     obs_module = ""
     ownship_inner = None
     if args.ownship_backend == "rl":
         if not args.ownship_bundle_dir:
             raise ValueError("--ownship-backend rl 이면 --ownship-bundle-dir 이 필요합니다.")
-        ownship_inner = MLPActionProvider(bundle_dir=args.ownship_bundle_dir)
+        ownship_inner = MLPActionProvider(bundle_dir=args.ownship_bundle_dir,
+                                          stochastic=stochastic)
         obs_module = ownship_inner.metadata.get("observation_module", "") or ""
 
     overrides = {
@@ -151,7 +161,7 @@ def main():
                    if tgt_meta.get("obs_normalization") else None)
         target_provider = SelfPlayProvider(
             tgt_model, tgt_rms, env._observation_fn, env._observation_mode,
-            step_ratio, "cpu", explore=False)   # 결정론적 리플레이
+            step_ratio, "cpu", explore=stochastic)
         env._target_action_provider = target_provider
 
     tgt_desc = (args.target_bt_dll if args.target_backend == "bt"
@@ -160,6 +170,7 @@ def main():
     print(f"[claude_code/local] ownship={args.ownship_backend} "
           f"target={args.target_backend}({tgt_desc}) "
           f"obs_module={obs_module or '(env default)'} "
+          f"action={'stochastic' if stochastic else 'argmax'} "
           f"max_engage={args.max_engage_time}s step_limit={args.episode_step_limit}")
 
     try:

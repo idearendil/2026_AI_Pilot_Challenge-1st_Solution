@@ -122,12 +122,19 @@ class MLPActorCritic(nn.Module):
         mean, _ = self.forward(obs)
         return mean
 
+    @torch.no_grad()
+    def act_stochastic(self, obs: torch.Tensor) -> torch.Tensor:
+        """추론용: 학습 때와 동일하게 정책 분포에서 샘플링."""
+        mean, _ = self.forward(obs)
+        return self._dist(mean).sample()
+
 
 # ── 이산(discrete) 행동 공간 ─────────────────────────────────────────────────
 # roll/pitch/yaw/throttle 각 채널을 num_bins(기본 7)개의 균등 분할 카테고리로
 # 이산화한다. 카테고리 index 는 make_action_grid 로 [-1,1] 의 연속값에 매핑되고,
 # env.step / 추론 경로의 throttle 변환((a+1)/2)은 기존과 동일하게 적용된다.
-ACTION_BINS = 7
+# 홀수 bins 여야 가운데 index=(num_bins-1)/2 가 정확히 0.0(조종간 중립)에 떨어진다.
+ACTION_BINS = 21
 
 
 def make_action_grid(num_bins: int = ACTION_BINS, low: float = -1.0, high: float = 1.0) -> np.ndarray:
@@ -207,6 +214,11 @@ class MLPDiscreteActorCritic(nn.Module):
         """추론용: 채널별 argmax 카테고리 index 반환 (탐험 없음)."""
         logits = self.actor_logits(obs).view(-1, self.act_dim, self.num_bins)
         return logits.argmax(-1).float()        # (B, act_dim) index
+
+    @torch.no_grad()
+    def act_stochastic(self, obs: torch.Tensor) -> torch.Tensor:
+        """추론용: 학습 때와 동일하게 채널별 Categorical 에서 샘플링."""
+        return self._dist(obs).sample().float()  # (B, act_dim) index
 
 
 def make_actor_critic(
