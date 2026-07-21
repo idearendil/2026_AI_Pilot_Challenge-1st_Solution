@@ -44,10 +44,10 @@ from dogfight.sim.state_schema import StateIndex
 _FT_TO_M = 0.3048
 
 MY_REWARD_CONFIG = {
-    "win_reward": 10.0,       # 상대 HP<=0 으로 종료(내가 이김)
-    "loss_reward": -10.0,     # 내 HP<=0 으로 종료(상대가 이김)
+    "win_reward": 0.0,       # 상대 HP<=0 으로 종료(내가 이김)
+    "loss_reward": 0.0,     # 내 HP<=0 으로 종료(상대가 이김)
     "ownship_alt_reward": -20.0,   # 내 고도가 최소고도 이하로 떨어져 종료
-    "target_alt_reward": 1.0,      # 상대 고도가 최소고도 이하로 떨어져 종료
+    "target_alt_reward": 5.0,      # 상대 고도가 최소고도 이하로 떨어져 종료
     "damage_scale": 10.0,   # (상대 HP감소 - 내 HP감소) * 이 값, 양측 생존 중 매 step
     "distance_reward_scale": 0.001,   # 직전 step 대비 줄어든 거리[m] * 이 값
     # 거리 보상 taper: WEZ(500~3000ft) 밖에서만 접근을 장려한다. 직전/현재 거리의 평균이

@@ -22,10 +22,16 @@ action 선택은 기본이 **stochastic**(학습 때와 동일하게 정책 분�
     --max-engage-time 120 \
     --episode-step-limit 7200 \
     --save-log
+
+baseline BT 상대로 붙이려면 (rule XML 은 자동 선택됨):
+  python claude_code/run_local_dogfight.py \
+    --ownship-backend rl --ownship-bundle-dir artifacts/models/team01/basic \
+    --target-backend bt --target-bt-dll AIP_DCS_baseline.dll --save-log
 """
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 from pathlib import Path
 
@@ -33,6 +39,59 @@ ROOT = Path(__file__).resolve().parents[1]
 for _p in (ROOT, ROOT / "src"):
     if str(_p) not in sys.path:
         sys.path.insert(0, str(_p))
+
+# ── BT rule XML 선택 ─────────────────────────────────────────────────────────
+# BT DLL 은 **로드(static init) 시점에 AIP_RULE_XML 을 한 번만 읽어 캐싱**한다. DLL 은
+# claude_code.env_utils import 체인에서 로드되므로, 그 import 보다 먼저 환경변수를
+# 세팅해야 한다(나중에 os.environ 을 바꿔도 무시됨). 그래서 여기서 argv 를 미리 훑는다.
+_DEF_OWNSHIP_BT = "AIP_DCS_ownship.dll"
+_DEF_TARGET_BT = "AIP_BASE_target.dll"
+
+# rule 을 지정하지 않으면 DLL 은 ./Rule.xml → ./Rule_forTraining.xml 순으로 폴백하는데,
+# Rule_forTraining.xml 의 트리는 Task_Empty(=조종 안 함)라 상대가 가만히 있게 된다.
+# 전용 rule 이 있는 DLL 은 여기에 매핑해 자동으로 이어준다.
+_BT_RULE_DEFAULTS = {
+    "AIP_DCS_baseline.dll": "./Rule_BaselineCore.xml",
+}
+
+
+def _resolve_bt_rule(ns) -> str | None:
+    """이번 대결에 쓸 rule XML 을 결정한다(없으면 None = DLL 기본값)."""
+    if getattr(ns, "bt_rule_xml", ""):
+        return ns.bt_rule_xml
+    dlls = []
+    if ns.ownship_backend == "bt":
+        dlls.append(ns.ownship_bt_dll)
+    if ns.target_backend == "bt":
+        dlls.append(ns.target_bt_dll)
+    rules = {_BT_RULE_DEFAULTS.get(Path(d).name) for d in dlls}
+    rules.discard(None)
+    if len(rules) > 1:
+        # AIP_RULE_XML 은 프로세스 전역이라 양쪽에 서로 다른 rule 을 줄 수 없다.
+        raise ValueError(
+            f"ownship/target BT 가 서로 다른 rule XML 을 요구합니다: {sorted(rules)}. "
+            "AIP_RULE_XML 은 프로세스 전역이라 한 번에 하나만 쓸 수 있으니 "
+            "--bt-rule-xml 로 직접 지정하세요."
+        )
+    return rules.pop() if rules else None
+
+
+def _apply_bt_rule_env() -> None:
+    """claude_code import 전에 argv 를 미리 파싱해 AIP_RULE_XML 을 세팅한다."""
+    pre = argparse.ArgumentParser(add_help=False)
+    pre.add_argument("--bt-rule-xml", default="")
+    pre.add_argument("--ownship-backend", default="rl")
+    pre.add_argument("--target-backend", default="bt")
+    pre.add_argument("--ownship-bt-dll", default=_DEF_OWNSHIP_BT)
+    pre.add_argument("--target-bt-dll", default=_DEF_TARGET_BT)
+    known, _ = pre.parse_known_args()
+    rule = _resolve_bt_rule(known)
+    if rule:
+        os.environ["AIP_RULE_XML"] = rule
+        print(f"[claude_code/local] BT rule XML = {rule} (AIP_RULE_XML)")
+
+
+_apply_bt_rule_env()   # ← 반드시 아래 claude_code import 들보다 먼저!
 
 import numpy as np
 
@@ -59,6 +118,10 @@ def parse_args():
     p.add_argument("--save-log", action="store_true", help="tacview CSV + summary 로그 저장")
     p.add_argument("--deterministic", action="store_true",
                    help="rl action 을 argmax 로 고정(기본은 학습과 동일한 stochastic 샘플링)")
+    p.add_argument("--bt-rule-xml", default="",
+                   help="BT DLL 이 읽을 rule XML 경로(환경변수 AIP_RULE_XML 로 전달). "
+                        "비우면 DLL 별 기본 rule 을 자동 선택한다 "
+                        "(AIP_DCS_baseline.dll → ./Rule_BaselineCore.xml).")
     return p.parse_args()
 
 
@@ -108,6 +171,15 @@ def _save_replay_log(env) -> str:
 def main():
     args = parse_args()
     step_ratio = int(STANDARD_ENV_CONFIG.get("step_ratio", 6))
+
+    # rule XML 은 이미 import 전에 _apply_bt_rule_env() 가 세팅했다. 전체 args 로 다시
+    # 계산해 어긋나면(=pre-parse 가 놓친 형태의 argv) 조용히 틀린 rule 로 도는 대신 실패시킨다.
+    bt_rule = _resolve_bt_rule(args)
+    if (bt_rule or "") != os.environ.get("AIP_RULE_XML", ""):
+        raise RuntimeError(
+            f"BT rule XML 불일치: 최종={bt_rule!r} / import 시점={os.environ.get('AIP_RULE_XML')!r}. "
+            "DLL 은 import 시점 값을 캐싱하므로 --bt-rule-xml 을 명시해 주세요."
+        )
     # stochastic 샘플링은 torch RNG 를 쓰므로 --seed 로 재현 가능하게 고정한다.
     import torch
     torch.manual_seed(args.seed)

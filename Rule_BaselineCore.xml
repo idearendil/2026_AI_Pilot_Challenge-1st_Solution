@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Frozen core BT baseline.
+  Keep this tree intentionally small and do not tune it alongside the competition tree.
+  The single BaselineCorePolicy C++ node intentionally freezes its decision logic.
+  It uses the same acceleration controller so experiments isolate BT decision quality.
+-->
+<root main_tree_to_execute="MainTree">
+  <BehaviorTree ID="MainTree">
+    <Sequence>
+      <SelectTarget name="SelectTarget" BB="{BB}"/>
+      <DirectionVectorUpdate name="DirectionVectorUpdate" BB="{BB}"/>
+      <UpdateGeometry name="UpdateGeometry" BB="{BB}"/>
+      <BaselineCorePolicy name="FrozenCorePolicy" BB="{BB}"/>
+    </Sequence>
+  </BehaviorTree>
+</root>
