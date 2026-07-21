@@ -34,7 +34,7 @@ for _p in (ROOT, ROOT / "src"):
 
 from claude_code.env_utils import make_env, STANDARD_ENV_CONFIG
 from claude_code.model import save_bundle
-from claude_code.parallel import logical_cpu_count
+from claude_code.parallel import physical_cpu_count
 from claude_code.ppo import PPOConfig, PPOTrainer, IterationStats
 
 TRAIN_CKPT_FORMAT = "claude_code_ppo_train_ckpt"
@@ -169,9 +169,9 @@ def parse_args():
                    help="상대를 같은 actor network 로 조종 (기본값)")
     p.add_argument("--no-self-play", dest="self_play", action="store_false",
                    help="self-play 끄고 --target-mode 스크립트 상대 사용")
-    # Ray 병렬 데이터 수집. 기본 worker 수 = 논리 CPU 수(하이퍼스레딩 포함). 1 이면 단일 프로세스.
-    p.add_argument("--num-workers", type=int, default=logical_cpu_count(),
-                   help="Ray rollout worker 수 (기본=논리 코어 수). 1 이면 Ray 미사용")
+    # Ray 병렬 데이터 수집. 기본 worker 수 = 물리 CPU 코어 수(논리 아님). 1 이면 단일 프로세스.
+    p.add_argument("--num-workers", type=int, default=physical_cpu_count(),
+                   help="Ray rollout worker 수 (기본=물리 코어 수). 1 이면 Ray 미사용")
     p.add_argument("--device", default="cpu",
                    help="driver update 디바이스 (큰 모델은 cuda). worker 는 항상 CPU 추론")
     p.add_argument("--output-name", default="team01")

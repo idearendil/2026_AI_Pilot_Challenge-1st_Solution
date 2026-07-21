@@ -1,0 +1,2 @@
+iteration,global_step,mean_return,mean_length,completed_episodes,policy_loss,value_loss,entropy,approx_kl,explained_variance,ep_pursuit,ep_damage,ep_distance,ep_aim,ep_terminal,elapsed_sec,win,loss,draw,raw_win_rate,ema_mean,ema_min,pool_size,opp_added,altitude_term
+1,3000,-25.6669,422.2,5,-0.02087,1.02126,11.3262,0.08540,0.0182,0.0000,0.0000,-11.3941,-2.6728,-11.6000,7.35,2,3,0,0.4000,0.4900,0.4900,1,0,3
