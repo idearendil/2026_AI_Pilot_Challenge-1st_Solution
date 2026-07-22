@@ -120,12 +120,9 @@ def parse_args():
                    help="보상 모듈 경로 (기본: claude_code.my_reward). 빈 값이면 프레임워크 기본 보상")
     p.add_argument("--observation-module", default="claude_code.my_observation",
                    help="관측 모듈 경로 (기본: claude_code.my_observation). 빈 값이면 tactical16")
-    p.add_argument("--distance-reward-scale", type=float, default=None,
-                   help="my_reward 의 distance_reward_scale 덮어쓰기. phase2 에서 거리 항을 "
-                        "끄려면 0 을 준다. None 이면 모듈 기본값(0.001) 사용.")
-    p.add_argument("--aim-reward-scale", type=float, default=None,
-                   help="my_reward 의 aim_reward_scale 덮어쓰기. 직전 step 대비 줄어든 "
-                        "|ATA|[deg] * 이 값. 0 이면 끔. None 이면 모듈 기본값(0.02) 사용.")
+    p.add_argument("--shaping-reward-scale", type=float, default=None,
+                   help="my_reward 의 shaping_reward_scale 덮어쓰기. 거리/조준을 합친 포텐셜 x "
+                        "의 step 차분 * 이 값. 0 이면 shaping 끔. None 이면 모듈 기본값(0.0001) 사용.")
     p.add_argument("--resume-from", default="",
                    help="이어서 학습할 snapshot(.pt) 경로. actor+critic 가중치+obs_rms 를 불러와 "
                         "그 상태에서 학습 시작(phase1 → phase2). optimizer 모멘트는 새로 시작.")
@@ -193,12 +190,10 @@ def main():
     critic_hidden = (tuple(int(x) for x in args.critic_hidden.split(",") if x.strip())
                      if args.critic_hidden else None)
     critic_activation = args.critic_activation or None
-    # phase2: 거리 보상 끄기 / 조준 shaping 켜기 등 reward 계수 덮어쓰기.
+    # phase2 등: 포텐셜 shaping 계수 덮어쓰기(0 이면 shaping 끔).
     reward_overrides = {}
-    if args.distance_reward_scale is not None:
-        reward_overrides["distance_reward_scale"] = args.distance_reward_scale
-    if args.aim_reward_scale is not None:
-        reward_overrides["aim_reward_scale"] = args.aim_reward_scale
+    if args.shaping_reward_scale is not None:
+        reward_overrides["shaping_reward_scale"] = args.shaping_reward_scale
     reward_overrides = reward_overrides or None
     # "opponent 에게 준 damage" 원값 복원용 damage_scale (my_reward: r_damage = 준damage×scale,
     # 받은damage 가중치 0 이므로 준damage = damage_reward / scale).
@@ -475,7 +470,7 @@ def main():
         writer.writerow([
             "iteration", "global_step", "mean_return", "mean_length", "completed_episodes",
             "policy_loss", "value_loss", "entropy", "approx_kl", "explained_variance",
-            "ep_pursuit", "ep_damage", "ep_distance", "ep_aim", "ep_terminal", "elapsed_sec",
+            "ep_pursuit", "ep_damage", "ep_shaping", "ep_terminal", "elapsed_sec",
             "win", "loss", "draw", "raw_win_rate",
             "ema_mean", "ema_min", "pool_size", "opp_added", "altitude_term",
         ])
@@ -486,8 +481,7 @@ def main():
     def on_iteration(s: IterationStats):
         pursuit = s.extra.get("pursuit", float("nan"))
         damage = s.extra.get("damage", float("nan"))
-        distance = s.extra.get("distance", float("nan"))
-        aim = s.extra.get("aim", float("nan"))
+        shaping = s.extra.get("shaping", float("nan"))
         terminal = s.extra.get("terminal", float("nan"))
 
         # 이번 iter rollout 게임들의 opponent 대비 승패 집계.
@@ -534,7 +528,7 @@ def main():
             s.iteration, s.global_step, f"{s.mean_return:.4f}", f"{s.mean_length:.1f}",
             s.completed_episodes, f"{s.policy_loss:.5f}", f"{s.value_loss:.5f}",
             f"{s.entropy:.4f}", f"{s.approx_kl:.5f}", f"{s.explained_variance:.4f}",
-            f"{pursuit:.4f}", f"{damage:.4f}", f"{distance:.4f}", f"{aim:.4f}",
+            f"{pursuit:.4f}", f"{damage:.4f}", f"{shaping:.4f}",
             f"{terminal:.4f}", f"{s.elapsed_sec:.2f}",
             wins, losses, draws, f"{raw_wr:.4f}",
             f"{ema_mean:.4f}", f"{ema_min:.4f}", len(pool), int(added), alt_term,
@@ -585,9 +579,8 @@ def main():
                     "selfplay/draws": draws,
                     "train/altitude_termination": alt_term,   # 고도 하락으로 종료된 episode 수
                     "reward/damage_reward": damage,
-                    "reward/distance_reward": distance,
+                    "reward/shaping_reward": shaping,
                     "reward/termination_reward": terminal,
-                    "reward/aim_reward": aim,
                     "damage/dealt_per_episode": damage_dealt,
                 }
                 # 후보별 EMA (슬롯 0=가장 오래된 후보 … pool_max-1). 빈 슬롯은 로깅 생략.
@@ -607,7 +600,7 @@ def main():
         print(
             f"iter {s.iteration:3d} | step {s.global_step:7d} | "
             f"return {s.mean_return:8.3f} | len {s.mean_length:6.1f} | "
-            f"damage {damage:6.3f} | dist {distance:6.3f} | aim {aim:6.3f} | "
+            f"damage {damage:6.3f} | shaping {shaping:7.3f} | "
             f"ent {s.entropy:6.3f} | kl {s.approx_kl:.4f} | ev {s.explained_variance:6.3f} | "
             f"altT {alt_term}"
             f"{sp_msg}",

@@ -22,9 +22,9 @@ python claude_code/snapshot_to_bundle.py --snapshot claude_code/models/team01/ba
 
 # (2) 두 모델 대결 + 리플레이 로그 저장
 (rl 모델과 bt 모델을 사용하는 경우)
-python claude_code/run_local_dogfight.py --ownship-backend rl --ownship-bundle-dir artifacts/models/team01/basic --target-backend bt --target-bt-dll AIP_DCS_baseline.dll --max-engage-time 200 --episode-step-limit 12000 --save-log
+python claude_code/run_local_dogfight.py --ownship-backend rl --ownship-bundle-dir artifacts/models/team01/basic --target-backend bt --target-bt-dll AIP_DCS_baseline.dll --max-engage-time 200 --episode-step-limit 12000 --save-log --seed 0
 (rl 모델과 rl 모델을 사용하는 경우)
-python claude_code/run_local_dogfight.py --ownship-backend rl --ownship-bundle-dir artifacts/models/team01/basic --target-backend rl --target-bundle-dir artifacts/models/team01/basic --max-engage-time 200 --episode-step-limit 12000 --save-log
+python claude_code/run_local_dogfight.py --ownship-backend rl --ownship-bundle-dir artifacts/models/team01/basic --target-backend rl --target-bundle-dir artifacts/models/team01/basic --max-engage-time 200 --episode-step-limit 12000 --save-log --seed 0
 
 # (3) 리플레이 로그는 artifacts/logs/ 아래 *_ownship_*.csv / *_target_*.csv / *_summary.json 로 저장됨 (Tacview 포맷)
 => 리플레이 로그 파일 3개를 모두 logs/ 폴더로 옮기고 아래 명령어 실행 후 브라우저에 접속해서 확인

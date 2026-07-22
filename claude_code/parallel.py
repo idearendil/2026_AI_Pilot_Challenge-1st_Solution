@@ -531,7 +531,7 @@ class ParallelPPOTrainer:
             mean_len = float(np.mean(ep_lengths)) if ep_lengths else float("nan")
             comp_means = {}
             if ep_components:
-                for key in ("pursuit", "damage", "distance", "aim", "terminal", "safety", "step"):
+                for key in ("pursuit", "damage", "shaping", "terminal", "safety", "step"):
                     comp_means[key] = float(np.mean([c.get(key, 0.0) for c in ep_components]))
             comp_means.update(_outcome_counts(ep_outcomes))
             comp_means["per_opp"] = _outcome_counts_by_opp(ep_opp_indices, ep_outcomes)

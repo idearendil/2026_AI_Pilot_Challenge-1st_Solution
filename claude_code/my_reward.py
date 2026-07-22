@@ -2,28 +2,32 @@
 """[편집 가능] claude_code 보상 함수.
 
 규칙(종료 보상 3분리):
-  - [종료·HP] 상대 HP<=0 으로 종료(내가 이김)          →  +win_reward(10)
-              내 HP<=0   으로 종료(상대가 이김)         →  +loss_reward(-10)
+  - [종료·HP] 상대 HP<=0 으로 종료(내가 이김)          →  +win_reward(0)
+              내 HP<=0   으로 종료(상대가 이김)         →  +loss_reward(0)
   - [종료·고도] 내 고도가 최소고도(=300m≈1000ft) 이하로 종료  →  ownship_alt_reward(-20)
-                상대 고도가 최소고도 이하로 종료             →  target_alt_reward(+1)
+                상대 고도가 최소고도 이하로 종료             →  target_alt_reward(+5)
   - [보조] 양측이 살아있는(HP>0) 매 step:
            reward += (상대 HP 감소량 - 본인 HP 감소량) * damage_scale(10)
            (HP 감소량 = 이번 step 에 입은 damage = 함수 인자 target_damage / ownship_damage)
-  - [보조] 거리 접근: 직전 RL-step(=6 sim sub-step) 대비 두 기체 거리가 d[m] 줄었으면
-           reward += d * distance_reward_scale(0.001) * taper. 멀어지면 d<0 → 음의 보상.
-           taper 는 직전/현재 거리의 **평균** 기준: 3000ft 이상 +1.0, 3000→500ft 선형 감소,
-           500ft 이하는 부호 반전 -1.0 (WEZ 가 500~3000ft 라 더 붙으면 오히려 해롭다).
-  - [보조] 조준: 직전 step 대비 LOS(|ATA|) 각도가 a[deg] 줄었으면
-           reward += a * aim_reward_scale(0.02). 늘어나면 a<0 → 음의 보상.
-           거리 항과 동일한 차분 형태라 텔레스코핑(episode 총합 = (첫 ATA - 끝 ATA)*scale).
+  - [보조] 상황 포텐셜 shaping: 거리/조준을 하나의 포텐셜 함수 x 로 합친 뒤 그 step 차분에
+           계수를 곱해 준다.  reward += (x_cur - x_prev) * shaping_reward_scale.
+           x = _shaping_potential(distance[ft], A1[deg], A2[deg]) 이고
+             A1 = 아군이 상대를 볼 때의 LOS(|ATA|),  A2 = 상대가 아군을 볼 때의 LOS(|ATA|).
+           거리가 가깝고(단, WEZ 안쪽), 내가 잘 조준하고, 상대는 못 조준할수록 x 가 커진다.
+           차분 형태라 텔레스코핑(episode 총합 = (x_end - x_start) * scale) → bounded.
+           _shaping_potential 정의(연속함수, distance 는 ft, A 는 deg 0~180):
+             distance ∈ [0, 500):     (d+14000)*(90-A1)/90*2.5 - (d+14000)*(90-A2)/90*2.5 + 999500
+             distance ∈ [500, 15000): (15000-d) + (15000-d)*(90-A1)/90*2.5 - (15000-d)*(90-A2)/90*2.5 + 985000
+             distance ∈ [15000, ∞):   1000000 - d
+           (경계 500ft·15000ft 에서 연속. 값은 대략 ~1e6 근처.)
 
 claude_code/train.py 는 기본적으로 이 모듈을 사용한다(끄려면 --reward-module "").
 
 계약: MY_REWARD_CONFIG(dict) + compute_reward(...) -> (total: float, components: dict).
 
-거리 접근 보상은 직전 step 의 거리를 모듈 상태로 추적해야 한다(reward_fn 은 stateless 계약).
-에피소드 경계는 SIM_TIME 으로 감지한다(NaN-crash 등 compute_reward 를 건너뛰는 종료 경로도
-안전하게 처리). 보상은 학습/평가 env 에서만 계산되고 추론(제출)에서는 호출되지 않으므로
+포텐셜 shaping 은 직전 step 의 포텐셜값 x 를 모듈 상태로 추적해야 한다(reward_fn 은 stateless
+계약). 에피소드 경계는 SIM_TIME 으로 감지한다(NaN-crash 등 compute_reward 를 건너뛰는 종료
+경로도 안전하게 처리). 보상은 학습/평가 env 에서만 계산되고 추론(제출)에서는 호출되지 않으므로
 SIM_TIME 이 항상 채워져 있어 안전하다. (병렬 워커는 프로세스별 별도 모듈이라 상태 충돌 없음;
 단일 프로세스 eval 은 끝나고 rollout env 를 reset 하므로 새 episode 로 자동 감지된다.)
 """
@@ -49,15 +53,13 @@ MY_REWARD_CONFIG = {
     "ownship_alt_reward": -20.0,   # 내 고도가 최소고도 이하로 떨어져 종료
     "target_alt_reward": 5.0,      # 상대 고도가 최소고도 이하로 떨어져 종료
     "damage_scale": 10.0,   # (상대 HP감소 - 내 HP감소) * 이 값, 양측 생존 중 매 step
-    "distance_reward_scale": 0.001,   # 직전 step 대비 줄어든 거리[m] * 이 값
-    # 거리 보상 taper: WEZ(500~3000ft) 밖에서만 접근을 장려한다. 직전/현재 거리의 평균이
-    # far 이상이면 계수 +1, 그 사이는 선형 감소, near 이하면 -1(접근에 페널티).
-    "distance_taper_far_ft": 3000.0,
-    "distance_taper_near_ft": 500.0,
-    # 조준 shaping: 직전 step 대비 줄어든 LOS(ATA) 각도[deg] * 이 값. 늘어나면 음수.
-    # distance 항과 에피소드 총합이 비슷해지도록 맞춘 값:
-    #   distance  2100m × 0.001 ≈ 2.1   /   aim  90deg × 0.02 ≈ 1.8
-    "aim_reward_scale": 0.02,
+    # 상황 포텐셜 shaping 계수. reward += (x_cur - x_prev) * 이 값.
+    # x 는 _shaping_potential(거리[ft], A1[deg], A2[deg]) 로 대략 ~1e6 스케일이다.
+    #   대표 궤적(원거리 20000ft·조준無 → 근거리 1000ft·내 조준0°·상대 90°)의
+    #   포텐셜 상승 x_end-x_start ≈ 54000 → 이 값 0.0001 이면 episode 총합 ≈ 5.4 로
+    #   target_alt_reward(5)·damage 한 방(≈10)과 같은 자릿수. 상대도 나를 조준하면
+    #   경쟁항이 상쇄돼 총합이 줄어든다(설계 의도).
+    "shaping_reward_scale": 0.0001,
 }
 # 주의: 아래 compute_reward 는 이 dict 의 키를 **직접 인덱싱**한다(.get 폴백 없음).
 # 계수를 바꾸려면 반드시 이 dict(또는 train.py 의 --*-reward-scale 오버라이드)를 고칠 것.
@@ -69,17 +71,36 @@ _TARGET_ALT_END = "target altitude below min"
 _OWNSHIP_ALT_END = "ownship altitude below min"
 
 # dense shaping 직전-step 상태 (모듈 싱글톤). 에피소드 경계는 SIM_TIME 으로 감지.
-_prev_distance_m: float | None = None
+_prev_x: float | None = None       # 직전 step 의 포텐셜값 x (거리/조준 shaping용)
 _prev_sim_time: float | None = None
-_prev_ata_deg: float = 0.0   # 직전 step 의 |ATA|[deg] (조준 차분 shaping용)
+
+
+def _shaping_potential(distance_ft: float, a1_deg: float, a2_deg: float) -> float:
+    """거리(ft)/조준(A1,A2 deg, 0~180)을 하나로 합친 상황 포텐셜.
+
+    A1 = 아군→상대 LOS(|ATA|), A2 = 상대→아군 LOS(|ATA|). 값이 클수록 유리.
+    경계 500ft·15000ft 에서 연속. (90-A) 항은 A>90(등 뒤) 이면 음수가 되어 자연스럽게
+    페널티로 작동하므로 clamp 하지 않는다.
+    """
+    if distance_ft <= 500.0:
+        base = distance_ft + 14000.0
+        return (base * (90.0 - a1_deg) / 90.0 * 2.5
+                - base * (90.0 - a2_deg) / 90.0 * 2.5
+                + 999500.0)
+    if distance_ft <= 15000.0:
+        base = 15000.0 - distance_ft
+        return (base
+                + base * (90.0 - a1_deg) / 90.0 * 2.5
+                - base * (90.0 - a2_deg) / 90.0 * 2.5
+                + 985000.0)
+    return 1000000.0 - distance_ft
 
 
 def reset_distance_tracker() -> None:
     """에피소드 시작 시 호출(선택). 호출 안 해도 SIM_TIME 으로 자동 감지된다."""
-    global _prev_distance_m, _prev_sim_time, _prev_ata_deg
-    _prev_distance_m = None
+    global _prev_x, _prev_sim_time
+    _prev_x = None
     _prev_sim_time = None
-    _prev_ata_deg = 0.0
 
 
 def compute_reward(
@@ -94,8 +115,8 @@ def compute_reward(
     truncated: bool,
     end_condition: str,
 ) -> tuple[float, dict]:
-    """종료 ±win/loss + HP 차분 damage + 거리 접근 shaping + ATA 차분 조준 shaping."""
-    global _prev_distance_m, _prev_sim_time, _prev_ata_deg
+    """종료 ±win/loss + HP 차분 damage + 거리·조준 포텐셜 shaping(차분)."""
+    global _prev_x, _prev_sim_time
     own_hp = float(ownship_state[StateIndex.HEALTH])
     tgt_hp = float(target_state[StateIndex.HEALTH])
 
@@ -107,47 +128,29 @@ def compute_reward(
             reward_config["damage_scale"]
         )
 
-    # [보조] 거리 접근: 직전 RL-step 대비 거리가 줄어든 양(m) * distance_reward_scale.
+    # [보조] 상황 포텐셜 shaping: 거리(ft)/조준(A1,A2)을 합친 포텐셜 x 의 step 차분.
     # SIM_TIME 으로 에피소드 경계 감지(거꾸로 가거나 처음이면 새 episode → 보상 0).
-    cur_distance = float(geo_info._get_distance(ownship_state, target_state))
     cur_sim_time = float(ownship_state[StateIndex.SIM_TIME])
-    new_episode = _prev_distance_m is None or cur_sim_time <= _prev_sim_time
-    r_distance = 0.0
-    if not new_episode:
-        closed = _prev_distance_m - cur_distance   # 가까워졌으면 양수, 멀어졌으면 음수
-        # WEZ(500~3000ft) 안에서는 더 붙어도 damage 가 안 들어가므로 접근 보상을 죽인다.
-        # 기준 거리 = 직전/현재 거리의 평균.
-        far_m = float(reward_config["distance_taper_far_ft"]) * _FT_TO_M
-        near_m = float(reward_config["distance_taper_near_ft"]) * _FT_TO_M
-        # near 이하로 더 붙는 것은 오히려 해로우므로 계수 부호를 뒤집는다(-1).
-        mid_distance = 0.5 * (_prev_distance_m + cur_distance)
-        if mid_distance <= near_m:
-            taper = -1.0
-        elif far_m > near_m:
-            taper = (mid_distance - near_m) / (far_m - near_m)
-            taper = min(1.0, max(0.0, taper))
-        else:
-            taper = 1.0
-        r_distance = closed * float(reward_config["distance_reward_scale"]) * taper
-    _prev_distance_m = cur_distance
+    new_episode = _prev_x is None or cur_sim_time <= _prev_sim_time
+    shaping_scale = float(reward_config["shaping_reward_scale"])
+    r_shaping = 0.0
+    if shaping_scale != 0.0:
+        # _get_distance 는 meter → ft 로 환산. A1/A2 는 3D ATA(proj=False, 0~180).
+        dist_ft = float(geo_info._get_distance(ownship_state, target_state)) / _FT_TO_M
+        a1 = abs(float(
+            geo_info._get_antenna_train_angle(ownship_state, target_state, False)))
+        a2 = abs(float(
+            geo_info._get_antenna_train_angle(target_state, ownship_state, False)))
+        cur_x = _shaping_potential(dist_ft, a1, a2)
+        if not new_episode:
+            r_shaping = (cur_x - _prev_x) * shaping_scale
+        _prev_x = cur_x
     _prev_sim_time = cur_sim_time
 
-    # [보조] 조준: 거리 항과 동일한 차분 형태. 직전 step 대비 LOS(|ATA|) 각도가 a[deg]
-    # 줄었으면 reward += a * aim_reward_scale, 늘어나면 a<0 → 음의 보상. 텔레스코핑이라
-    # episode 총합 = (첫 ATA - 마지막 ATA) * scale 로 bounded. scale=0 이면 끔.
-    aim_scale = float(reward_config["aim_reward_scale"])
-    r_aim = 0.0
-    if aim_scale != 0.0:
-        cur_ata = abs(float(
-            geo_info._get_antenna_train_angle(ownship_state, target_state, False)))
-        if not new_episode:
-            r_aim = (_prev_ata_deg - cur_ata) * aim_scale
-        _prev_ata_deg = cur_ata
-
-    # [종료] 3분리: (1) HP 승/패 ±10  (2) 내 고도 하락 -20  (3) 상대 고도 하락 +1
+    # [종료] 3분리: (1) HP 승/패  (2) 내 고도 하락 -20  (3) 상대 고도 하락 +5
     r_terminal = 0.0
     if terminated:
-        # (1) HP 로 승부가 난 경우: 내가 이김 +10 / 상대가 이김 -10
+        # (1) HP 로 승부가 난 경우
         if tgt_hp <= 0.0:
             r_terminal += float(reward_config["win_reward"])
         if own_hp <= 0.0:
@@ -155,13 +158,13 @@ def compute_reward(
         # (2) 내 고도가 최소고도 이하로 떨어져 종료 → -20
         if end_condition == _OWNSHIP_ALT_END:
             r_terminal += float(reward_config["ownship_alt_reward"])
-        # (3) 상대 고도가 최소고도 이하로 떨어져 종료 → +1
+        # (3) 상대 고도가 최소고도 이하로 떨어져 종료 → +5
         if end_condition == _TARGET_ALT_END:
             r_terminal += float(reward_config["target_alt_reward"])
 
-    total = r_damage + r_distance + r_aim + r_terminal
-    return float(total), {"damage": r_damage, "distance": r_distance,
-                          "aim": r_aim, "terminal": r_terminal}
+    total = r_damage + r_shaping + r_terminal
+    return float(total), {"damage": r_damage, "shaping": r_shaping,
+                          "terminal": r_terminal}
 
 
 __all__ = ["MY_REWARD_CONFIG", "compute_reward", "reset_distance_tracker"]
