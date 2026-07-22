@@ -12,6 +12,9 @@ self-learning). env 는 상대 관점(context.ownship_state=상대, context.targ
 """
 from __future__ import annotations
 
+import os
+from pathlib import Path
+
 import numpy as np
 import torch
 
@@ -21,6 +24,33 @@ from GeoMathUtil import GeometryInfo
 from claude_code import my_observation
 from claude_code.model import policy_action_to_command, discrete_indices_to_continuous
 from claude_code.my_observation import StateReconstructor
+
+
+# BT DLL 별 기본 rule XML. rule 을 안 주면 DLL 은 ./Rule.xml → ./Rule_forTraining.xml 로
+# 폴백하는데 후자의 트리는 Task_Empty(=조종 안 함)라 상대가 가만히 있게 된다.
+BT_RULE_DEFAULTS = {
+    "AIP_DCS_baseline.dll": "./Rule_BaselineCore.xml",
+}
+DEFAULT_BT_DLL = "AIP_DCS_baseline.dll"
+
+
+def make_bt_provider(dll_name: str = DEFAULT_BT_DLL, rule_xml: str = ""):
+    """baseline BT(DLL) 상대를 opponent pool 후보로 쓰기 위한 ActionProvider 를 만든다.
+
+    BT DLL 은 **load(static init) 시점에 AIP_RULE_XML 을 한 번만 읽어 캐싱**하므로
+    AIPilot(= ctypes LoadLibrary) 생성 **직전**에 환경변수를 세팅해야 한다. 이 함수를
+    통해서만 BT provider 를 만들면 그 순서가 보장된다.
+
+    학습 env 는 target_mode 가 fixed/loiter 라 이 DLL 이 다른 경로에서 먼저 로드되지
+    않으므로, 여기서 세팅한 rule 이 실제로 반영된다. Ray 병렬 모드에서는 worker 마다
+    별도 프로세스라 DLL 인스턴스도 worker 별로 독립이다.
+    """
+    from dogfight.ai.bt_action_provider import BTActionProvider
+
+    rule = rule_xml or BT_RULE_DEFAULTS.get(Path(dll_name).name, "")
+    if rule:
+        os.environ["AIP_RULE_XML"] = rule
+    return BTActionProvider(dll_name=dll_name)
 
 
 class SelfPlayProvider(ActionProvider):
@@ -100,6 +130,11 @@ class PoolSelfPlayProvider(ActionProvider):
 
     가중치는 'EMA 승률이 낮은 opponent 일수록 크게' 주어 자주 뽑히게 한다(호출부에서
     softmax(-ema/τ) 등으로 계산해 set_weights 로 전달).
+
+    **슬롯 규약**: baseline BT 상대를 쓰는 경우 항상 index 0 에 고정하고(=bt_slots=1),
+    학습 snapshot 후보는 index 1.. 에 오래된→최신 순으로 놓는다. pool 초과 시 제거는
+    index bt_slots(=가장 오래된 snapshot)부터 하므로 BT 는 절대 evict 되지 않는다.
+    (제거 로직은 호출부 = PPOTrainer / RolloutWorker 에 있다.)
     """
 
     def __init__(self, providers, weights=None, seed: int = 0):
@@ -150,4 +185,5 @@ class PoolSelfPlayProvider(ActionProvider):
                 pass
 
 
-__all__ = ["SelfPlayProvider", "PoolSelfPlayProvider"]
+__all__ = ["SelfPlayProvider", "PoolSelfPlayProvider", "make_bt_provider",
+           "BT_RULE_DEFAULTS", "DEFAULT_BT_DLL"]

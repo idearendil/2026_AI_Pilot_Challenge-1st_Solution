@@ -174,21 +174,41 @@ def _make_worker_cls():
                 m, rms, self.env._observation_fn, self.env._observation_mode,
                 sr, "cpu", explore=explore)
 
-        def pool_init(self, state_dict, mean, var, count, weights, pool_max, seed):
-            """opponent pool 초기화(후보 1개 = 초기 정책). target provider 를 pool 로 교체."""
+        def _get_bt_provider(self, bt_dll, bt_rule):
+            """baseline BT 상대 provider(worker 당 1개, 재사용). DLL 은 1회만 로드."""
+            if getattr(self, "_bt_provider", None) is None:
+                from claude_code.self_play import make_bt_provider
+                self._bt_provider = make_bt_provider(bt_dll, bt_rule)
+            return self._bt_provider
+
+        def pool_init(self, state_dict, mean, var, count, weights, pool_max, seed,
+                      bt_dll="", bt_rule=""):
+            """opponent pool 초기화. target provider 를 pool 로 교체.
+
+            bt_dll 이 있으면 slot0 = baseline BT(고정, 절대 evict 안 됨), 그 뒤에
+            초기 정책 snapshot 1개. 없으면 초기 정책 1개만.
+            """
             from claude_code.self_play import PoolSelfPlayProvider
             self._pool_max = max(1, int(pool_max))
-            prov = self._build_opp_provider(state_dict, mean, var, count)
-            self._pool_provider = PoolSelfPlayProvider([prov], weights, seed=int(seed))
+            provs = []
+            self._bt_slots = 0
+            if bt_dll:
+                provs.append(self._get_bt_provider(bt_dll, bt_rule))
+                self._bt_slots = 1
+            provs.append(self._build_opp_provider(state_dict, mean, var, count))
+            self._pool_provider = PoolSelfPlayProvider(provs, weights, seed=int(seed))
             self.env._target_action_provider = self._pool_provider
 
         def pool_add(self, state_dict, mean, var, count):
-            """현재 정책 frozen copy 를 pool 에 추가(초과 시 oldest 제거) + env 리셋."""
+            """현재 정책 frozen copy 를 pool 에 추가(초과 시 oldest **snapshot** 제거) + env 리셋.
+
+            slot0 이 BT 면(_bt_slots=1) index 1 부터 제거하므로 BT 는 유지된다.
+            """
             prov = self._build_opp_provider(state_dict, mean, var, count)
             providers = list(self._pool_provider.providers)
             providers.append(prov)
             if len(providers) > self._pool_max:
-                providers.pop(0)
+                providers.pop(int(getattr(self, "_bt_slots", 0)))
             self._pool_provider.set_pool(providers)
             if self._reset_recon is not None:
                 self._reset_recon()
@@ -205,12 +225,22 @@ def _make_worker_cls():
             if getattr(self, "_pool_provider", None) is not None:
                 self._pool_provider.set_weights(weights)
 
-        def pool_set_all(self, state_dicts, means, vars_, counts, weights, pool_max, seed):
-            """checkpoint 의 opponent pool 전체를 복원(worker). state_dicts 는 오래된→최신."""
+        def pool_set_all(self, state_dicts, means, vars_, counts, weights, pool_max, seed,
+                         bt_dll="", bt_rule=""):
+            """checkpoint 의 opponent pool 전체를 복원(worker).
+
+            state_dicts 는 **snapshot 후보만** 오래된→최신. bt_dll 이 있으면 그 앞
+            slot0 에 baseline BT 를 넣어 driver 측 pool 인덱스와 정확히 일치시킨다.
+            """
             from claude_code.self_play import PoolSelfPlayProvider
             self._pool_max = max(1, int(pool_max))
-            provs = [self._build_opp_provider(st, mn, vr, ct)
-                     for st, mn, vr, ct in zip(state_dicts, means, vars_, counts)]
+            provs = []
+            self._bt_slots = 0
+            if bt_dll:
+                provs.append(self._get_bt_provider(bt_dll, bt_rule))
+                self._bt_slots = 1
+            provs += [self._build_opp_provider(st, mn, vr, ct)
+                      for st, mn, vr, ct in zip(state_dicts, means, vars_, counts)]
             self._pool_provider = PoolSelfPlayProvider(provs, weights, seed=int(seed))
             self.env._target_action_provider = self._pool_provider
 
@@ -463,19 +493,22 @@ class ParallelPPOTrainer:
         count = self.obs_rms.count if self.obs_rms is not None else 0.0
         return state, mean, var, count
 
-    def install_opponent_pool(self, pool_max: int = 5) -> None:
-        """모든 worker 의 opponent pool 초기화(후보 1개 = 현재 정책). broadcast.
+    def install_opponent_pool(self, pool_max: int = 5, bt_dll: str = "",
+                              bt_rule: str = "") -> None:
+        """모든 worker 의 opponent pool 초기화. broadcast.
 
+        bt_dll 이 있으면 slot0 = baseline BT(고정), slot1 = 현재 정책. 없으면 현재 정책만.
         학습 시작 시 1회 호출. worker 별로 다른 seed 를 줘서 opponent 샘플 순서가
         분산되게 한다(pool 다양성).
         """
         import ray
         self._pool_max = max(1, int(pool_max))
         state, mean, var, count = self._current_state_rms()
+        n = 2 if bt_dll else 1
         ref = ray.put(state)
         ray.get([
-            w.pool_init.remote(ref, mean, var, count, [1.0], self._pool_max,
-                               self.cfg.seed + 101 + i)
+            w.pool_init.remote(ref, mean, var, count, [1.0 / n] * n, self._pool_max,
+                               self.cfg.seed + 101 + i, bt_dll, bt_rule)
             for i, w in enumerate(self.workers)
         ])
 
@@ -502,8 +535,13 @@ class ParallelPPOTrainer:
         }
         return {"state": state, "rms": rms}
 
-    def set_opponent_pool(self, entries, weights, pool_max) -> None:
-        """checkpoint 의 opponent pool 전체를 모든 worker 에 복원(broadcast)."""
+    def set_opponent_pool(self, entries, weights, pool_max, bt_dll: str = "",
+                          bt_rule: str = "") -> None:
+        """checkpoint 의 opponent pool 전체를 모든 worker 에 복원(broadcast).
+
+        entries 는 **snapshot 후보만**(오래된→최신). bt_dll 이 있으면 worker 가 slot0 에
+        baseline BT 를 넣으므로 weights 는 [bt, snapshot...] 길이여야 한다.
+        """
         import ray
         self._pool_max = max(1, int(pool_max))
         states = [e["state"] for e in entries]
@@ -514,7 +552,7 @@ class ParallelPPOTrainer:
         wl = list(weights)
         ray.get([
             w.pool_set_all.remote(sref, means, vars_, counts, wl, self._pool_max,
-                                  self.cfg.seed + 101 + i)
+                                  self.cfg.seed + 101 + i, bt_dll, bt_rule)
             for i, w in enumerate(self.workers)
         ])
 

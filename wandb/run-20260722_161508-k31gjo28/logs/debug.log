@@ -1,0 +1,24 @@
+2026-07-22 16:15:08,355 INFO    MainThread:17188 [wandb_setup.py:_flush():81] Current SDK version is 0.28.1
+2026-07-22 16:15:08,356 INFO    MainThread:17188 [wandb_setup.py:_flush():81] Configure stats pid to 17188
+2026-07-22 16:15:08,356 INFO    MainThread:17188 [wandb_setup.py:_flush():81] Loading settings from environment variables
+2026-07-22 16:15:08,356 INFO    MainThread:17188 [wandb_init.py:setup_run_log_directory():729] Logging user logs to D:\AIP_LIB_claude\DogFightEnv\Release\wandb\run-20260722_161508-k31gjo28\logs\debug.log
+2026-07-22 16:15:08,356 INFO    MainThread:17188 [wandb_init.py:setup_run_log_directory():730] Logging internal logs to D:\AIP_LIB_claude\DogFightEnv\Release\wandb\run-20260722_161508-k31gjo28\logs\debug-internal.log
+2026-07-22 16:15:08,356 INFO    MainThread:17188 [wandb_init.py:init():772] calling init triggers
+2026-07-22 16:15:08,356 INFO    MainThread:17188 [wandb_init.py:init():777] wandb.init called with sweep_config: {}
+config: {'iterations': 1000, 'rollout_steps': 50000, 'lr': 0.0001, 'gamma': 0.98, 'gae_lambda': 0.95, 'clip_coef': 0.2, 'update_epochs': 4, 'minibatch_size': 512, 'ent_coef': 5e-05, 'vf_coef': 0.5, 'target_kl': 0.05, 'hidden': '512,512,512', 'activation': 'tanh', 'action_bins': 21, 'num_workers': 6, 'self_play': True, 'target_mode': 'loiter', 'frozen_opponent': False, 'selfplay_gate_threshold': 0.6, 'selfplay_ema_alpha': 0.1, 'pool_size': 5, 'pool_sample_temp': 0.3, 'reward_module': 'claude_code.my_reward', 'observation_module': 'claude_code.my_observation', 'reward_overrides': None, 'resume_from': '', 'obs_dim': 164, 'act_dim': 4, 'damage_scale': 10.0, '_wandb': {}}
+2026-07-22 16:15:08,356 INFO    MainThread:17188 [wandb_init.py:init():820] starting backend
+2026-07-22 16:15:08,356 INFO    MainThread:17188 [wandb_init.py:init():835] sending inform_init request
+2026-07-22 16:15:08,854 INFO    MainThread:17188 [wandb_init.py:init():840] backend started and connected
+2026-07-22 16:15:08,855 INFO    MainThread:17188 [wandb_init.py:init():910] updated telemetry
+2026-07-22 16:15:08,972 INFO    MainThread:17188 [wandb_init.py:init():933] communicating run to backend with 90.0 second timeout
+2026-07-22 16:15:10,081 INFO    MainThread:17188 [wandb_init.py:init():978] starting run threads in backend
+2026-07-22 16:15:10,770 INFO    MainThread:17188 [wandb_run.py:_console_start():2621] atexit reg
+2026-07-22 16:15:10,770 INFO    MainThread:17188 [wandb_run.py:_redirect():2471] redirect: wrap_raw
+2026-07-22 16:15:10,770 INFO    MainThread:17188 [wandb_run.py:_redirect():2540] Wrapping output streams.
+2026-07-22 16:15:10,771 INFO    MainThread:17188 [wandb_run.py:_redirect():2563] Redirects installed.
+2026-07-22 16:15:10,774 INFO    MainThread:17188 [wandb_init.py:init():1016] run started, returning control to user process
+2026-07-22 21:19:20,186 INFO    MainThread:17188 [wandb_run.py:_finish():2383] finishing run leetm2021-postech/AIP contest/k31gjo28
+2026-07-22 21:19:20,186 INFO    MainThread:17188 [wandb_run.py:_atexit_cleanup():2588] got exitcode: 0
+2026-07-22 21:19:20,187 INFO    MainThread:17188 [wandb_run.py:_restore():2570] restore
+2026-07-22 21:19:20,187 INFO    MainThread:17188 [wandb_run.py:_restore():2576] restore done
+2026-07-22 21:19:33,885 INFO    MainThread:17188 [wandb_run.py:_footer_sync_info():3993] logging synced files

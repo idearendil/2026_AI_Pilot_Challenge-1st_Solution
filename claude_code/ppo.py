@@ -381,20 +381,34 @@ class PPOTrainer:
             model, rms, self.env._observation_fn, self.env._observation_mode,
             sr, self.cfg.device, explore=explore)
 
-    def install_opponent_pool(self, pool_max: int = 5, explore: bool = True) -> None:
-        """opponent pool 초기화: 후보 1개(= 현재 정책의 frozen deep-copy)로 시작.
+    def _get_bt_provider(self, bt_dll, bt_rule):
+        """baseline BT 상대 provider(프로세스당 1개, 재사용). DLL 은 1회만 로드."""
+        if getattr(self, "_bt_provider", None) is None:
+            from claude_code.self_play import make_bt_provider
+            self._bt_provider = make_bt_provider(bt_dll, bt_rule)
+        return self._bt_provider
 
-        학습 시작 시(초기 후보=iter0) 1회 호출. 이후 pool_add_current 로 후보를 추가한다.
-        env 의 target provider 를 PoolSelfPlayProvider 로 교체한다.
+    def install_opponent_pool(self, pool_max: int = 5, explore: bool = True,
+                              bt_dll: str = "", bt_rule: str = "") -> None:
+        """opponent pool 초기화. env 의 target provider 를 PoolSelfPlayProvider 로 교체.
+
+        bt_dll 이 있으면 slot0 = baseline BT(고정, 절대 evict 안 됨), 그 뒤에 현재 정책의
+        frozen deep-copy 1개. 학습 시작 시 1회 호출. 이후 pool_add_current 로 후보 추가.
         """
         import copy
         from claude_code.self_play import PoolSelfPlayProvider
         self._pool_max = max(1, int(pool_max))
         self._opp_explore = bool(explore)
+        provs = []
+        self._bt_slots = 0
+        if bt_dll:
+            provs.append(self._get_bt_provider(bt_dll, bt_rule))
+            self._bt_slots = 1
         m = copy.deepcopy(self.model).eval()
         rms = copy.deepcopy(self.obs_rms) if self.obs_rms is not None else None
-        prov = self._make_opp_provider(m, rms, explore)
-        self._pool_provider = PoolSelfPlayProvider([prov], [1.0], seed=self.cfg.seed)
+        provs.append(self._make_opp_provider(m, rms, explore))
+        n = len(provs)
+        self._pool_provider = PoolSelfPlayProvider(provs, [1.0 / n] * n, seed=self.cfg.seed)
         self.env._target_action_provider = self._pool_provider
 
     def pool_set_weights(self, weights) -> None:
@@ -425,24 +439,34 @@ class PPOTrainer:
             rms.count = float(rms_dict["count"])
         return self._make_opp_provider(m, rms, explore)
 
-    def set_opponent_pool(self, entries, weights, pool_max, explore=True) -> None:
+    def set_opponent_pool(self, entries, weights, pool_max, explore=True,
+                          bt_dll: str = "", bt_rule: str = "") -> None:
         """checkpoint 의 opponent pool 전체를 그대로 복원(단일 프로세스).
 
-        entries: [{"state": state_dict(np), "rms": {mean,var,count}|None}, ...] (오래된→최신).
+        entries: **snapshot 후보만** [{"state": state_dict(np), "rms": {...}|None}, ...]
+        (오래된→최신). bt_dll 이 있으면 slot0 에 baseline BT 를 넣으므로 weights 는
+        [bt, snapshot...] 길이여야 한다.
         """
         from claude_code.self_play import PoolSelfPlayProvider
         self._pool_max = max(1, int(pool_max))
         self._opp_explore = bool(explore)
-        provs = [self._make_opp_provider_from(e["state"], e.get("rms"), explore) for e in entries]
-        if not provs:  # 방어: 최소 1개(현재 정책)
+        provs = []
+        self._bt_slots = 0
+        if bt_dll:
+            provs.append(self._get_bt_provider(bt_dll, bt_rule))
+            self._bt_slots = 1
+        provs += [self._make_opp_provider_from(e["state"], e.get("rms"), explore)
+                  for e in entries]
+        if len(provs) == self._bt_slots:  # 방어: snapshot 후보 최소 1개(현재 정책)
             snap = self.snapshot_current()
-            provs = [self._make_opp_provider_from(snap["state"], snap["rms"], explore)]
+            provs.append(self._make_opp_provider_from(snap["state"], snap["rms"], explore))
         self._pool_provider = PoolSelfPlayProvider(provs, weights, seed=self.cfg.seed)
         self.env._target_action_provider = self._pool_provider
 
     def pool_add_current(self) -> int:
-        """현재 정책+obs_rms 의 frozen deep-copy 를 pool 에 추가(초과 시 가장 오래된 후보 제거).
+        """현재 정책+obs_rms 의 frozen deep-copy 를 pool 에 추가.
 
+        초과 시 가장 오래된 **snapshot** 후보를 제거한다(slot0 이 BT 면 index 1 부터).
         pool 구성이 바뀌므로 진행 중이던 rollout episode 를 폐기하고 env 를 리셋해
         다음 episode 부터 새 구성으로 opponent 를 샘플/귀속하게 한다.
         """
@@ -453,7 +477,7 @@ class PPOTrainer:
         providers = list(self._pool_provider.providers)
         providers.append(prov)
         if len(providers) > self._pool_max:
-            providers.pop(0)
+            providers.pop(int(getattr(self, "_bt_slots", 0)))
         self._pool_provider.set_pool(providers)
         self._reset_rollout_env()
         return len(providers)

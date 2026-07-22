@@ -88,13 +88,14 @@ python tools/web_log_viewer.py --logdir logs --port 7870
 | **보상/관측** | | |
 | `--reward-module` | claude_code.my_reward | 보상 모듈(빈 값이면 프레임워크 기본 보상) |
 | `--observation-module` | claude_code.my_observation | 관측 모듈(빈 값이면 tactical16) |
-| `--distance-reward-scale` | None(→0.001) | 거리 접근 shaping 계수. **phase2 에서 0 으로 끔** |
-| `--aim-reward-scale` | 0.5 | 조준 dense shaping(potential-based) 계수. 0 이면 끔 |
+| `--shaping-reward-scale` | None(→0.0001) | 거리·조준 통합 포텐셜 shaping 계수. 0 이면 끔 |
 | **상대/phase** | | |
 | `--self-play` / `--no-self-play` | self-play on | 상대를 학습 중 정책으로 / 스크립트 상대로 |
 | `--target-mode` | loiter | `--no-self-play` 일 때 스크립트 상대(`loiter`/`fixed`/`behavior_tree`/`autopilot`) |
 | `--resume-from` | "" | snapshot(.pt) 에서 actor+critic+obs_rms 이어받기(phase2) |
-| `--frozen-opponent` | (off) | self-play 상대를 학습 시작 시점 정책으로 **고정** |
+| `--frozen-opponent` | (off) | self-play snapshot 상대를 학습 시작 시점 정책으로 **고정** |
+| `--pool-size` | 6 | opponent pool 최대 크기(**BT 포함**). 기본 = BT 1 + snapshot 5 |
+| `--selfplay-gate-threshold` | 0.6 | **snapshot 후보들**의 min-EMA 가 이 값 이상이면 현재 정책을 pool 에 추가 |
 | **평가/저장** | | |
 | `--eval-interval` | 5 | 평가 주기(iter). N iter 전 self 상대 승률>0.5 면 best 번들 저장 |
 | `--eval-games` | 20 | 평가 1회당 대결 판 수 |
@@ -205,7 +206,13 @@ python tools/web_log_viewer.py --logdir logs --port 7870
 - **이산 정책**(채널별 Categorical, 7 bins) — 연속 가우시안 대비 안정적 탐험
 - 관측 running mean/std 정규화(통계 번들 저장 → 추론 동일 적용), per-minibatch advantage 정규화, approx_kl 조기 종료
 - **Ray 병렬 rollout**(worker=물리 코어 수, driver 가 weights/obs_rms broadcast)
-- **self-play**(기본) + `--frozen-opponent` 로 상대 고정
+- **opponent pool self-play**(기본, 최대 6): slot0 = **baseline BT(`AIP_DCS_baseline.dll`) 고정 후보**,
+  slot1.. = 학습 snapshot(오래된→최신). 후보별 EMA 승률을 각각 관리하고 EMA 가 낮은 후보를
+  softmax(-ema/τ) 로 더 자주 샘플링한다. pool 이 가득 차면 **가장 오래된 snapshot** 을 제거하고
+  BT 는 절대 evict 하지 않는다. pool 추가 게이트(min-EMA)는 **snapshot 후보만** 보고 판단한다
+  (BT 는 매우 강해 게이트에 넣으면 세대 진행이 영구히 멈춤). BT DLL/rule 은
+  `self_play.DEFAULT_BT_DLL`/`BT_RULE_DEFAULTS` 로 고정(CLI 옵션 없음).
+- `--frozen-opponent` 로 snapshot 상대 고정
 - **2-phase 학습**: phase1(거리 shaping) → phase2(`--resume-from` 이어받아 거리 off + 고정 상대)
 - **WEZ 3-tier 시간 게이팅**(tier1 항상 / tier2 100s / tier3 150s, 콘 1°/2°/3° 고정)을 학습 env(`TierGatedDogFightEnv`)에도 반영해 대결 서버 규칙과 일치
 - best-model saving: 결정론적 평가 승률>0.5 iteration 만 번들로 저장(마지막 출렁임 방지)
