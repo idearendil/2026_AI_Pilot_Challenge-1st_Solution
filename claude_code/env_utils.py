@@ -15,6 +15,7 @@
 """
 from __future__ import annotations
 
+import os
 import sys
 from pathlib import Path
 from typing import Optional
@@ -27,6 +28,12 @@ SRC = ROOT / "src"
 for _p in (ROOT, SRC):
     if str(_p) not in sys.path:
         sys.path.insert(0, str(_p))
+
+# 아래 DogFightEnvWrapper import 는 JSBSimWrapper → JSBSimAIPLib.dll 을 로드하고, 그
+# 시점에 BT DLL 의 rule XML(AIP_RULE_XML)이 한 번만 읽혀 캐싱된다. 이후 os.environ 을
+# 바꿔도 무시되므로, 그때 실제로 걸려 있던 값을 남겨 두고 BT provider 생성 시 검증한다
+# (claude_code.bt_rule 참고).
+RULE_XML_AT_IMPORT = os.environ.get("AIP_RULE_XML", "")
 
 from DogFightEnvWrapper import DogFightWrapper  # noqa: E402
 from dogfight.sim.state_schema import StateIndex  # noqa: E402
@@ -191,6 +198,7 @@ def _deep_update(base: dict, updates: dict) -> dict:
 __all__ = [
     "ROOT",
     "SRC",
+    "RULE_XML_AT_IMPORT",
     "STANDARD_ENV_CONFIG",
     "OBSERVATION_MODE",
     "OBSERVATION_SIZE",

@@ -41,18 +41,14 @@ for _p in (ROOT, ROOT / "src"):
         sys.path.insert(0, str(_p))
 
 # ── BT rule XML 선택 ─────────────────────────────────────────────────────────
-# BT DLL 은 **로드(static init) 시점에 AIP_RULE_XML 을 한 번만 읽어 캐싱**한다. DLL 은
-# claude_code.env_utils import 체인에서 로드되므로, 그 import 보다 먼저 환경변수를
-# 세팅해야 한다(나중에 os.environ 을 바꿔도 무시됨). 그래서 여기서 argv 를 미리 훑는다.
+# AIP_RULE_XML 은 JSBSimAIPLib.dll 로드 시점(= claude_code.env_utils import 체인)에 한 번만
+# 읽혀 캐싱된다. 그 import 보다 먼저 세팅해야 하므로 여기서 argv 를 미리 훑는다(나중에
+# os.environ 을 바꿔도 무시됨). rule 을 못 걸면 DLL 은 Rule_forTraining.xml(Task_Empty
+# =조종 안 함)로 폴백해 상대가 가만히 있게 된다. 자세한 내용은 claude_code.bt_rule 참고.
+from claude_code.bt_rule import BT_RULE_DEFAULTS as _BT_RULE_DEFAULTS  # noqa: E402
+
 _DEF_OWNSHIP_BT = "AIP_DCS_ownship.dll"
 _DEF_TARGET_BT = "AIP_BASE_target.dll"
-
-# rule 을 지정하지 않으면 DLL 은 ./Rule.xml → ./Rule_forTraining.xml 순으로 폴백하는데,
-# Rule_forTraining.xml 의 트리는 Task_Empty(=조종 안 함)라 상대가 가만히 있게 된다.
-# 전용 rule 이 있는 DLL 은 여기에 매핑해 자동으로 이어준다.
-_BT_RULE_DEFAULTS = {
-    "AIP_DCS_baseline.dll": "./Rule_BaselineCore.xml",
-}
 
 
 def _resolve_bt_rule(ns) -> str | None:

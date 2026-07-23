@@ -22,6 +22,7 @@ for _p in (ROOT, ROOT / "src"):
     if str(_p) not in sys.path:
         sys.path.insert(0, str(_p))
 
+from claude_code.bt_rule import ENV_KEY as BT_RULE_ENV_KEY
 from claude_code.model import make_actor_critic, discrete_indices_to_continuous
 from claude_code.normalizers import RunningMeanStd
 from claude_code.ppo import (PPOConfig, PPOTrainer, IterationStats, compute_gae, OBS_CLIP,
@@ -399,9 +400,16 @@ class ParallelPPOTrainer:
         if not ray.is_initialized():
             pythonpath = os.pathsep.join(
                 [str(ROOT), str(ROOT / "src"), os.environ.get("PYTHONPATH", "")])
+            env_vars = {"PYTHONPATH": pythonpath}
+            # BT rule XML 은 worker **프로세스 시작 시점**에 들어가 있어야 한다. worker 안에서
+            # os.environ 을 바꾸면 JSBSimAIPLib.dll 이 이미 로드된 뒤라 무시되고, BT 가
+            # Task_Empty(=직진만 하는 표적)로 돌아간다(claude_code.bt_rule 참고).
+            rule = os.environ.get(BT_RULE_ENV_KEY, "")
+            if rule:
+                env_vars[BT_RULE_ENV_KEY] = rule
             ray.init(num_cpus=self.num_workers, include_dashboard=False,
                      ignore_reinit_error=True, log_to_driver=False,
-                     runtime_env={"env_vars": {"PYTHONPATH": pythonpath}})
+                     runtime_env={"env_vars": env_vars})
         WorkerCls = _make_worker_cls()
         self.workers = [
             WorkerCls.remote(i, env_kwargs, model_kwargs, cfg_dict, self_play,

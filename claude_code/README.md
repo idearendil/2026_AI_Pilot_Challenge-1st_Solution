@@ -211,7 +211,14 @@ python tools/web_log_viewer.py --logdir logs --port 7870
   softmax(-ema/τ) 로 더 자주 샘플링한다. pool 이 가득 차면 **가장 오래된 snapshot** 을 제거하고
   BT 는 절대 evict 하지 않는다. pool 추가 게이트(min-EMA)는 **snapshot 후보만** 보고 판단한다
   (BT 는 매우 강해 게이트에 넣으면 세대 진행이 영구히 멈춤). BT DLL/rule 은
-  `self_play.DEFAULT_BT_DLL`/`BT_RULE_DEFAULTS` 로 고정(CLI 옵션 없음).
+  `bt_rule.DEFAULT_BT_DLL`/`BT_RULE_DEFAULTS` 로 고정(CLI 옵션 없음).
+  - ⚠️ **rule XML 캐싱 gotcha**: BT DLL 이 읽는 `AIP_RULE_XML` 은 `JSBSimAIPLib.dll` 이
+    로드되는 시점(= `claude_code.env_utils` import 체인)에 **한 번만** 캐싱된다. 그래서
+    `train.py` 는 다른 claude_code import 보다 **먼저** `bt_rule.apply_rule_env()` 를 호출하고,
+    Ray worker 에는 `ray.init(runtime_env={"env_vars": ...})` 로 **프로세스 시작 시점에** 주입한다.
+    늦게 세팅하면 DLL 이 `Rule_forTraining.xml`(트리 = `Task_Empty`)로 폴백해 **표적이 조종을
+    전혀 안 하고 직진만 한다** → BT 상대 승률이 거짓으로 100% 가까이 찍힌다.
+    `make_bt_provider()` 가 `bt_rule.check_rule_applied()` 로 이 상황을 즉시 에러로 잡는다.
 - `--frozen-opponent` 로 snapshot 상대 고정
 - **2-phase 학습**: phase1(거리 shaping) → phase2(`--resume-from` 이어받아 거리 off + 고정 상대)
 - **WEZ 3-tier 시간 게이팅**(tier1 항상 / tier2 100s / tier3 150s, 콘 1°/2°/3° 고정)을 학습 env(`TierGatedDogFightEnv`)에도 반영해 대결 서버 규칙과 일치

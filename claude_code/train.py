@@ -32,6 +32,16 @@ for _p in (ROOT, ROOT / "src"):
     if str(_p) not in sys.path:
         sys.path.insert(0, str(_p))
 
+# ── baseline BT rule XML (반드시 아래 claude_code import 들보다 먼저!) ──────────
+# self-play 면 baseline BT 가 opponent pool slot0 에 들어간다. BT DLL 이 읽는 rule XML 은
+# JSBSimAIPLib.dll 로드 시점(= claude_code.env_utils import 체인)에 한 번만 캐싱되므로
+# 여기서 미리 세팅해야 한다. 늦게 세팅하면 DLL 이 Rule_forTraining.xml(Task_Empty)로
+# 폴백해 상대가 조종을 전혀 안 하고, BT 상대 승률이 거짓으로 100% 가까이 찍힌다.
+from claude_code.bt_rule import apply_rule_env  # noqa: E402  (leaf 모듈, DLL 안 건드림)
+
+if "--no-self-play" not in sys.argv:
+    apply_rule_env()
+
 from claude_code.env_utils import make_env, STANDARD_ENV_CONFIG
 from claude_code.model import save_bundle
 from claude_code.parallel import physical_cpu_count
@@ -95,7 +105,7 @@ def load_train_state(path):
 def parse_args():
     p = argparse.ArgumentParser(description="claude_code standalone PPO trainer for DogFight 1v1")
     p.add_argument("--iterations", type=int, default=1000)
-    p.add_argument("--rollout-steps", type=int, default=50000)
+    p.add_argument("--rollout-steps", type=int, default=80000)
     p.add_argument("--lr", type=float, default=1e-4)
     p.add_argument("--gamma", type=float, default=0.98)
     p.add_argument("--gae-lambda", type=float, default=0.95)
@@ -162,7 +172,7 @@ def parse_args():
                         "더 자주 뽑힘. 작을수록 최저 EMA 후보를 강하게 선호. baseline BT 도 동일한 "
                         "softmax 로 뽑힌다(BT 상대 승률이 낮으므로 자연히 자주 뽑힘).")
     # baseline BT(AIP_DCS_baseline.dll) 는 self-play 시 항상 opponent pool slot0 에 고정으로
-    # 들어간다. DLL/rule 은 self_play.DEFAULT_BT_DLL + BT_RULE_DEFAULTS 로 고정 — CLI 옵션 없음.
+    # 들어간다. DLL/rule 은 bt_rule.DEFAULT_BT_DLL + BT_RULE_DEFAULTS 로 고정 — CLI 옵션 없음.
     p.add_argument("--seed", type=int, default=0)
     # loiter: 표적이 선회하며 고도를 유지(자기파괴 없음) → episode 가 timeout(terminal=0)
     # 으로 끝나므로 return 이 ownship 의 추격/사격 성과로만 결정돼 학습 신호가 깨끗하다.

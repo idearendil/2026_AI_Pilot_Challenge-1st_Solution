@@ -12,9 +12,6 @@ self-learning). env 는 상대 관점(context.ownship_state=상대, context.targ
 """
 from __future__ import annotations
 
-import os
-from pathlib import Path
-
 import numpy as np
 import torch
 
@@ -22,34 +19,25 @@ from dogfight.ai.action_provider import ActionContext, ActionProvider, ActionRes
 from GeoMathUtil import GeometryInfo
 
 from claude_code import my_observation
+from claude_code.bt_rule import BT_RULE_DEFAULTS, DEFAULT_BT_DLL, check_rule_applied
 from claude_code.model import policy_action_to_command, discrete_indices_to_continuous
 from claude_code.my_observation import StateReconstructor
-
-
-# BT DLL 별 기본 rule XML. rule 을 안 주면 DLL 은 ./Rule.xml → ./Rule_forTraining.xml 로
-# 폴백하는데 후자의 트리는 Task_Empty(=조종 안 함)라 상대가 가만히 있게 된다.
-BT_RULE_DEFAULTS = {
-    "AIP_DCS_baseline.dll": "./Rule_BaselineCore.xml",
-}
-DEFAULT_BT_DLL = "AIP_DCS_baseline.dll"
 
 
 def make_bt_provider(dll_name: str = DEFAULT_BT_DLL, rule_xml: str = ""):
     """baseline BT(DLL) 상대를 opponent pool 후보로 쓰기 위한 ActionProvider 를 만든다.
 
-    BT DLL 은 **load(static init) 시점에 AIP_RULE_XML 을 한 번만 읽어 캐싱**하므로
-    AIPilot(= ctypes LoadLibrary) 생성 **직전**에 환경변수를 세팅해야 한다. 이 함수를
-    통해서만 BT provider 를 만들면 그 순서가 보장된다.
+    rule XML(AIP_RULE_XML)은 여기서 세팅해도 **이미 늦다** — JSBSimAIPLib.dll 이 로드되는
+    claude_code.env_utils import 시점에 한 번만 읽히기 때문이다(claude_code.bt_rule 참고).
+    그래서 여기서는 세팅 대신 **검증**만 한다: rule 이 안 걸렸으면 조용히 Task_Empty BT
+    (=직진만 하는 표적, 가짜 승률 100%)로 학습하는 대신 즉시 실패시킨다.
 
-    학습 env 는 target_mode 가 fixed/loiter 라 이 DLL 이 다른 경로에서 먼저 로드되지
-    않으므로, 여기서 세팅한 rule 이 실제로 반영된다. Ray 병렬 모드에서는 worker 마다
-    별도 프로세스라 DLL 인스턴스도 worker 별로 독립이다.
+    entrypoint(train.py 등)는 claude_code import 보다 먼저 bt_rule.apply_rule_env() 를
+    호출해야 하고, Ray worker 는 ray.init 의 runtime_env env_vars 로 주입받는다.
     """
     from dogfight.ai.bt_action_provider import BTActionProvider
 
-    rule = rule_xml or BT_RULE_DEFAULTS.get(Path(dll_name).name, "")
-    if rule:
-        os.environ["AIP_RULE_XML"] = rule
+    check_rule_applied(dll_name, rule_xml)
     return BTActionProvider(dll_name=dll_name)
 
 
