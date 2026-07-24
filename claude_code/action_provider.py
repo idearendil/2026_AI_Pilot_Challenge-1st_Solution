@@ -39,9 +39,11 @@ class MLPActionProvider(ActionProvider):
         # 갱신한다 (다른 관측 모듈에는 영향 없음).
         self._reconstruct = self.metadata.get("observation_module") == "claude_code.my_observation"
         if self._reconstruct:
-            from claude_code.my_observation import reset_reconstructor, advance_reconstructor
+            from claude_code.my_observation import (reset_reconstructor, advance_reconstructor,
+                                                    push_action_reconstructor)
             self._reset_recon = reset_reconstructor
             self._advance_recon = advance_reconstructor
+            self._push_action = push_action_reconstructor
 
     def reset(self, context: ActionContext | None = None) -> None:
         # MLP 정책은 recurrent state 가 없으므로 reset 시 별도 처리 불필요.
@@ -75,6 +77,10 @@ class MLPActionProvider(ActionProvider):
         # 이산 정책이면 카테고리 index → 연속값으로 변환.
         if hasattr(self.model, "num_bins"):
             raw = discrete_indices_to_continuous(raw, self.model.num_bins)
+        # action history: 방금 결정한 action([-1,1]^4)을 reconstructor 에 push → 다음 관측이
+        # 이 action 을 포함(학습 경로와 동일 규약). command 변환 전 raw 를 넣는다.
+        if self._reconstruct:
+            self._push_action(raw)
         command = policy_action_to_command(raw)  # [roll,pitch,rudder]∈[-1,1], throttle∈[0,1]
 
         return ActionResult(

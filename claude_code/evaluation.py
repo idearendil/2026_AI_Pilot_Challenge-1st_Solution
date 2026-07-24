@@ -86,7 +86,8 @@ def play_games(env, model, cur_rms_mean, cur_rms_var, seeds, stochastic: bool,
     각 게임의 raw return / 길이 / terminal 보상 성분 + 최종 양측 체력(승패 판정용)을 반환.
     """
     if reconstruct:
-        from claude_code.my_observation import reset_reconstructor, advance_reconstructor
+        from claude_code.my_observation import (reset_reconstructor, advance_reconstructor,
+                                                push_action_reconstructor)
     results = []
     for seed in seeds:
         if reconstruct:
@@ -107,6 +108,8 @@ def play_games(env, model, cur_rms_mean, cur_rms_var, seeds, stochastic: bool,
                     a = model.act_deterministic(obs_t).squeeze(0).cpu().numpy().astype(np.float32)
             # 이산 정책이면 카테고리 index → 연속값으로 변환 후 env.step.
             env_a = discrete_indices_to_continuous(a, model.num_bins) if hasattr(model, "num_bins") else a
+            if reconstruct:
+                push_action_reconstructor(env_a)   # next obs 빌드(env.step) 전에 push
             o, r, term, trunc, info = env.step(env_a)
             if reconstruct:
                 advance_reconstructor(env._ownship_state, env._target_state)

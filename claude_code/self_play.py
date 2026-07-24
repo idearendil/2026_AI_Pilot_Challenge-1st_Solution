@@ -96,6 +96,10 @@ class SelfPlayProvider(ActionProvider):
             # 이산 정책이면 카테고리 index → 연속값으로 변환 후 command 변환.
             if hasattr(self.model, "num_bins"):
                 raw = discrete_indices_to_continuous(raw, self.model.num_bins)
+            # action history: 방금 결정한 상대 action([-1,1]^4)을 상대 reconstructor 에 push.
+            # 다음 _build_obs(다음 RL-step)가 이 action 을 포함한다(ownship 과 동일 규약).
+            if self.observation_fn is my_observation.build_observation:
+                self._recon.push_action(raw)
             cmd = policy_action_to_command(raw)
             self._cached = ActionResult(action=cmd, source="self_play", confidence=0.9, info={})
         self._count += 1

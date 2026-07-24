@@ -37,7 +37,7 @@ for _p in (ROOT, ROOT / "src"):
 # JSBSimAIPLib.dll 로드 시점(= claude_code.env_utils import 체인)에 한 번만 캐싱되므로
 # 여기서 미리 세팅해야 한다. 늦게 세팅하면 DLL 이 Rule_forTraining.xml(Task_Empty)로
 # 폴백해 상대가 조종을 전혀 안 하고, BT 상대 승률이 거짓으로 100% 가까이 찍힌다.
-from claude_code.bt_rule import apply_rule_env  # noqa: E402  (leaf 모듈, DLL 안 건드림)
+from claude_code.bt_rule import apply_rule_env, BT_OPPONENTS  # noqa: E402  (leaf 모듈, DLL 안 건드림)
 
 if "--no-self-play" not in sys.argv:
     apply_rule_env()
@@ -85,7 +85,8 @@ def save_train_state(path, *, trainer, pool, pool_state, pool_max, iteration,
         # 각 후보: kind + EMA + actor net(+critic; state_dict 전체) + obs_rms 스냅샷.
         #   kind="bt"  → baseline BT(DLL) 상대. state/rms 없음, dll/rule 만 저장(slot0 고정).
         #   kind="net" → 학습 snapshot 후보.
-        "pool": [{"kind": e.get("kind", "net"), "gen": int(e["gen"]),
+        "pool": [{"kind": e.get("kind", "net"), "bt_index": e.get("bt_index", 0),
+                  "gen": int(e["gen"]),
                   "ema": float(e["ema"]), "state": e.get("state"), "rms": e.get("rms"),
                   "dll": e.get("dll", ""), "rule": e.get("rule", "")} for e in pool],
         "best": dict(best),
@@ -107,7 +108,7 @@ def parse_args():
     p.add_argument("--iterations", type=int, default=1000)
     p.add_argument("--rollout-steps", type=int, default=80000)
     p.add_argument("--lr", type=float, default=1e-4)
-    p.add_argument("--gamma", type=float, default=0.99)
+    p.add_argument("--gamma", type=float, default=0.98)
     p.add_argument("--gae-lambda", type=float, default=0.95)
     p.add_argument("--clip-coef", type=float, default=0.2)
     p.add_argument("--update-epochs", type=int, default=5)
@@ -166,10 +167,10 @@ def parse_args():
                         "(--frozen-opponent 이면 무시=영구 고정)")
     p.add_argument("--selfplay-ema-alpha", type=float, default=0.1,
                    help="opponent 별 EMA 계수 α. ema_i = (1-α)·ema_i + α·(이번 iter 후보 i 상대 raw 승률). 초기 ema=0.5.")
-    p.add_argument("--pool-size", type=int, default=6,
-                   help="opponent pool 최대 크기(baseline BT 후보 포함). 초과 시 가장 오래 전에 "
+    p.add_argument("--pool-size", type=int, default=8,
+                   help="opponent pool 총 슬롯 수(BT 후보 전부 포함). 초과 시 가장 오래 전에 "
                         "추가된 **snapshot** 후보를 제거(FIFO). BT 는 절대 제거되지 않는다. "
-                        "기본 6 = BT 1 + snapshot 5.")
+                        "기본 8 = BT 3(Lee_BT1/Jeon_BT1/Jeon_BT2) + snapshot 5.")
     p.add_argument("--pool-sample-temp", type=float, default=0.3,
                    help="opponent 샘플링 softmax 온도 τ. weight_i ∝ exp(-ema_i/τ) → EMA 낮은 후보가 "
                         "더 자주 뽑힘. 작을수록 최저 EMA 후보를 강하게 선호. baseline BT 도 동일한 "
@@ -205,10 +206,12 @@ def parse_args():
     p.add_argument("--wandb-project", default="AIP contest", help="wandb 프로젝트명")
     p.add_argument("--wandb-run-name", default="",
                    help="wandb run 이름 (비우면 output-name/output-tag)")
-    # crash 자동 재시작(Windows CUDA+Ray 네이티브 크래시 우회). REDQ 와 동일 메커니즘.
-    p.add_argument("--supervise", action="store_true",
+    # crash 자동 재시작(Windows CUDA+Ray 네이티브 크래시 우회). REDQ 와 동일 메커니즘. **기본 켜짐**.
+    p.add_argument("--supervise", dest="supervise", action="store_true", default=True,
                    help="바깥 supervisor 로 학습을 자식 프로세스로 띄우고, 크래시하면 마지막 "
-                        "train_state 체크포인트에서 자동 재시작. 크래시난 iteration 은 처음부터 다시.")
+                        "train_state 체크포인트에서 자동 재시작(기본 켜짐). 크래시난 iteration 은 처음부터 다시.")
+    p.add_argument("--no-supervise", dest="supervise", action="store_false",
+                   help="supervisor 없이 이 프로세스에서 바로 학습(디버그용).")
     p.add_argument("--auto-resume", action="store_true",
                    help="시작 시 train_state 체크포인트가 있으면 이어서 학습(--resume-state 로 자동 매핑). "
                         "supervisor 가 자식에 자동 부여.")
@@ -325,20 +328,27 @@ def main():
         device=args.device,
     )
 
+    # opponent pool 에 넣을 BT 목록 [(dll, rule), ...]. 워커에 round-robin 배정한다.
+    # 한 프로세스 = BT rule 1개 제약 → 워커 수보다 많은 BT 는 배정될 워커가 없으므로,
+    # 실제 사용 BT 수를 min(BT 종류, 워커 수)로 제한한다(단일 프로세스면 BT 1종).
+    bt_list = (list(BT_OPPONENTS)[:min(len(BT_OPPONENTS), int(args.num_workers))]
+               if bt_enabled else [])
+
     # 데이터 수집: num_workers>1 이면 Ray 병렬, 아니면 단일 프로세스.
     if args.num_workers > 1:
         from claude_code.parallel import ParallelPPOTrainer
         env.close()   # driver 는 rollout env 를 step 하지 않음 (worker 가 가짐)
         trainer = ParallelPPOTrainer(env_kwargs, cfg, args.num_workers,
-                                     args.self_play, obs_dim, act_dim)
+                                     args.self_play, obs_dim, act_dim,
+                                     bt_opponents=bt_list)
     else:
-        trainer = PPOTrainer(env, cfg)
+        trainer = PPOTrainer(env, cfg, bt_opponents=bt_list)
     # gated self-play 상대는 resume(weights 확정) 후에 '현재 정책의 frozen copy' 로 설치한다.
     if args.self_play:
         print("[claude_code/PPO] 상대 = OPPONENT POOL self-play (매 게임 pool 에서 EMA 낮은 "
               f"후보 우대 샘플링, snapshot min-EMA≥{args.selfplay_gate_threshold:.2f} 시 "
               "현재 정책 추가; 둘 다 stochastic)"
-              + (f" + baseline BT({DEFAULT_BT_DLL}) 고정 후보" if bt_enabled else ""))
+              + (" + BT 고정 후보(워커 분할)" if bt_enabled else ""))
     else:
         print(f"[claude_code/PPO] 상대 = 스크립트 target_mode={args.target_mode}")
 
@@ -388,10 +398,11 @@ def main():
                     "selfplay_gate_threshold": (None if args.frozen_opponent
                                                 else args.selfplay_gate_threshold),
                     "selfplay_ema_alpha": args.selfplay_ema_alpha,
-                    "pool_size": ((1 + int(bt_enabled)) if args.frozen_opponent
-                                  else max(1 + int(bt_enabled), int(args.pool_size))),
+                    "pool_size": (len(bt_list)
+                                  + (1 if args.frozen_opponent
+                                     else max(1, int(args.pool_size) - len(bt_list)))),
                     "pool_sample_temp": args.pool_sample_temp,
-                    "bt_opponent": (DEFAULT_BT_DLL if bt_enabled else None),
+                    "bt_opponents": ([d for d, _ in bt_list] if bt_enabled else None),
                     "reward_module": args.reward_module,
                     "observation_module": args.observation_module,
                     "reward_overrides": reward_overrides, "resume_from": args.resume_from,
@@ -471,85 +482,91 @@ def main():
     # 이후 매 iter EMA 승률이 임계값을 넘으면 on_iteration 에서 현재 정책으로 승격한다.
     # --frozen-opponent 이면 임계값을 무한대로 둬서 영구 고정(승격 안 함).
     gate_threshold = float("inf") if args.frozen_opponent else float(args.selfplay_gate_threshold)
-    bt_dll = DEFAULT_BT_DLL if bt_enabled else ""
-    bt_rule = ""                          # 빈 값 = DLL 별 기본 rule 자동 선택
-    bt_slots = 1 if bt_enabled else 0     # pool 앞쪽에서 evict 금지인 슬롯 수
-    # --frozen-opponent 는 snapshot 후보를 1개로 고정 → BT 를 쓰면 총 2개.
-    pool_max = (1 + bt_slots) if args.frozen_opponent else max(1 + bt_slots, int(args.pool_size))
+    # bt_list 는 위(trainer 생성 전)에서 이미 계산(워커 수로 cap). trainer._bt_assign 과 일치.
+    # 글로벌 pool 슬롯: [BT n_bt개] + [snapshot cap개]. 워커를 BT 별로 round-robin 분할한다.
+    n_bt = len(bt_list)
+    # --pool-size = 총 슬롯 수(BT 전부 포함). snapshot 정원 = pool_size - n_bt (최소 1).
+    # frozen 이면 snapshot 1개 고정.
+    snapshot_cap = 1 if args.frozen_opponent else max(1, int(args.pool_size) - n_bt)
+    pool_max = n_bt + snapshot_cap                       # 글로벌 총 슬롯(BT n_bt + snapshot cap)
+    local_pool_max = (1 + snapshot_cap) if n_bt else snapshot_cap   # 워커 로컬(BT 1 + snapshot)
     if resume_ckpt is not None:
-        pool_max = int(resume_ckpt["pool_max"])   # checkpoint 의 pool 구성을 그대로 이어감
+        pool_max = int(resume_ckpt["pool_max"])
 
-    def _pool_weights(entries) -> list:
-        """EMA 낮은 후보가 더 자주 뽑히도록 softmax(-ema/τ) 가중치.
+    def _per_worker_weights() -> list:
+        """워커별 로컬 pool([그 워커 BT, snapshot...]) 샘플 가중치를 반환.
 
-        baseline BT(slot0)도 예외 없이 같은 식으로 뽑는다. BT 상대 승률이 낮으면 BT EMA 가
-        낮아져 자연히 자주 샘플링된다(별도 확률 고정 옵션 없음).
+        BT 별로 1개씩(총 n_bt개) 벡터를 만들고 워커 i → i%n_bt 벡터를 준다. EMA 낮은 후보가
+        더 자주 뽑히도록 softmax(-ema/τ), 각 벡터 합=1. (다른 BT 는 이 워커에서 아예 로컬
+        pool 에 없으므로 자연히 확률 0.)
         """
-        e = np.asarray([x["ema"] for x in entries], dtype=np.float64)
-        n = int(e.size)
-        if n <= 1:
-            return [1.0] * max(n, 1)
-        logits = -e / max(float(args.pool_sample_temp), 1e-6)
-        logits -= logits.max()
-        w = np.exp(logits)
-        return (w / w.sum()).tolist()
+        snaps = [e for e in pool if e["kind"] == "net"]
+        snap_emas = [e["ema"] for e in snaps]
+        temp = max(float(args.pool_sample_temp), 1e-6)
 
-    # opponent pool EMA/net 메타데이터(train.py 소유, checkpoint 저장 대상).
-    #   각 후보: {"kind", "gen", "ema", "state"(actor+critic net np), "rms"(obs_rms 스냅샷)}.
-    #   kind="bt"(slot0, 있으면) 는 state/rms 대신 dll/rule 을 갖고 절대 evict 되지 않는다.
+        def _sm(emas):
+            a = np.asarray(emas, dtype=np.float64)
+            if a.size <= 1:
+                return [1.0] * max(int(a.size), 1)
+            lg = -a / temp
+            lg -= lg.max()
+            w = np.exp(lg)
+            return (w / w.sum()).tolist()
+
+        if n_bt == 0:
+            v = _sm(snap_emas)
+            return [v for _ in range(trainer.num_workers)]
+        vecs = [_sm([pool[b]["ema"]] + snap_emas) for b in range(n_bt)]
+        return [vecs[i % n_bt] for i in range(trainer.num_workers)]
+
+    # opponent pool 메타데이터(train.py 소유, checkpoint 저장 대상). 글로벌 슬롯 순서:
+    #   slots 0..n_bt-1 = BT(kind="bt", bt_index, dll, rule) — 절대 evict 안 됨,
+    #   slots n_bt..    = snapshot(kind="net", gen, ema, state, rms).
     pool: list = []
     pool_state = {"next_gen": 1, "n_added": 0}
 
-    def _bt_entry(ema: float = 0.5) -> dict:
-        return {"kind": "bt", "gen": -1, "ema": float(ema), "state": None, "rms": None,
-                "dll": DEFAULT_BT_DLL, "rule": ""}
+    def _bt_entries() -> list:
+        return [{"kind": "bt", "bt_index": b, "gen": -1 - b, "ema": 0.5,
+                 "state": None, "rms": None, "dll": dll, "rule": rule}
+                for b, (dll, rule) in enumerate(bt_list)]
 
     if args.self_play:
         if resume_ckpt is not None:
-            # checkpoint 의 pool(모든 후보 net + EMA) 을 그대로 복원.
-            # (구 checkpoint 는 kind 가 없다 → 전부 "net" 으로 간주.)
-            pool = [{"kind": e.get("kind", "net"), "gen": int(e["gen"]), "ema": float(e["ema"]),
+            pool = [{"kind": e.get("kind", "net"), "bt_index": e.get("bt_index", 0),
+                     "gen": int(e["gen"]), "ema": float(e["ema"]),
                      "state": e.get("state"), "rms": e.get("rms"),
                      "dll": e.get("dll", ""), "rule": e.get("rule", "")}
                     for e in resume_ckpt["pool"]]
-            if not (pool and pool[0].get("kind") == "bt"):
-                # BT 없이 학습하던(구) checkpoint → slot0 에 BT 를 새로 끼워 넣는다.
-                # snapshot 정원은 그대로 두고 BT 슬롯 1칸을 더한다(예: 5 → 6).
-                pool.insert(0, _bt_entry())
-                pool_max = max(pool_max + 1, len(pool))
-            bt_slots = 1
-            bt_dll = pool[0].get("dll") or DEFAULT_BT_DLL
-            bt_rule = pool[0].get("rule") or ""
+            # 복원된 pool 의 BT 개수/snapshot 정원으로 local_pool_max 재계산.
+            n_bt = sum(1 for e in pool if e["kind"] == "bt")
+            local_pool_max = pool_max - n_bt + 1 if n_bt else pool_max
             pool_state = {"next_gen": int(resume_ckpt["next_gen"]),
                           "n_added": int(resume_ckpt["n_added"])}
             trainer.set_opponent_pool([e for e in pool if e["kind"] == "net"],
-                                      _pool_weights(pool), pool_max,
-                                      bt_dll=bt_dll, bt_rule=bt_rule)
-            print(f"[claude_code/PPO] opponent pool 복원: {len(pool)}개 후보 "
-                  f"(kind {[e['kind'] for e in pool]}, gen {[e['gen'] for e in pool]}, "
+                                      _per_worker_weights(), local_pool_max)
+            print(f"[claude_code/PPO] opponent pool 복원: {len(pool)}개 "
+                  f"(BT {n_bt} + snapshot {len(pool)-n_bt}, "
                   f"ema {[round(e['ema'],3) for e in pool]})")
         else:
-            trainer.install_opponent_pool(pool_max, bt_dll=bt_dll, bt_rule=bt_rule)
             snap = trainer.snapshot_current()
-            pool = [_bt_entry(),
-                    {"kind": "net", "gen": 0, "ema": 0.5,
-                     "state": snap["state"], "rms": snap["rms"]}]
+            pool = _bt_entries() + [{"kind": "net", "gen": 0, "ema": 0.5,
+                                     "state": snap["state"], "rms": snap["rms"]}]
             pool_state = {"next_gen": 1, "n_added": 0}
-            trainer.pool_set_weights(_pool_weights(pool))
-            print(f"[claude_code/PPO] opponent pool 초기화 = baseline BT + iter0 정책 "
-                  f"(최대 {pool_max}개, EMA α={args.selfplay_ema_alpha}, 추가 임계 "
-                  f"min-EMA(snapshot만)≥{args.selfplay_gate_threshold:.2f}, "
-                  f"초기 EMA=0.5, 샘플 τ={args.pool_sample_temp})")
-        print(f"[claude_code/PPO] baseline BT 상대 = {bt_dll} "
-              f"(rule={bt_rule or 'DLL 기본'}), pool slot0 고정 · evict 안 됨 · "
-              "EMA 별도 관리 · 샘플 확률 = EMA softmax")
+            trainer.install_opponent_pool(local_pool_max, _per_worker_weights())
+            print(f"[claude_code/PPO] opponent pool 초기화 = BT {n_bt}종 + iter0 정책 "
+                  f"(글로벌 최대 {pool_max}칸 = BT {n_bt} + snapshot {snapshot_cap}, "
+                  f"EMA α={args.selfplay_ema_alpha}, 추가 임계 min-EMA(snapshot만)"
+                  f"≥{args.selfplay_gate_threshold:.2f}, τ={args.pool_sample_temp})")
+        bt_names = [Path(e["dll"]).stem for e in pool if e["kind"] == "bt"]
+        print(f"[claude_code/PPO] BT {n_bt}종 = {bt_names} (워커 round-robin 분할, "
+              "각 워커 프로세스에 AIP_RULE_XML 주입 · evict 안 됨 · BT별 EMA 분리 집계)")
         base_metadata["selfplay_gate_threshold"] = (None if args.frozen_opponent
                                                     else args.selfplay_gate_threshold)
         base_metadata["selfplay_ema_alpha"] = args.selfplay_ema_alpha
         base_metadata["frozen_opponent"] = bool(args.frozen_opponent)
         base_metadata["pool_size"] = pool_max
         base_metadata["pool_sample_temp"] = args.pool_sample_temp
-        base_metadata["bt_opponent"] = bt_dll or None
+        base_metadata["bt_opponents"] = [e["dll"] for e in pool if e["kind"] == "bt"]
         if args.frozen_opponent:
             print("[claude_code/PPO] opponent snapshot = 학습 시작 시점 정책으로 영구 고정(추가 없음)")
 
@@ -620,16 +637,22 @@ def main():
         upd_early = int(s.extra.get("update_early_stop", 0))
 
         # opponent 별 EMA 갱신 + 조건부 pool 추가. 우리팀·opponent 모두 stochastic rollout.
+        # per_opp 는 **글로벌 슬롯 인덱스**(워커가 로컬→글로벌 매핑) 기준: 0..n_bt-1=BT, 그 뒤 snapshot.
         per_opp = s.extra.get("per_opp", {}) or {}
         added = False
-        # baseline BT(slot0) 상대 이번 iter 성적 (BT 미사용이면 NaN).
-        bt_stat = per_opp.get(0) if bt_slots else None
-        bt_games = int(bt_stat.get("decided", 0)) if bt_stat else 0
-        bt_wr = float(bt_stat["raw_win_rate"]) if bt_games > 0 else float("nan")
+        # BT n_bt종 각각의 이번 iter 성적(슬롯 0..n_bt-1). 로깅/샘플링에 쓰인다.
+        bt_stats = [per_opp.get(b) for b in range(n_bt)]
+        bt_games_each = [int(st.get("decided", 0)) if st else 0 for st in bt_stats]
+        bt_wr_each = [float(st["raw_win_rate"]) if (st and st.get("decided", 0) > 0) else float("nan")
+                      for st in bt_stats]
+        # 하위 로깅 호환(대표값 = BT 전체 합산).
+        bt_games = int(sum(bt_games_each))
+        _bt_wins = int(sum((per_opp.get(b) or {}).get("win", 0) for b in range(n_bt)))
+        bt_wr = (_bt_wins / bt_games) if bt_games > 0 else float("nan")
         if args.self_play:
             alpha = args.selfplay_ema_alpha
             # 이번 iter 에 실제로 게임이 있었던 후보만 EMA 갱신(안 뽑힌 후보는 유지).
-            # BT 후보(slot0)도 동일하게 자기 EMA 를 갖는다(별도 관리).
+            # BT 후보(슬롯 0..n_bt-1)도 각각 자기 EMA 를 갖는다(BT별 분리 집계).
             for i, entry in enumerate(pool):
                 d = per_opp.get(i)
                 if d and d.get("decided", 0) > 0:
@@ -645,17 +668,17 @@ def main():
                              "state": snap["state"], "rms": snap["rms"]})
                 pool_state["next_gen"] += 1
                 if len(pool) > pool_max:
-                    pool.pop(bt_slots)   # 가장 오래된 snapshot 제거 (BT slot0 는 보존)
+                    pool.pop(n_bt)   # 가장 오래된 snapshot 제거 (BT 슬롯 0..n_bt-1 은 보존)
                 pool_state["n_added"] += 1
                 _save_best(s, {"mean_return": s.mean_return, "win_rate": raw_wr})
                 added = True
-            # 다음 iteration 을 위한 샘플링 가중치 갱신(EMA 낮은 후보 우대).
-            trainer.pool_set_weights(_pool_weights(pool))
+            # 다음 iteration 을 위한 워커별 샘플링 가중치 갱신(EMA 낮은 후보 우대).
+            trainer.pool_set_weights(_per_worker_weights())
 
         net_emas = [e["ema"] for e in pool if e["kind"] == "net"]
         ema_mean = float(np.mean(net_emas)) if net_emas else float("nan")
         ema_min = float(np.min(net_emas)) if net_emas else float("nan")
-        ema_bt = float(pool[0]["ema"]) if bt_slots else float("nan")
+        ema_bt = float(np.mean([pool[b]["ema"] for b in range(n_bt)])) if n_bt else float("nan")
         promoted = added   # 하위 print/wandb 호환
 
         writer.writerow([
@@ -729,13 +752,17 @@ def main():
                     "reward/termination_reward": terminal,
                     "damage/dealt_per_episode": damage_dealt,
                 }
-                if bt_slots:
-                    # baseline BT 상대 전용 지표(다른 후보와 분리해서 추적).
-                    log_dict["selfplay/bt_ema"] = ema_bt
-                    log_dict["selfplay/bt_win_rate"] = bt_wr
+                if n_bt:
+                    # BT n_bt종 각각의 EMA/승률/게임수(BT별 분리 추적) + 대표 평균값.
+                    log_dict["selfplay/bt_ema"] = ema_bt          # BT 전체 평균 EMA
+                    log_dict["selfplay/bt_win_rate"] = bt_wr      # BT 전체 승률
                     log_dict["selfplay/bt_games"] = bt_games
-                # 후보별 EMA (슬롯 0=BT(있으면) 또는 가장 오래된 후보 … pool_max-1).
-                # 빈 슬롯은 로깅 생략.
+                    for b in range(n_bt):
+                        name = Path(pool[b]["dll"]).stem          # Lee_BT1, Jeon_BT1, ...
+                        log_dict[f"selfplay/bt_ema/{name}"] = pool[b]["ema"]
+                        log_dict[f"selfplay/bt_win_rate/{name}"] = bt_wr_each[b]
+                        log_dict[f"selfplay/bt_games/{name}"] = bt_games_each[b]
+                # 후보별 EMA (슬롯 0..n_bt-1=BT, 그 뒤 snapshot). 빈 슬롯은 로깅 생략.
                 for i in range(pool_max):
                     if i < len(pool):
                         log_dict[f"selfplay/pool_ema_slot{i}"] = pool[i]["ema"]
@@ -745,7 +772,7 @@ def main():
 
         sp_msg = ""
         if args.self_play:
-            bt_msg = (f" bt[ema {ema_bt:.3f} wr {bt_wr:.2f} n{bt_games}]" if bt_slots else "")
+            bt_msg = (f" bt[ema {ema_bt:.3f} wr {bt_wr:.2f} n{bt_games}]" if n_bt else "")
             sp_msg = (f" | pool{len(pool)} W/L/D {wins}/{losses}/{draws} "
                       f"raw_wr {raw_wr:.2f} ema[min {ema_min:.3f} mean {ema_mean:.3f}]"
                       f"{bt_msg}"

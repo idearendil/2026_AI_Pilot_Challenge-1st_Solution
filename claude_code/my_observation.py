@@ -104,6 +104,13 @@ SIM_HZ = 60
 STEP_RATIO = 6
 DT_PER_STEP = STEP_RATIO / SIM_HZ
 
+# ── action history: 직전 5 RL-step 동안 '내가 결정한 action'(연속 [-1,1]^4)을 관측에 붙인다.
+# 5 step × 4 dim = 20 차원. 에피소드 시작 전(0 step 이전)은 0 으로 채운다. actor/critic 이
+# 같은 관측을 쓰므로 둘 다에 반영된다. 순서: [가장 최근, ..., 가장 오래된] × 4채널.
+ACTION_HISTORY_LEN = 5
+ACTION_DIM = 4
+ACTION_HISTORY_SIZE = ACTION_HISTORY_LEN * ACTION_DIM   # 20
+
 MAX_SPEED = 600.0
 BODY_VEL_MIN = -600.0
 BODY_VEL_MAX = 600.0
@@ -234,6 +241,10 @@ def _all_feature_names():
     for key, _kind, fr in _VEC_LAYOUT:
         for ax in ("x", "y", "z"):
             names.append(f"{key}__{fr}_{ax}")
+    # action history 20개: act_hist_t{-1..-5}_{ch0..3} (가장 최근 → 오래된).
+    for lag in range(1, ACTION_HISTORY_LEN + 1):
+        for ch in range(ACTION_DIM):
+            names.append(f"act_hist_t-{lag}_ch{ch}")
     return names
 
 
@@ -436,6 +447,9 @@ class StateReconstructor:
         self.prev_tgt_att = None
         self.own_pqr_est = np.zeros(3, dtype=np.float64)
         self.tgt_pqr_est = np.zeros(3, dtype=np.float64)
+        # 직전 ACTION_HISTORY_LEN 개 action(각 ACTION_DIM 차원). row 0 = 가장 최근. 에피소드
+        # 시작 시 전부 0(= 0 step 이전 action 없음). push_action 으로 갱신.
+        self.action_history = np.zeros((ACTION_HISTORY_LEN, ACTION_DIM), dtype=np.float64)
 
     def advance(self, own_state, tgt_state) -> None:
         own = np.asarray(own_state, dtype=np.float64)
@@ -478,6 +492,23 @@ class StateReconstructor:
 
         self.t_sec += self.dt
 
+    def push_action(self, action) -> None:
+        """이번 RL-step 에 결정한 action(연속 [-1,1]^4)을 history 맨 앞에 넣고 한 칸 민다.
+
+        관측 빌드 **전에** 호출해야 그 관측이 방금 결정한 action 을 포함한다(lag 없음).
+        """
+        a = np.asarray(action, dtype=np.float64).reshape(-1)
+        if a.size < ACTION_DIM:
+            a = np.pad(a, (0, ACTION_DIM - a.size))
+        else:
+            a = a[:ACTION_DIM]
+        self.action_history = np.roll(self.action_history, 1, axis=0)
+        self.action_history[0] = a
+
+    def action_history_flat(self) -> np.ndarray:
+        """(ACTION_HISTORY_SIZE,) = [가장 최근 4채널, ..., 가장 오래된 4채널]."""
+        return self.action_history.reshape(-1).astype(np.float32)
+
 
 _RECON = StateReconstructor()
 
@@ -494,6 +525,15 @@ def reset_reconstructor() -> None:
 def advance_reconstructor(own_state, tgt_state) -> None:
     """모듈 singleton을 RL step마다 정확히 한 번 진행시킨다."""
     _RECON.advance(own_state, tgt_state)
+
+
+def push_action_reconstructor(action) -> None:
+    """모듈 singleton(전역 _RECON = ownship 관점)의 action history 를 RL step 당 한 번 갱신.
+
+    관측이 방금 결정한 action 을 포함하도록, 그 관측을 빌드하기 **직전**에 호출한다
+    (학습: env.step 전, 추론: action 결정 후 다음 관측 빌드 전).
+    """
+    _RECON.push_action(action)
 
 
 def build_observation(ownship_state, target_state, geo_info, wez_config=None,
@@ -676,7 +716,10 @@ def build_observation(ownship_state, target_state, geo_info, wez_config=None,
                 _tanh_scale(float(comp[i]), PQR_SCALE_RAD_S) for i in range(3)
             )
 
-    obs = np.asarray(scalars + vec_feats, dtype=np.float32)
+    # ── action history 20개(직전 5 RL-step 의 내 action, [-1,1]^4). reconstructor 소유. ──
+    act_hist = list(rec.action_history_flat())
+
+    obs = np.asarray(scalars + vec_feats + act_hist, dtype=np.float32)
     obs = np.nan_to_num(obs, nan=0.0, posinf=10.0, neginf=-10.0)
     return obs.astype(np.float32)
 
@@ -721,4 +764,8 @@ __all__ = [
     "get_reconstructor",
     "reset_reconstructor",
     "advance_reconstructor",
+    "push_action_reconstructor",
+    "ACTION_HISTORY_LEN",
+    "ACTION_DIM",
+    "ACTION_HISTORY_SIZE",
 ]

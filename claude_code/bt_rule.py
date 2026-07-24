@@ -23,10 +23,24 @@ from pathlib import Path
 ENV_KEY = "AIP_RULE_XML"
 
 # BT DLL 별 기본 rule XML.
+#   ⚠️ 같은 프로세스에서는 BT DLL 이 rule 을 **한 번만**(전역 AIP_RULE_XML) 읽으므로,
+#   서로 다른 rule 3개를 한 프로세스에 동시에 로드해도 전부 같은 rule 로 동작한다(DLL 을
+#   파일명만 바꿔 복사해도 마찬가지 — DLL 은 자기 이름의 XML 을 읽지 않고 전역 값을 읽는다).
+#   따라서 학습에서 3개 BT 를 동시에 쓰려면 **워커(프로세스)별로 다른 rule 을 주입**해야 한다.
 BT_RULE_DEFAULTS = {
-    "AIP_DCS_baseline.dll": "./Rule_BaselineCore.xml",
+    "Lee_BT1.dll": "./Lee_BT1.xml",     # 기존 baseline(BaselineCore) 을 이름만 바꾼 것
+    "Jeon_BT1.dll": "./Jeon_BT1.xml",   # 추가 BT #1 (WEZ 추적 + 지면 회피)
+    "Jeon_BT2.dll": "./Jeon_BT2.xml",   # 추가 BT #2 (FarNeutral + PurePursuit)
 }
-DEFAULT_BT_DLL = "AIP_DCS_baseline.dll"
+DEFAULT_BT_DLL = "Lee_BT1.dll"
+
+# 학습 opponent pool 에 넣을 BT 3종(dll, rule XML). 순서 = pool 슬롯 순서.
+# 한 프로세스 = 1 rule 제약 때문에, 학습에서는 이 목록을 **워커별로 round-robin 배정**한다.
+BT_OPPONENTS = [
+    ("Lee_BT1.dll", "./Lee_BT1.xml"),
+    ("Jeon_BT1.dll", "./Jeon_BT1.xml"),
+    ("Jeon_BT2.dll", "./Jeon_BT2.xml"),
+]
 
 
 def rule_for(dll_name: str = DEFAULT_BT_DLL, rule_xml: str = "") -> str:
@@ -68,5 +82,5 @@ def check_rule_applied(dll_name: str = DEFAULT_BT_DLL, rule_xml: str = "") -> st
     return want
 
 
-__all__ = ["ENV_KEY", "BT_RULE_DEFAULTS", "DEFAULT_BT_DLL", "rule_for",
+__all__ = ["ENV_KEY", "BT_RULE_DEFAULTS", "DEFAULT_BT_DLL", "BT_OPPONENTS", "rule_for",
            "apply_rule_env", "rule_at_import", "check_rule_applied"]

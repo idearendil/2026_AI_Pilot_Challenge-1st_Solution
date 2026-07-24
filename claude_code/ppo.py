@@ -148,11 +148,19 @@ class IterationStats:
 
 
 class PPOTrainer:
-    def __init__(self, env, config: PPOConfig):
+    def __init__(self, env, config: PPOConfig, bt_opponents=None):
         self.env = env
         self.cfg = config
         torch.manual_seed(config.seed)
         np.random.seed(config.seed)
+
+        # 단일 프로세스 = BT rule 1개(첫 BT 를 slot0/bt_index 0 에 배정). AIP_RULE_XML 은
+        # 이 프로세스 시작 시점(train.py 맨 위 apply_rule_env)에 이미 세팅돼 있어야 한다.
+        self.num_workers = 1
+        self._bt_opponents = list(bt_opponents or [])
+        self._n_bt = len(self._bt_opponents)
+        self._bt_assign = ([(self._bt_opponents[0][0], self._bt_opponents[0][1], 0)]
+                           if self._n_bt else [("", "", 0)])
 
         obs_dim = int(env.observation_space.shape[0])
         act_dim = int(env.action_space.shape[0])
@@ -189,11 +197,13 @@ class PPOTrainer:
         self.obs_rms = RunningMeanStd(shape=(obs_dim,)) if config.normalize_obs else None
 
         # 상태 재구성 (HP 누적) 갱신 함수 (claude_code.my_observation 사용 시)
-        self._reset_recon = self._advance_recon = None
+        self._reset_recon = self._advance_recon = self._push_action = None
         if config.reconstruct_state:
-            from claude_code.my_observation import reset_reconstructor, advance_reconstructor
+            from claude_code.my_observation import (reset_reconstructor, advance_reconstructor,
+                                                    push_action_reconstructor)
             self._reset_recon = reset_reconstructor
             self._advance_recon = advance_reconstructor
+            self._push_action = push_action_reconstructor
             self._reset_recon()
 
         # rollout 가로지르며 유지되는 환경 상태
@@ -249,6 +259,9 @@ class PPOTrainer:
             val_buf[t] = float(value.item())
 
             env_action = discrete_indices_to_continuous(action_np, self.model.num_bins)
+            # action history: env.step 이 next_obs 를 빌드하기 전에 방금 결정한 action 을 push.
+            if self._push_action is not None:
+                self._push_action(env_action)
             next_obs, reward, terminated, truncated, info = self.env.step(env_action)
             done = bool(terminated or truncated)
             # HP 재구성 갱신: 이번 RL-step 결과 state 로 1회 advance (obs 는 step 안에서
@@ -419,33 +432,32 @@ class PPOTrainer:
             self._bt_provider = make_bt_provider(bt_dll, bt_rule)
         return self._bt_provider
 
-    def install_opponent_pool(self, pool_max: int = 5, explore: bool = True,
-                              bt_dll: str = "", bt_rule: str = "") -> None:
-        """opponent pool 초기화. env 의 target provider 를 PoolSelfPlayProvider 로 교체.
+    def install_opponent_pool(self, pool_max, per_worker_weights, explore: bool = True) -> None:
+        """opponent pool 초기화(단일 프로세스 = 워커 1개). BT 는 self._bt_assign[0].
 
-        bt_dll 이 있으면 slot0 = baseline BT(고정, 절대 evict 안 됨), 그 뒤에 현재 정책의
-        frozen deep-copy 1개. 학습 시작 시 1회 호출. 이후 pool_add_current 로 후보 추가.
+        per_worker_weights[0] = 로컬 pool([BT?, snapshot...]) 가중치. 슬롯 규약은 병렬과 동일.
         """
         import copy
         from claude_code.self_play import PoolSelfPlayProvider
         self._pool_max = max(1, int(pool_max))
         self._opp_explore = bool(explore)
+        dll, rule, _bti = self._bt_assign[0]
         provs = []
         self._bt_slots = 0
-        if bt_dll:
-            provs.append(self._get_bt_provider(bt_dll, bt_rule))
+        if dll:
+            provs.append(self._get_bt_provider(dll, rule))
             self._bt_slots = 1
         m = copy.deepcopy(self.model).eval()
         rms = copy.deepcopy(self.obs_rms) if self.obs_rms is not None else None
         provs.append(self._make_opp_provider(m, rms, explore))
-        n = len(provs)
-        self._pool_provider = PoolSelfPlayProvider(provs, [1.0 / n] * n, seed=self.cfg.seed)
+        self._pool_provider = PoolSelfPlayProvider(provs, list(per_worker_weights[0]),
+                                                   seed=self.cfg.seed)
         self.env._target_action_provider = self._pool_provider
 
-    def pool_set_weights(self, weights) -> None:
-        """opponent 샘플링 가중치 갱신(다음 episode reset 부터 적용). EMA 낮을수록 크게."""
+    def pool_set_weights(self, per_worker_weights) -> None:
+        """opponent 샘플링 가중치 갱신(다음 episode reset 부터). per_worker_weights[0] 사용."""
         if getattr(self, "_pool_provider", None) is not None:
-            self._pool_provider.set_weights(weights)
+            self._pool_provider.set_weights(list(per_worker_weights[0]))
 
     def snapshot_current(self) -> dict:
         """현재 정책 weights + obs_rms 통계를 checkpoint 용 dict 로 반환(numpy)."""
@@ -470,21 +482,21 @@ class PPOTrainer:
             rms.count = float(rms_dict["count"])
         return self._make_opp_provider(m, rms, explore)
 
-    def set_opponent_pool(self, entries, weights, pool_max, explore=True,
-                          bt_dll: str = "", bt_rule: str = "") -> None:
-        """checkpoint 의 opponent pool 전체를 그대로 복원(단일 프로세스).
+    def set_opponent_pool(self, entries, per_worker_weights, pool_max, explore=True) -> None:
+        """checkpoint 의 opponent pool 복원(단일 프로세스). BT 는 self._bt_assign[0].
 
-        entries: **snapshot 후보만** [{"state": state_dict(np), "rms": {...}|None}, ...]
-        (오래된→최신). bt_dll 이 있으면 slot0 에 baseline BT 를 넣으므로 weights 는
-        [bt, snapshot...] 길이여야 한다.
+        entries: **snapshot 후보만** [{"state": state_dict(np), "rms": {...}|None}, ...] (오래된→최신).
+        per_worker_weights[0] = 로컬 pool([BT?, snapshot...]) 가중치.
         """
         from claude_code.self_play import PoolSelfPlayProvider
         self._pool_max = max(1, int(pool_max))
         self._opp_explore = bool(explore)
+        dll, rule, _bti = self._bt_assign[0]
+        weights = list(per_worker_weights[0])
         provs = []
         self._bt_slots = 0
-        if bt_dll:
-            provs.append(self._get_bt_provider(bt_dll, bt_rule))
+        if dll:
+            provs.append(self._get_bt_provider(dll, rule))
             self._bt_slots = 1
         provs += [self._make_opp_provider_from(e["state"], e.get("rms"), explore)
                   for e in entries]

@@ -26,7 +26,7 @@ action 선택은 기본이 **stochastic**(학습 때와 동일하게 정책 분�
 baseline BT 상대로 붙이려면 (rule XML 은 자동 선택됨):
   python claude_code/run_local_dogfight.py \
     --ownship-backend rl --ownship-bundle-dir artifacts/models/team01/basic \
-    --target-backend bt --target-bt-dll AIP_DCS_baseline.dll --save-log
+    --target-backend bt --target-bt-dll Lee_BT1.dll --save-log
 """
 from __future__ import annotations
 
@@ -63,11 +63,13 @@ def _resolve_bt_rule(ns) -> str | None:
     rules = {_BT_RULE_DEFAULTS.get(Path(d).name) for d in dlls}
     rules.discard(None)
     if len(rules) > 1:
-        # AIP_RULE_XML 은 프로세스 전역이라 양쪽에 서로 다른 rule 을 줄 수 없다.
+        # AIP_RULE_XML 은 프로세스 전역이라 한 프로세스(=한 게임)에 rule 1개만 로드된다.
+        # DLL 을 따로 복사해도 전부 이 전역 값을 읽으므로 서로 다른 두 BT 는 동시에 못 붙인다.
         raise ValueError(
-            f"ownship/target BT 가 서로 다른 rule XML 을 요구합니다: {sorted(rules)}. "
-            "AIP_RULE_XML 은 프로세스 전역이라 한 번에 하나만 쓸 수 있으니 "
-            "--bt-rule-xml 로 직접 지정하세요."
+            f"ownship/target BT 가 서로 다른 rule 을 요구합니다: {sorted(rules)}.\n"
+            "  한 프로세스 = BT rule 1개(AIP_RULE_XML 전역) 제약 때문에 서로 다른 두 BT 를\n"
+            "  같은 게임에 붙일 수 없습니다(BT vs BT 불가). (--bt-rule-xml 로 강제하면 양쪽이\n"
+            "  같은 rule 로 도는 거울 대결이 됩니다.)"
         )
     return rules.pop() if rules else None
 
@@ -117,7 +119,7 @@ def parse_args():
     p.add_argument("--bt-rule-xml", default="",
                    help="BT DLL 이 읽을 rule XML 경로(환경변수 AIP_RULE_XML 로 전달). "
                         "비우면 DLL 별 기본 rule 을 자동 선택한다 "
-                        "(AIP_DCS_baseline.dll → ./Rule_BaselineCore.xml).")
+                        "(Lee_BT1.dll → ./Lee_BT1.xml).")
     return p.parse_args()
 
 

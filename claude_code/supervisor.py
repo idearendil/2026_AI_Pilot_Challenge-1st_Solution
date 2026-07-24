@@ -113,8 +113,12 @@ def supervise_loop(cmd, heartbeat_path, timeout_s: float = 120.0,
 
 
 def build_child_cmd(entry_file):
-    """현재 argv 에서 --supervise 를 빼고 --auto-resume 를 넣은 자식 실행 커맨드."""
-    child = [a for a in sys.argv[1:] if a != "--supervise"]
+    """현재 argv 에서 supervise 플래그를 빼고 --no-supervise + --auto-resume 를 넣은 자식 커맨드.
+
+    --supervise 가 기본값(True)이어도 자식은 항상 --no-supervise 를 받아 supervisor 를 다시
+    띄우지 않는다(무한 재귀 방지). 자식은 실제 학습을 수행한다."""
+    child = [a for a in sys.argv[1:] if a not in ("--supervise", "--no-supervise")]
+    child.append("--no-supervise")
     if "--auto-resume" not in child:
         child.append("--auto-resume")
     return [sys.executable, str(Path(entry_file).resolve())] + child

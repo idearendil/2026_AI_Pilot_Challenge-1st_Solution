@@ -12,7 +12,7 @@
 예시 (학습 번들 vs baseline BT, 100판):
   python claude_code/power_test.py \
     --ownship-backend rl --ownship-bundle-dir artifacts/models/team01/basic \
-    --target-backend bt --target-bt-dll AIP_DCS_baseline.dll --games 100
+    --target-backend bt --target-bt-dll Lee_BT1.dll --games 100
 
 예시 (번들 A vs 번들 B):
   python claude_code/power_test.py \
@@ -40,7 +40,7 @@ for _p in (ROOT, ROOT / "src"):
 from claude_code.bt_rule import BT_RULE_DEFAULTS, ENV_KEY  # noqa: E402  (leaf 모듈)
 
 _DEF_OWNSHIP_BT = "AIP_DCS_ownship.dll"
-_DEF_TARGET_BT = "AIP_DCS_baseline.dll"
+_DEF_TARGET_BT = "Lee_BT1.dll"   # 기존 baseline. Jeon_BT1.dll / Jeon_BT2.dll 로도 지정 가능
 
 
 def _resolve_bt_rule(ns) -> str | None:
@@ -55,10 +55,15 @@ def _resolve_bt_rule(ns) -> str | None:
     rules = {BT_RULE_DEFAULTS.get(Path(d).name) for d in dlls}
     rules.discard(None)
     if len(rules) > 1:
-        # AIP_RULE_XML 은 프로세스 전역이라 양쪽에 서로 다른 rule 을 줄 수 없다.
+        # AIP_RULE_XML 은 프로세스 전역이라 한 프로세스(=한 게임)에 rule 1개만 로드된다.
+        # DLL 파일을 따로 복사해도 전부 이 전역 값을 읽으므로, 서로 다른 두 BT 를 동시에
+        # 붙일 수 없다(BT vs BT 불가). BT 강도 비교는 공통 상대(RL)에 각 BT 를 따로 붙여서 한다.
         raise ValueError(
-            f"ownship/target BT 가 서로 다른 rule XML 을 요구합니다: {sorted(rules)}. "
-            "--bt-rule-xml 로 하나를 직접 지정하세요."
+            f"ownship/target BT 가 서로 다른 rule 을 요구합니다: {sorted(rules)}.\n"
+            "  한 프로세스 = BT rule 1개(AIP_RULE_XML 전역) 제약 때문에 서로 다른 두 BT 를\n"
+            "  같은 게임에 붙일 수 없습니다(BT vs BT 불가). BT 강도 비교는 '공통 RL 상대 vs\n"
+            "  각 BT' 를 따로 돌려 승률을 비교하세요. (--bt-rule-xml 로 강제 지정하면 양쪽이\n"
+            "  같은 rule 로 도는 거울 대결이 됩니다.)"
         )
     return rules.pop() if rules else None
 
@@ -246,8 +251,8 @@ def parse_args():
     p.add_argument("--ownship-bt-dll", default=_DEF_OWNSHIP_BT)
     p.add_argument("--target-bt-dll", default=_DEF_TARGET_BT)
     p.add_argument("--bt-rule-xml", default="",
-                   help="BT rule XML(기본: DLL 별 자동 선택, AIP_DCS_baseline.dll → "
-                        "./Rule_BaselineCore.xml)")
+                   help="BT rule XML(기본: DLL 별 자동 선택. Lee_BT1.dll/Jeon_BT1.dll/"
+                        "Jeon_BT2.dll → 각 동명 .xml)")
     p.add_argument("--target-bt-mode", choices=["behavior_tree", "provider"],
                    default="behavior_tree",
                    help="target bt 를 부르는 경로. behavior_tree(기본) = env 내장 경로"

@@ -102,12 +102,15 @@ def _make_worker_cls():
             self.obs_rms = RunningMeanStd(shape=(self.obs_dim,)) if self.normalize_obs else None
 
             if self.reconstruct:
-                from claude_code.my_observation import reset_reconstructor, advance_reconstructor
+                from claude_code.my_observation import (reset_reconstructor,
+                                                        advance_reconstructor,
+                                                        push_action_reconstructor)
                 self._reset_recon = reset_reconstructor
                 self._advance_recon = advance_reconstructor
+                self._push_action = push_action_reconstructor
                 self._reset_recon()
             else:
-                self._reset_recon = self._advance_recon = None
+                self._reset_recon = self._advance_recon = self._push_action = None
 
             if self_play:
                 from claude_code.self_play import SelfPlayProvider
@@ -183,14 +186,18 @@ def _make_worker_cls():
             return self._bt_provider
 
         def pool_init(self, state_dict, mean, var, count, weights, pool_max, seed,
-                      bt_dll="", bt_rule=""):
+                      bt_dll="", bt_rule="", bt_index=0, n_bt=0):
             """opponent pool 초기화. target provider 를 pool 로 교체.
 
-            bt_dll 이 있으면 slot0 = baseline BT(고정, 절대 evict 안 됨), 그 뒤에
-            초기 정책 snapshot 1개. 없으면 초기 정책 1개만.
+            이 워커의 **로컬** pool = [이 워커에 배정된 BT 1개(있으면)] + [snapshot...].
+            bt_index = 이 BT 의 **글로벌** 슬롯(0..n_bt-1), n_bt = 전체 BT 수(글로벌).
+            로컬 슬롯(0=BT, 1+=snapshot)을 글로벌 슬롯으로 매핑해 driver 가 BT별 EMA 를
+            분리 집계한다. bt_dll 이 있으면 로컬 slot0=BT(고정, 절대 evict 안 됨).
             """
             from claude_code.self_play import PoolSelfPlayProvider
             self._pool_max = max(1, int(pool_max))
+            self._bt_index = int(bt_index)
+            self._n_bt = int(n_bt)
             provs = []
             self._bt_slots = 0
             if bt_dll:
@@ -227,14 +234,16 @@ def _make_worker_cls():
                 self._pool_provider.set_weights(weights)
 
         def pool_set_all(self, state_dicts, means, vars_, counts, weights, pool_max, seed,
-                         bt_dll="", bt_rule=""):
-            """checkpoint 의 opponent pool 전체를 복원(worker).
+                         bt_dll="", bt_rule="", bt_index=0, n_bt=0):
+            """checkpoint 의 opponent pool 을 이 워커의 로컬 pool 로 복원.
 
-            state_dicts 는 **snapshot 후보만** 오래된→최신. bt_dll 이 있으면 그 앞
-            slot0 에 baseline BT 를 넣어 driver 측 pool 인덱스와 정확히 일치시킨다.
+            state_dicts 는 **snapshot 후보만** 오래된→최신. bt_dll 이 있으면 이 워커에
+            배정된 BT 1개를 로컬 slot0 에 넣는다. bt_index/n_bt 는 글로벌 매핑용.
             """
             from claude_code.self_play import PoolSelfPlayProvider
             self._pool_max = max(1, int(pool_max))
+            self._bt_index = int(bt_index)
+            self._n_bt = int(n_bt)
             provs = []
             self._bt_slots = 0
             if bt_dll:
@@ -278,6 +287,10 @@ def _make_worker_cls():
                 val_buf[t] = float(v.item())
 
                 env_action = discrete_indices_to_continuous(a_np, self.model.num_bins)
+                # action history: env.step 이 next_obs 를 빌드하기 **전에** 방금 결정한
+                # action 을 reconstructor 에 넣어, next_obs 가 이 action 을 포함하게 한다.
+                if self._push_action is not None:
+                    self._push_action(env_action)
                 next_obs, reward, term, trunc, info = self.env.step(env_action)
                 done = bool(term or trunc)
                 if self._advance_recon is not None:
@@ -297,7 +310,15 @@ def _make_worker_cls():
                     if oc is not None:
                         ep_outcomes.append(oc)
                         prov = getattr(self.env, "_target_action_provider", None)
-                        ep_opp_indices.append(int(getattr(prov, "last_index", 0)))
+                        local = int(getattr(prov, "last_index", 0))
+                        # 로컬 슬롯(0=이 워커 BT, 1+=snapshot) → 글로벌 슬롯 매핑.
+                        # BT: 글로벌 bt_index. snapshot: n_bt + (로컬 snapshot 순번).
+                        bt_slots = int(getattr(self, "_bt_slots", 0))
+                        if bt_slots and local < bt_slots:
+                            gidx = int(getattr(self, "_bt_index", 0))
+                        else:
+                            gidx = int(getattr(self, "_n_bt", 0)) + (local - bt_slots)
+                        ep_opp_indices.append(gidx)
                     self._ep_return = 0.0
                     self._ep_len = 0
                     if self._reset_recon is not None:
@@ -367,13 +388,25 @@ class ParallelPPOTrainer:
     """Ray worker 들로 rollout 을 병렬 수집하고, driver 에서 PPO update(=PPOTrainer.update)."""
 
     def __init__(self, env_kwargs, config: PPOConfig, num_workers: int,
-                 self_play: bool, obs_dim: int, act_dim: int):
+                 self_play: bool, obs_dim: int, act_dim: int,
+                 bt_opponents=None):
         import ray
         self.cfg = config
         self.num_workers = max(1, int(num_workers))
         self.obs_dim = obs_dim
         self.act_dim = act_dim
         self.global_step = 0
+        # opponent pool 에 넣을 BT 목록 [(dll, rule), ...]. 워커를 여기에 round-robin 배정한다.
+        # 한 프로세스 = BT rule 1개 제약 때문에, 워커별로 다른 BT 를 고정 배정하고 그 rule 을
+        # 워커 프로세스 시작 시점(runtime_env)에 AIP_RULE_XML 로 주입한다(claude_code.bt_rule).
+        self._bt_opponents = list(bt_opponents or [])
+        self._n_bt = len(self._bt_opponents)
+        # 워커 w 의 배정: (bt_dll, bt_rule, bt_index=글로벌 BT 슬롯). n_bt=0 이면 BT 없음.
+        self._bt_assign = [
+            (self._bt_opponents[i % self._n_bt][0], self._bt_opponents[i % self._n_bt][1],
+             i % self._n_bt) if self._n_bt else ("", "", 0)
+            for i in range(self.num_workers)
+        ]
 
         torch.manual_seed(config.seed)
         np.random.seed(config.seed)
@@ -397,26 +430,34 @@ class ParallelPPOTrainer:
                         normalize_obs=config.normalize_obs,
                         reconstruct_state=config.reconstruct_state)
 
+        pythonpath = os.pathsep.join(
+            [str(ROOT), str(ROOT / "src"), os.environ.get("PYTHONPATH", "")])
         if not ray.is_initialized():
-            pythonpath = os.pathsep.join(
-                [str(ROOT), str(ROOT / "src"), os.environ.get("PYTHONPATH", "")])
-            env_vars = {"PYTHONPATH": pythonpath}
-            # BT rule XML 은 worker **프로세스 시작 시점**에 들어가 있어야 한다. worker 안에서
-            # os.environ 을 바꾸면 JSBSimAIPLib.dll 이 이미 로드된 뒤라 무시되고, BT 가
-            # Task_Empty(=직진만 하는 표적)로 돌아간다(claude_code.bt_rule 참고).
-            rule = os.environ.get(BT_RULE_ENV_KEY, "")
-            if rule:
-                env_vars[BT_RULE_ENV_KEY] = rule
+            # job-level 에는 PYTHONPATH 만. AIP_RULE_XML 은 **워커별로** 주입한다(아래).
             ray.init(num_cpus=self.num_workers, include_dashboard=False,
                      ignore_reinit_error=True, log_to_driver=False,
-                     runtime_env={"env_vars": env_vars})
+                     runtime_env={"env_vars": {"PYTHONPATH": pythonpath}})
         WorkerCls = _make_worker_cls()
-        self.workers = [
-            WorkerCls.remote(i, env_kwargs, model_kwargs, cfg_dict, self_play,
-                             config.seed + 1 + i)
-            for i in range(self.num_workers)
-        ]
-        print(f"[claude_code/PPO] Ray 병렬 수집: workers={self.num_workers} (물리 코어 기준)")
+        # 워커마다 자기 BT rule 을 AIP_RULE_XML 로 주입(프로세스 시작 시점 = JSBSim 로드 전).
+        # BT rule XML 은 worker 프로세스 시작 시점에 들어가 있어야 한다. worker 안에서
+        # os.environ 을 바꾸면 JSBSimAIPLib.dll 이 이미 로드된 뒤라 무시된다(claude_code.bt_rule).
+        self.workers = []
+        for i in range(self.num_workers):
+            _dll, _rule, _bti = self._bt_assign[i]
+            evars = {"PYTHONPATH": pythonpath}
+            if _rule:
+                evars[BT_RULE_ENV_KEY] = _rule
+            self.workers.append(
+                WorkerCls.options(runtime_env={"env_vars": evars}).remote(
+                    i, env_kwargs, model_kwargs, cfg_dict, self_play, config.seed + 1 + i))
+        if self._n_bt:
+            groups = {}
+            for i, (_d, _r, _b) in enumerate(self._bt_assign):
+                groups.setdefault(_d, []).append(i)
+            print(f"[claude_code/PPO] Ray 병렬 수집: workers={self.num_workers}, "
+                  f"BT {self._n_bt}종 워커 분할 " + ", ".join(f"{d}:{ws}" for d, ws in groups.items()))
+        else:
+            print(f"[claude_code/PPO] Ray 병렬 수집: workers={self.num_workers} (BT 없음)")
 
     def _broadcast(self):
         import ray
@@ -501,23 +542,21 @@ class ParallelPPOTrainer:
         count = self.obs_rms.count if self.obs_rms is not None else 0.0
         return state, mean, var, count
 
-    def install_opponent_pool(self, pool_max: int = 5, bt_dll: str = "",
-                              bt_rule: str = "") -> None:
+    def install_opponent_pool(self, pool_max, per_worker_weights) -> None:
         """모든 worker 의 opponent pool 초기화. broadcast.
 
-        bt_dll 이 있으면 slot0 = baseline BT(고정), slot1 = 현재 정책. 없으면 현재 정책만.
-        학습 시작 시 1회 호출. worker 별로 다른 seed 를 줘서 opponent 샘플 순서가
-        분산되게 한다(pool 다양성).
+        각 워커는 자기에 배정된 BT 1개(self._bt_assign) + 현재 정책 snapshot 1개로 시작한다.
+        per_worker_weights[i] = 워커 i 의 로컬 pool([그 워커 BT, snapshot...]) 샘플 가중치.
         """
         import ray
         self._pool_max = max(1, int(pool_max))
         state, mean, var, count = self._current_state_rms()
-        n = 2 if bt_dll else 1
         ref = ray.put(state)
         ray.get([
-            w.pool_init.remote(ref, mean, var, count, [1.0 / n] * n, self._pool_max,
-                               self.cfg.seed + 101 + i, bt_dll, bt_rule)
-            for i, w in enumerate(self.workers)
+            w.pool_init.remote(ref, mean, var, count, list(per_worker_weights[i]),
+                               self._pool_max, self.cfg.seed + 101 + i,
+                               dll, rule, bti, self._n_bt)
+            for i, (w, (dll, rule, bti)) in enumerate(zip(self.workers, self._bt_assign))
         ])
 
     def pool_add_current(self) -> None:
@@ -527,11 +566,11 @@ class ParallelPPOTrainer:
         ref = ray.put(state)
         ray.get([w.pool_add.remote(ref, mean, var, count) for w in self.workers])
 
-    def pool_set_weights(self, weights) -> None:
-        """모든 worker 의 opponent 샘플링 가중치 갱신(broadcast)."""
+    def pool_set_weights(self, per_worker_weights) -> None:
+        """워커별 opponent 샘플링 가중치 갱신(broadcast). per_worker_weights[i] = 워커 i 로컬 가중치."""
         import ray
-        wl = list(weights)
-        ray.get([w.pool_set_weights.remote(wl) for w in self.workers])
+        ray.get([w.pool_set_weights.remote(list(per_worker_weights[i]))
+                 for i, w in enumerate(self.workers)])
 
     def snapshot_current(self) -> dict:
         """현재 정책 weights + obs_rms 통계를 checkpoint 용 dict 로 반환(numpy)."""
@@ -543,12 +582,11 @@ class ParallelPPOTrainer:
         }
         return {"state": state, "rms": rms}
 
-    def set_opponent_pool(self, entries, weights, pool_max, bt_dll: str = "",
-                          bt_rule: str = "") -> None:
-        """checkpoint 의 opponent pool 전체를 모든 worker 에 복원(broadcast).
+    def set_opponent_pool(self, entries, per_worker_weights, pool_max) -> None:
+        """checkpoint 의 opponent pool(snapshot 후보들)을 모든 worker 에 복원(broadcast).
 
-        entries 는 **snapshot 후보만**(오래된→최신). bt_dll 이 있으면 worker 가 slot0 에
-        baseline BT 를 넣으므로 weights 는 [bt, snapshot...] 길이여야 한다.
+        entries 는 **snapshot 후보만**(오래된→최신). 각 워커는 자기 BT(self._bt_assign) +
+        이 snapshot 들로 로컬 pool 을 만든다. per_worker_weights[i] = 워커 i 로컬 가중치.
         """
         import ray
         self._pool_max = max(1, int(pool_max))
@@ -557,11 +595,11 @@ class ParallelPPOTrainer:
         vars_ = [(e["rms"]["var"] if e.get("rms") else None) for e in entries]
         counts = [(e["rms"]["count"] if e.get("rms") else 0.0) for e in entries]
         sref = ray.put(states)
-        wl = list(weights)
         ray.get([
-            w.pool_set_all.remote(sref, means, vars_, counts, wl, self._pool_max,
-                                  self.cfg.seed + 101 + i, bt_dll, bt_rule)
-            for i, w in enumerate(self.workers)
+            w.pool_set_all.remote(sref, means, vars_, counts, list(per_worker_weights[i]),
+                                  self._pool_max, self.cfg.seed + 101 + i,
+                                  dll, rule, bti, self._n_bt)
+            for i, (w, (dll, rule, bti)) in enumerate(zip(self.workers, self._bt_assign))
         ])
 
     def train(self, on_iteration=None, start_iteration: int = 1):
