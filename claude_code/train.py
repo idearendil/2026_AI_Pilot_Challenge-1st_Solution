@@ -390,7 +390,8 @@ def main():
                     "lr": args.lr, "gamma": args.gamma, "gae_lambda": args.gae_lambda,
                     "clip_coef": args.clip_coef, "update_epochs": args.update_epochs,
                     "minibatch_size": args.minibatch_size, "ent_coef": args.ent_coef,
-                    "critic_epochs": critic_epochs_cfg, "target_kl": args.target_kl,
+                    "critic_epochs": (args.critic_epochs if args.critic_epochs is not None
+                         else args.update_epochs), "target_kl": args.target_kl,
                     "hidden": args.hidden, "activation": args.activation,
                     "action_bins": args.action_bins, "num_workers": args.num_workers,
                     "self_play": bool(args.self_play), "target_mode": args.target_mode,
