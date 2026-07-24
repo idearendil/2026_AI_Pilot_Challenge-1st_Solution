@@ -110,10 +110,9 @@ def parse_args():
     p.add_argument("--gamma", type=float, default=0.99)
     p.add_argument("--gae-lambda", type=float, default=0.95)
     p.add_argument("--clip-coef", type=float, default=0.2)
-    p.add_argument("--update-epochs", type=int, default=4)
+    p.add_argument("--update-epochs", type=int, default=5)
     p.add_argument("--minibatch-size", type=int, default=512)
     p.add_argument("--ent-coef", type=float, default=0.00005)
-    p.add_argument("--vf-coef", type=float, default=0.5)
     p.add_argument("--target-kl", type=float, default=0.05)
     p.add_argument("--hidden", default="512,512,512", help="actor hidden 크기, 예: 256,256")
     p.add_argument("--activation", default="tanh", choices=["tanh", "relu", "elu"])
@@ -127,6 +126,10 @@ def parse_args():
                    help="critic 전용 활성화 (비우면 actor 와 동일)")
     p.add_argument("--critic-lr", type=float, default=None,
                    help="critic 전용 학습률 (비우면 actor lr 공유)")
+    p.add_argument("--critic-epochs", type=int, default=None,
+                   help="critic 전용 update epoch 수 (비우면 --update-epochs 와 동일). "
+                        "critic 루프는 actor 루프와 분리돼 있어 --target-kl 조기 종료의 "
+                        "영향을 받지 않고 항상 이 횟수만큼 돈다.")
     p.add_argument("--no-normalize-obs", action="store_true", help="관측 정규화 끄기")
     # 기본값으로 claude_code 의 my_reward / my_observation 을 사용한다.
     # 프레임워크 기본 보상/관측을 쓰려면 빈 문자열을 넘긴다: --reward-module "" --observation-module ""
@@ -261,7 +264,6 @@ def main():
         minibatch_size=args.minibatch_size,
         lr=args.lr,
         ent_coef=args.ent_coef,
-        vf_coef=args.vf_coef,
         target_kl=args.target_kl,
         hidden=hidden,
         activation=args.activation,
@@ -270,6 +272,7 @@ def main():
         critic_hidden=critic_hidden,
         critic_activation=critic_activation,
         critic_lr=args.critic_lr,
+        critic_epochs=args.critic_epochs,
         normalize_obs=not args.no_normalize_obs,
         reconstruct_state=(args.observation_module == "claude_code.my_observation"),
         seed=args.seed,
@@ -329,7 +332,7 @@ def main():
                     "lr": args.lr, "gamma": args.gamma, "gae_lambda": args.gae_lambda,
                     "clip_coef": args.clip_coef, "update_epochs": args.update_epochs,
                     "minibatch_size": args.minibatch_size, "ent_coef": args.ent_coef,
-                    "vf_coef": args.vf_coef, "target_kl": args.target_kl,
+                    "critic_epochs": critic_epochs_cfg, "target_kl": args.target_kl,
                     "hidden": args.hidden, "activation": args.activation,
                     "action_bins": args.action_bins, "num_workers": args.num_workers,
                     "self_play": bool(args.self_play), "target_mode": args.target_mode,
@@ -520,6 +523,10 @@ def main():
         best["iter"] = s.iteration
         best["saved"] = True
 
+    # critic 전용 epoch 수(미지정이면 actor 와 동일). 로깅/출력에 쓴다.
+    critic_epochs_cfg = (args.critic_epochs if args.critic_epochs is not None
+                         else args.update_epochs)
+
     log_dir = Path(args.artifacts_dir) / "logs" / args.output_name / args.output_tag
     log_dir.mkdir(parents=True, exist_ok=True)
     log_path = log_dir / "ppo_training_log.csv"
@@ -536,8 +543,8 @@ def main():
             "ema_mean", "ema_min", "pool_size", "opp_added", "altitude_term",
             # baseline BT 후보 전용 지표(BT 미사용이면 nan/0). 기존 CSV 와의 호환을 위해 맨 뒤.
             "ema_bt", "bt_win_rate", "bt_games",
-            # 이번 iter 의 PPO update 가 실제로 돈 epoch 수 / target_kl 조기종료 여부.
-            "update_epochs", "update_early_stop",
+            # 이번 iter 의 PPO update 가 실제로 돈 epoch 수 / actor 의 target_kl 조기종료 여부.
+            "update_epochs", "critic_epochs", "update_early_stop",
         ])
 
     # 마지막으로 완료한 iteration 추적(학습 종료 시 최종 checkpoint 저장에 사용).
@@ -557,10 +564,11 @@ def main():
         raw_wr = (wins / decided) if decided > 0 else float("nan")
         # 이번 iter 에서 우리 기체 고도 하락으로 종료된 episode 수.
         alt_term = int(s.extra.get("alt_term", 0))
-        # 이번 iter 의 PPO update 가 실제로 돈 epoch 수(설정값 = args.update_epochs).
-        # actor/critic 은 같은 루프·같은 backward 로 갱신되므로 두 네트워크가 항상 동일하다.
-        # early_stop=1 이면 approx_kl > target_kl 로 남은 epoch 을 건너뛴 것이다.
+        # 이번 iter 의 PPO update 가 실제로 돈 epoch 수. actor/critic 루프가 분리돼 있어
+        # 두 값이 다를 수 있다: early_stop=1 이면 actor 만 approx_kl > target_kl 로 남은
+        # epoch 을 건너뛴 것이고, critic 은 항상 critic_epochs_config 만큼 다 돈다.
         upd_epochs = int(s.extra.get("update_epochs", 0))
+        crt_epochs = int(s.extra.get("critic_epochs", 0))
         upd_early = int(s.extra.get("update_early_stop", 0))
 
         # opponent 별 EMA 갱신 + 조건부 pool 추가. 우리팀·opponent 모두 stochastic rollout.
@@ -611,7 +619,7 @@ def main():
             wins, losses, draws, f"{raw_wr:.4f}",
             f"{ema_mean:.4f}", f"{ema_min:.4f}", len(pool), int(added), alt_term,
             f"{ema_bt:.4f}", f"{bt_wr:.4f}", bt_games,
-            upd_epochs, upd_early,
+            upd_epochs, crt_epochs, upd_early,
         ])
         log_file.flush()
 
@@ -648,14 +656,15 @@ def main():
                     "policy/entropy": s.entropy,          # 현재 정책 entropy
                     "metrics/approx_kl": s.approx_kl,
                     "metrics/explained_variance": s.explained_variance,
-                    # 실제로 돈 update epoch 수(설정 상한 = update_epochs_config).
-                    # actor/critic 이 같은 루프에서 갱신되므로 두 값은 항상 같다.
-                    "update/epochs_run": upd_epochs,
+                    # 실제로 돈 update epoch 수. actor 루프만 target_kl 로 조기 종료되고
+                    # critic 루프는 분리돼 있어 항상 critic_epochs_config 만큼 다 돈다.
                     "update/actor_epochs": upd_epochs,
-                    "update/critic_epochs": upd_epochs,
-                    "update/epochs_config": int(args.update_epochs),
-                    "update/epochs_frac": (upd_epochs / args.update_epochs
-                                           if args.update_epochs else float("nan")),
+                    "update/critic_epochs": crt_epochs,
+                    "update/epochs_run": upd_epochs,      # 하위 호환(= actor_epochs)
+                    "update/actor_epochs_config": int(args.update_epochs),
+                    "update/critic_epochs_config": int(critic_epochs_cfg),
+                    "update/actor_epochs_frac": (upd_epochs / args.update_epochs
+                                                 if args.update_epochs else float("nan")),
                     "update/kl_early_stop": upd_early,
                     "selfplay/raw_win_rate": raw_wr,
                     "selfplay/ema_mean": ema_mean,
@@ -699,7 +708,8 @@ def main():
             f"return {s.mean_return:8.3f} | len {s.mean_length:6.1f} | "
             f"damage {damage:6.3f} | shaping {shaping:7.3f} | "
             f"ent {s.entropy:6.3f} | kl {s.approx_kl:.4f} | ev {s.explained_variance:6.3f} | "
-            f"ep {upd_epochs}/{args.update_epochs}{'*' if upd_early else ''} | "
+            f"ep a{upd_epochs}/{args.update_epochs}{'*' if upd_early else ''} "
+            f"c{crt_epochs}/{critic_epochs_cfg} | "
             f"altT {alt_term}"
             f"{sp_msg}",
             flush=True,

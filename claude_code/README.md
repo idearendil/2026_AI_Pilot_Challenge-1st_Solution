@@ -89,6 +89,7 @@ python tools/web_log_viewer.py --logdir logs --port 7870
 | `--activation` | tanh | 활성화(`tanh`/`relu`/`elu`) |
 | `--action-bins` | 7 | 행동 채널당 이산 카테고리 수(균등 분할) |
 | `--critic-hidden` / `--critic-activation` / `--critic-lr` | (actor 와 동일) | critic 전용 구조·학습률(별개 네트워크) |
+| `--critic-epochs` | (`--update-epochs` 와 동일) | critic 전용 epoch 수. **critic 루프는 actor 루프와 분리**돼 `--target-kl` 조기 종료의 영향을 받지 않는다 |
 | `--num-workers` | 물리 코어 수 | Ray 병렬 worker 수. 1 이면 단일 프로세스 |
 | `--device` | cpu | driver update 디바이스(큰 모델은 `cuda`, worker 는 항상 CPU) |
 | `--no-normalize-obs` | (off) | 관측 정규화 끄기 |
@@ -191,14 +192,13 @@ python tools/web_log_viewer.py --logdir logs --port 7870
 - `damage` / `dist` / `aim` : 보상 성분별 평균(어느 신호로 배우는지 확인)
 - `ent` : 정책 엔트로피(탐험 정도), `kl` : approx_kl(trust region)
 - `ev` : value function explained variance(가치함수 학습 지표; 보상이 희소하면 낮음)
-- `ep N/M` : 이번 iter 의 PPO update 가 **실제로 돈 epoch 수 N** / 설정 상한 `M=--update-epochs`.
-  뒤에 `*` 가 붙으면 `approx_kl > --target-kl` 로 **조기 종료**된 것이다.
-  CSV 컬럼은 `update_epochs` / `update_early_stop`, wandb 는 `update/epochs_run`,
-  `update/epochs_frac`, `update/kl_early_stop` (+ `update/actor_epochs`,
-  `update/critic_epochs`).
-  > ⚠️ actor 와 critic 은 **같은 epoch 루프에서 같은 backward** 로 갱신되므로(`ppo.py`
-  > `update()`), 두 네트워크의 epoch 수는 **항상 같다**. 즉 KL 조기 종료가 걸리면 critic
-  > 학습도 함께 잘린다.
+- `ep aN/M cK/L` : 이번 iter 의 update 가 실제로 돈 epoch 수. `a`=actor(`N`/상한 `M=--update-epochs`),
+  `c`=critic(`K`/상한 `L=--critic-epochs`, 미지정이면 `M`). actor 쪽 `*` 는
+  `approx_kl > --target-kl` 로 **조기 종료**됐다는 뜻이다.
+  **actor 와 critic 은 별도 루프**라 critic 은 KL 조기 종료와 무관하게 항상 `L` 번 다 돈다.
+  CSV 컬럼 `update_epochs`(actor) / `critic_epochs` / `update_early_stop`,
+  wandb `update/actor_epochs`, `update/critic_epochs`, `update/actor_epochs_frac`,
+  `update/kl_early_stop`.
 - `EVAL vs iterN` : `--eval-interval` 마다 **탐험 끈 결정론적 정책**으로 N iter 전 self 와 대결한 승률/전적. **승률>0.5 면 best 번들로 저장**.
 
 ---
@@ -217,7 +217,10 @@ python tools/web_log_viewer.py --logdir logs --port 7870
 - HP-tiebreak 는 보상이 아니라 **평가 판정**에서만
 
 **학습 구조**
-- 순수 PyTorch PPO(GAE + clipped surrogate), **actor/critic 완전 분리**(별 네트워크·별 optimizer)
+- 순수 PyTorch PPO(GAE + clipped surrogate), **actor/critic 완전 분리**
+  (별 네트워크·별 optimizer·**별 update 루프**). `--target-kl` 조기 종료는 actor 에만 적용되고
+  critic 은 `--critic-epochs` 만큼 항상 다 돈다(가치 회귀 타깃은 rollout 시점에 고정돼 있어
+  정책의 trust region 과 무관하기 때문).
 - **이산 정책**(채널별 Categorical, 7 bins) — 연속 가우시안 대비 안정적 탐험
 - 관측 running mean/std 정규화(통계 번들 저장 → 추론 동일 적용), per-minibatch advantage 정규화, approx_kl 조기 종료
 - **Ray 병렬 rollout**(worker=물리 코어 수, driver 가 weights/obs_rms broadcast)

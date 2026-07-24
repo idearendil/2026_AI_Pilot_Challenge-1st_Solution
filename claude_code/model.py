@@ -106,6 +106,16 @@ class MLPActorCritic(nn.Module):
     def get_value(self, obs: torch.Tensor) -> torch.Tensor:
         return self.critic(obs).squeeze(-1)
 
+    def evaluate_actions(self, obs: torch.Tensor, action: torch.Tensor):
+        """**actor 전용** forward: critic 을 태우지 않고 (log_prob, entropy) 만 계산한다.
+
+        actor/critic 업데이트 루프가 분리돼 있어(ppo.py `update()`), actor 루프에서
+        불필요한 critic forward/grad 를 만들지 않기 위한 경로다.
+        """
+        mean = self.actor_mean(obs)
+        dist = self._dist(mean)
+        return dist.log_prob(action).sum(-1), dist.entropy().sum(-1)
+
     def get_action_and_value(self, obs: torch.Tensor, action: torch.Tensor | None = None):
         """샘플(or 평가)된 action, log_prob, entropy, value 반환."""
         mean, value = self.forward(obs)
@@ -192,6 +202,16 @@ class MLPDiscreteActorCritic(nn.Module):
 
     def get_value(self, obs: torch.Tensor) -> torch.Tensor:
         return self.critic(obs).squeeze(-1)
+
+    def evaluate_actions(self, obs: torch.Tensor, action: torch.Tensor):
+        """**actor 전용** forward: critic 을 태우지 않고 (log_prob, entropy) 만 계산한다.
+
+        actor/critic 업데이트 루프가 분리돼 있어(ppo.py `update()`), actor 루프에서
+        불필요한 critic forward/grad 를 만들지 않기 위한 경로다. action 은 카테고리 index.
+        """
+        dist = self._dist(obs)
+        action = action.long()
+        return dist.log_prob(action).sum(-1), dist.entropy().sum(-1)
 
     def get_action_and_value(self, obs: torch.Tensor, action: torch.Tensor | None = None):
         """샘플(or 평가)된 카테고리 index, 합산 log_prob, 합산 entropy, value 반환.

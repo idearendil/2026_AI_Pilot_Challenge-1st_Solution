@@ -583,6 +583,7 @@ class ParallelPPOTrainer:
             comp_means["per_opp"] = _outcome_counts_by_opp(ep_opp_indices, ep_outcomes)
             comp_means["alt_term"] = _count_altitude_terms(ep_end_conditions)
             comp_means["update_epochs"] = int(self.last_update_epochs)
+            comp_means["critic_epochs"] = int(self.last_critic_epochs)
             comp_means["update_early_stop"] = int(self.last_update_early_stop)
             stats = IterationStats(
                 iteration=it, global_step=self.global_step, mean_return=mean_ret,

@@ -112,7 +112,6 @@ class PPOConfig:
     minibatch_size: int = 256
     lr: float = 3e-4
     ent_coef: float = 0.0
-    vf_coef: float = 0.5
     max_grad_norm: float = 0.5
     target_kl: Optional[float] = 0.05   # 초과 시 epoch 조기 종료 (None 이면 비활성)
     hidden: tuple = (256, 256)
@@ -123,6 +122,9 @@ class PPOConfig:
     critic_hidden: Optional[tuple] = None
     critic_activation: Optional[str] = None
     critic_lr: Optional[float] = None
+    # critic 전용 epoch 수 (None = update_epochs 와 동일). critic 루프는 actor 루프와
+    # 분리돼 있어 target_kl 조기 종료의 영향을 받지 않고 항상 이 횟수만큼 돈다.
+    critic_epochs: Optional[int] = None
     normalize_obs: bool = True          # 관측 running mean/std 정규화
     reconstruct_state: bool = False     # claude_code.my_observation HP 재구성 갱신
     seed: int = 0
@@ -172,8 +174,9 @@ class PPOTrainer:
         self.act_dim = act_dim
         self.global_step = 0
         # 직전 update() 가 실제로 돈 epoch 수와 target_kl 조기종료 여부(로깅용).
-        # actor/critic 은 같은 루프에서 함께 갱신되므로 이 값은 양쪽에 동일하게 적용된다.
-        self.last_update_epochs = 0
+        # actor/critic 루프가 분리돼 있어 두 값이 다를 수 있다(actor 만 KL 로 조기 종료됨).
+        self.last_update_epochs = 0        # actor
+        self.last_critic_epochs = 0        # critic
         self.last_update_early_stop = False
         # 재개(resume)/pool 후보 재생성 시 동일 구조로 모델을 만들기 위한 kwargs.
         self._model_kwargs = dict(
@@ -321,17 +324,18 @@ class PPOTrainer:
 
         clip = cfg.clip_coef
         last_pl = last_vl = last_ent = last_kl = 0.0
-        epochs_done = 0
+
+        # ── (1) actor 루프 ────────────────────────────────────────────────────
+        # critic 을 태우지 않고 정책만 갱신한다. approx_kl > target_kl 이면 조기 종료.
+        actor_epochs = 0
         early_stop = False
         for epoch in range(cfg.update_epochs):
             np.random.shuffle(idx)
             approx_kls = []
             for start in range(0, T, cfg.minibatch_size):
                 mb = idx[start:start + cfg.minibatch_size]
-                mb_obs = batch["obs"][mb]
-                mb_act = batch["actions"][mb]
-
-                _, new_logp, entropy, new_value = self.model.get_action_and_value(mb_obs, mb_act)
+                new_logp, entropy = self.model.evaluate_actions(
+                    batch["obs"][mb], batch["actions"][mb])
                 log_ratio = new_logp - old_logp[mb]
                 ratio = log_ratio.exp()
 
@@ -342,38 +346,52 @@ class PPOTrainer:
                 pg_loss2 = -mb_adv * torch.clamp(ratio, 1 - clip, 1 + clip)
                 policy_loss = torch.max(pg_loss1, pg_loss2).mean()
 
-                # value loss (clip 없이 단순 MSE — value 가 큰 오차를 빠르게 따라가도록)
-                value_loss = 0.5 * ((new_value - returns[mb]) ** 2).mean()
-
                 entropy_loss = entropy.mean()
-                # actor / critic 손실을 분리해 각자의 optimizer 로 독립 업데이트.
                 actor_loss = policy_loss - cfg.ent_coef * entropy_loss
-                critic_loss = cfg.vf_coef * value_loss
 
                 self.actor_opt.zero_grad()
-                self.critic_opt.zero_grad()
-                (actor_loss + critic_loss).backward()   # 파라미터가 분리돼 각 net 에만 grad
+                actor_loss.backward()
                 nn.utils.clip_grad_norm_(self.model.actor_parameters(), cfg.max_grad_norm)
-                nn.utils.clip_grad_norm_(self.model.critic_parameters(), cfg.max_grad_norm)
                 self.actor_opt.step()
-                self.critic_opt.step()
 
                 with torch.no_grad():
                     approx_kls.append(((ratio - 1) - log_ratio).mean().item())
 
                 last_pl = float(policy_loss.item())
-                last_vl = float(value_loss.item())
                 last_ent = float(entropy_loss.item())
 
-            epochs_done = epoch + 1
+            actor_epochs = epoch + 1
             last_kl = float(np.mean(approx_kls)) if approx_kls else 0.0
             if cfg.target_kl is not None and last_kl > cfg.target_kl:
                 early_stop = True
                 break
 
-        # 실제로 돈 epoch 수 / 조기종료 여부(로깅용). actor·critic 은 같은 루프에서 같은
-        # backward 로 갱신되므로 두 네트워크의 epoch 수는 항상 이 값으로 동일하다.
-        self.last_update_epochs = epochs_done
+        # ── (2) critic 루프 (actor 와 완전히 분리) ────────────────────────────
+        # actor 가 KL 로 조기 종료돼도 critic 은 항상 n_critic epoch 을 다 돈다.
+        # 가치 회귀 타깃(returns)은 rollout 시점에 고정돼 있어 정책 갱신과 무관하므로
+        # trust region 을 공유할 이유가 없다. critic 이 덜 학습되면 다음 iteration 의
+        # advantage 추정이 나빠져 actor 까지 함께 느려지는 문제를 없앤다.
+        n_critic = cfg.critic_epochs if cfg.critic_epochs is not None else cfg.update_epochs
+        critic_epochs = 0
+        for epoch in range(int(n_critic)):
+            np.random.shuffle(idx)
+            for start in range(0, T, cfg.minibatch_size):
+                mb = idx[start:start + cfg.minibatch_size]
+                new_value = self.model.get_value(batch["obs"][mb])
+                # value loss (clip 없이 단순 MSE — value 가 큰 오차를 빠르게 따라가도록)
+                value_loss = 0.5 * ((new_value - returns[mb]) ** 2).mean()
+
+                self.critic_opt.zero_grad()
+                value_loss.backward()
+                nn.utils.clip_grad_norm_(self.model.critic_parameters(), cfg.max_grad_norm)
+                self.critic_opt.step()
+
+                last_vl = float(value_loss.item())
+            critic_epochs = epoch + 1
+
+        # 실제로 돈 epoch 수 / actor 조기종료 여부 (로깅용).
+        self.last_update_epochs = actor_epochs
+        self.last_critic_epochs = critic_epochs
         self.last_update_early_stop = early_stop
 
         # explained variance
@@ -566,6 +584,7 @@ class PPOTrainer:
             comp_means["per_opp"] = _outcome_counts_by_opp(ep_opp_indices, ep_outcomes)
             comp_means["alt_term"] = _count_altitude_terms(ep_end_conditions)
             comp_means["update_epochs"] = int(self.last_update_epochs)
+            comp_means["critic_epochs"] = int(self.last_critic_epochs)
             comp_means["update_early_stop"] = int(self.last_update_early_stop)
             stats = IterationStats(
                 iteration=it,
