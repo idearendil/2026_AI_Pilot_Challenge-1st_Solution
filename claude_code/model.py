@@ -257,6 +257,80 @@ def make_actor_critic(
         critic_hidden=critic_hidden, critic_activation=critic_activation)
 
 
+class MLPDiscreteActor(nn.Module):
+    """가치망 없는 **정책 전용** factorized categorical actor (REDQ/discrete SAC 용).
+
+    MLPDiscreteActorCritic 과 동일한 정책 구조(채널 act_dim 개 × num_bins 카테고리,
+    채널별 독립 softmax)를 갖지만 critic(가치망)이 없다. REDQ 트랙은 Q 앙상블을 별도
+    모듈(claude_code.redq.networks)로 관리하므로 정책 번들에는 actor 만 담는다.
+
+    추론 계약(act_deterministic / act_stochastic / num_bins)은 MLPDiscreteActorCritic
+    과 동일해서, 기존 MLPActionProvider / load_bundle 이 그대로 이 actor 를 로드·구동한다.
+    """
+
+    def __init__(
+        self,
+        obs_dim: int,
+        act_dim: int = 4,
+        num_bins: int = ACTION_BINS,
+        hidden: Sequence[int] = (256, 256),
+        activation: str = "tanh",
+        **_ignored,
+    ):
+        super().__init__()
+        self.obs_dim = int(obs_dim)
+        self.act_dim = int(act_dim)
+        self.num_bins = int(num_bins)
+        self.hidden = list(hidden)
+        self.activation = activation
+        # save_bundle 메타 호환: critic_* 필드를 갖되 None 으로 둔다(가치망 없음).
+        self.critic_hidden = None
+        self.critic_activation = None
+        self.actor_logits = _mlp(obs_dim, hidden, self.act_dim * self.num_bins, activation)
+        self.apply(MLPActorCritic._init_weights)
+
+    def actor_parameters(self):
+        return list(self.actor_logits.parameters())
+
+    def logits(self, obs: torch.Tensor) -> torch.Tensor:
+        """(B, act_dim, num_bins) 로짓."""
+        return self.actor_logits(obs).view(-1, self.act_dim, self.num_bins)
+
+    def _dist(self, obs: torch.Tensor) -> torch.distributions.Categorical:
+        return torch.distributions.Categorical(logits=self.logits(obs))
+
+    def probs_log_probs(self, obs: torch.Tensor):
+        """discrete SAC 용: (probs, log_probs) 각각 (B, act_dim, num_bins).
+
+        전체 카테고리 기대값 Σ_a π(a|s)(α logπ − Q) 을 채널별로 계산할 때 쓴다.
+        log_softmax 로 수치 안정적으로 구한다.
+        """
+        logits = self.logits(obs)
+        log_probs = torch.log_softmax(logits, dim=-1)
+        probs = log_probs.exp()
+        return probs, log_probs
+
+    @torch.no_grad()
+    def act_deterministic(self, obs: torch.Tensor) -> torch.Tensor:
+        """추론용: 채널별 argmax 카테고리 index (탐험 없음)."""
+        return self.logits(obs).argmax(-1).float()
+
+    @torch.no_grad()
+    def act_stochastic(self, obs: torch.Tensor) -> torch.Tensor:
+        """추론용: 채널별 Categorical 에서 샘플링."""
+        return self._dist(obs).sample().float()
+
+    @torch.no_grad()
+    def get_action_and_value(self, obs: torch.Tensor, action: torch.Tensor | None = None):
+        """SelfPlayProvider(explore) 호환 shim. 가치망이 없으므로 value=None.
+
+        SelfPlayProvider 는 첫 반환값(카테고리 index)만 쓰므로 나머지는 None 이어도 된다.
+        이 덕분에 REDQ actor(MLPDiscreteActor)를 기존 self-play pool 상대로 그대로 쓸 수 있다.
+        """
+        idx = self._dist(obs).sample().float() if action is None else action.float()
+        return idx, None, None, None
+
+
 # ── 환경/서버로 보낼 action 변환 ──────────────────────────────────────────────
 # 학습 환경 DogFightEnv._to_sim_action 과 동일한 변환을 추론에서도 적용해
 # train/inference action 의미를 일치시킨다.
@@ -302,15 +376,20 @@ def save_bundle(
     out = Path(output_dir)
     out.mkdir(parents=True, exist_ok=True)
 
-    is_discrete = isinstance(model, MLPDiscreteActorCritic)
+    if isinstance(model, MLPDiscreteActor):
+        model_type = "mlp_discrete_actor"          # 정책 전용(REDQ/SAC). 가치망 없음.
+    elif isinstance(model, MLPDiscreteActorCritic):
+        model_type = "mlp_discrete_actor_critic"
+    else:
+        model_type = "mlp_actor_critic"
     model_meta = {
-        "type": "mlp_discrete_actor_critic" if is_discrete else "mlp_actor_critic",
+        "type": model_type,
         "hidden": model.hidden,
         "activation": model.activation,
         "critic_hidden": model.critic_hidden,
         "critic_activation": model.critic_activation,
     }
-    if is_discrete:
+    if model_type != "mlp_actor_critic":
         model_meta["num_bins"] = model.num_bins
     metadata = {
         "framework": "claude_code_ppo",
@@ -354,7 +433,14 @@ def load_bundle(bundle_dir: str | Path, device: str = "cpu") -> tuple[MLPActorCr
         critic_hidden=tuple(crit_hidden) if crit_hidden is not None else None,
         critic_activation=model_meta.get("critic_activation"),
     )
-    if model_meta.get("type") == "mlp_discrete_actor_critic":
+    mtype = model_meta.get("type")
+    if mtype == "mlp_discrete_actor":
+        # 정책 전용 actor(REDQ/SAC). critic 관련 kwargs 는 무시.
+        model = MLPDiscreteActor(
+            obs_dim=common["obs_dim"], act_dim=common["act_dim"],
+            num_bins=int(model_meta.get("num_bins", ACTION_BINS)),
+            hidden=common["hidden"], activation=common["activation"])
+    elif mtype == "mlp_discrete_actor_critic":
         model = MLPDiscreteActorCritic(num_bins=int(model_meta.get("num_bins", ACTION_BINS)), **common)
     else:
         model = MLPActorCritic(**common)
@@ -367,6 +453,7 @@ def load_bundle(bundle_dir: str | Path, device: str = "cpu") -> tuple[MLPActorCr
 __all__ = [
     "MLPActorCritic",
     "MLPDiscreteActorCritic",
+    "MLPDiscreteActor",
     "make_actor_critic",
     "ACTION_BINS",
     "make_action_grid",

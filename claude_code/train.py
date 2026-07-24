@@ -193,7 +193,7 @@ def parse_args():
     # Ray 병렬 데이터 수집. 기본 worker 수 = 물리 CPU 코어 수(논리 아님). 1 이면 단일 프로세스.
     p.add_argument("--num-workers", type=int, default=physical_cpu_count(),
                    help="Ray rollout worker 수 (기본=물리 코어 수). 1 이면 Ray 미사용")
-    p.add_argument("--device", default="cpu",
+    p.add_argument("--device", default="cuda",
                    help="driver update 디바이스 (큰 모델은 cuda). worker 는 항상 CPU 추론")
     p.add_argument("--output-name", default="team01")
     p.add_argument("--output-tag", default="ppo_mlp_v1")
@@ -205,11 +205,57 @@ def parse_args():
     p.add_argument("--wandb-project", default="AIP contest", help="wandb 프로젝트명")
     p.add_argument("--wandb-run-name", default="",
                    help="wandb run 이름 (비우면 output-name/output-tag)")
+    # crash 자동 재시작(Windows CUDA+Ray 네이티브 크래시 우회). REDQ 와 동일 메커니즘.
+    p.add_argument("--supervise", action="store_true",
+                   help="바깥 supervisor 로 학습을 자식 프로세스로 띄우고, 크래시하면 마지막 "
+                        "train_state 체크포인트에서 자동 재시작. 크래시난 iteration 은 처음부터 다시.")
+    p.add_argument("--auto-resume", action="store_true",
+                   help="시작 시 train_state 체크포인트가 있으면 이어서 학습(--resume-state 로 자동 매핑). "
+                        "supervisor 가 자식에 자동 부여.")
+    p.add_argument("--restart-timeout", type=float, default=120.0,
+                   help="supervisor watchdog: heartbeat 가 이 초 동안 안 갱신되면 죽음/hang 으로 "
+                        "보고 자식 트리를 죽여 재시작.")
+    p.add_argument("--max-restarts", type=int, default=200,
+                   help="supervisor 최대 재시작 횟수(무한루프 방지).")
     return p.parse_args()
+
+
+def _ckpt_path_for(args):
+    """train_state 체크포인트 경로(--checkpoint-path 우선, 없으면 기본 위치)."""
+    if args.checkpoint_path:
+        return Path(args.checkpoint_path)
+    return Path("claude_code") / "models" / args.output_name / args.output_tag / "train_state.pt"
+
+
+def _run_supervisor(args):
+    """바깥 supervisor: 학습을 자식 프로세스로 반복 실행하고 크래시하면 마지막
+    train_state 체크포인트에서 자동 재시작. 공용 로직은 claude_code.supervisor."""
+    from claude_code.supervisor import supervise_loop, build_child_cmd
+    cmd = build_child_cmd(__file__)
+    hb = _ckpt_path_for(args).parent / "heartbeat"
+    supervise_loop(cmd, hb, timeout_s=float(args.restart_timeout),
+                   max_restarts=int(args.max_restarts), label="PPO")
 
 
 def main():
     args = parse_args()
+    if args.supervise:
+        _run_supervisor(args)
+        return
+    # --auto-resume: train_state 체크포인트가 있으면 --resume-state 로 자동 매핑
+    # (크래시난 iteration 은 다음 시작 시 처음부터 다시 돈다).
+    if args.auto_resume and not args.resume_state:
+        _ck = _ckpt_path_for(args)
+        if _ck.exists():
+            args.resume_state = str(_ck)
+            print(f"[claude_code/PPO] --auto-resume: {_ck} 에서 이어서 학습", flush=True)
+    # CUDA 미가용(cpu 전용 torch) 환경에서 --device cuda 로 죽지 않게 안전 폴백.
+    if args.device == "cuda" and not torch.cuda.is_available():
+        print("[claude_code/PPO] CUDA 미가용 → --device cpu 로 폴백", flush=True)
+        args.device = "cpu"
+    # supervisor watchdog 용 heartbeat 를 시작 즉시 띄운다(Ray init/update 중에도 tick).
+    from claude_code.supervisor import start_heartbeat
+    _hb_stop = start_heartbeat(_ckpt_path_for(args).parent / "heartbeat")
     # baseline BT 는 self-play 일 때 항상 opponent pool slot0 에 고정으로 들어간다.
     bt_enabled = bool(args.self_play)
     hidden = tuple(int(x) for x in args.hidden.split(",") if x.strip())
@@ -325,8 +371,10 @@ def main():
             if not os.environ.get("WANDB_API_KEY"):
                 os.environ["WANDB_API_KEY"] = _WANDB_API_KEY
             run_name = args.wandb_run_name or f"{args.output_name}/{args.output_tag}"
+            # crash 재시작 시 같은 run 에 이어 붙도록 run id 고정 + resume 허용.
+            run_id = f"ppo-{args.output_name}-{args.output_tag}".replace("/", "-")
             wandb.init(
-                project=args.wandb_project, name=run_name,
+                project=args.wandb_project, name=run_name, id=run_id, resume="allow",
                 config={
                     "iterations": args.iterations, "rollout_steps": args.rollout_steps,
                     "lr": args.lr, "gamma": args.gamma, "gae_lambda": args.gae_lambda,
@@ -718,6 +766,7 @@ def main():
     try:
         history = trainer.train(on_iteration=on_iteration, start_iteration=start_iter)
     finally:
+        _hb_stop.set()
         log_file.close()
         env.close()
         if eval_env is not None:
