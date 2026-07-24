@@ -171,6 +171,10 @@ class PPOTrainer:
         self.obs_dim = obs_dim
         self.act_dim = act_dim
         self.global_step = 0
+        # 직전 update() 가 실제로 돈 epoch 수와 target_kl 조기종료 여부(로깅용).
+        # actor/critic 은 같은 루프에서 함께 갱신되므로 이 값은 양쪽에 동일하게 적용된다.
+        self.last_update_epochs = 0
+        self.last_update_early_stop = False
         # 재개(resume)/pool 후보 재생성 시 동일 구조로 모델을 만들기 위한 kwargs.
         self._model_kwargs = dict(
             obs_dim=obs_dim, act_dim=act_dim, hidden=tuple(config.hidden),
@@ -317,6 +321,8 @@ class PPOTrainer:
 
         clip = cfg.clip_coef
         last_pl = last_vl = last_ent = last_kl = 0.0
+        epochs_done = 0
+        early_stop = False
         for epoch in range(cfg.update_epochs):
             np.random.shuffle(idx)
             approx_kls = []
@@ -359,9 +365,16 @@ class PPOTrainer:
                 last_vl = float(value_loss.item())
                 last_ent = float(entropy_loss.item())
 
+            epochs_done = epoch + 1
             last_kl = float(np.mean(approx_kls)) if approx_kls else 0.0
             if cfg.target_kl is not None and last_kl > cfg.target_kl:
+                early_stop = True
                 break
+
+        # 실제로 돈 epoch 수 / 조기종료 여부(로깅용). actor·critic 은 같은 루프에서 같은
+        # backward 로 갱신되므로 두 네트워크의 epoch 수는 항상 이 값으로 동일하다.
+        self.last_update_epochs = epochs_done
+        self.last_update_early_stop = early_stop
 
         # explained variance
         y_pred = old_values.cpu().numpy()
@@ -552,6 +565,8 @@ class PPOTrainer:
             comp_means.update(_outcome_counts(ep_outcomes))
             comp_means["per_opp"] = _outcome_counts_by_opp(ep_opp_indices, ep_outcomes)
             comp_means["alt_term"] = _count_altitude_terms(ep_end_conditions)
+            comp_means["update_epochs"] = int(self.last_update_epochs)
+            comp_means["update_early_stop"] = int(self.last_update_early_stop)
             stats = IterationStats(
                 iteration=it,
                 global_step=self.global_step,

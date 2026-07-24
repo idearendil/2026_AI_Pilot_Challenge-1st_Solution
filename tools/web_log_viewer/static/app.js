@@ -12,7 +12,10 @@ const COLORS = {
   sky: 0x7fb7d7,
 };
 
-const AIRCRAFT_MODEL_YAW_OFFSET_DEG = 180;
+// f16_simple_cc_by.obj 는 +x 가 기수다(캐노피 x≈0.15~2.2, 수직미익 x=-5.4, 노즈콘 x=8.0).
+// 예전엔 180 이라 기체가 뒤를 보고 날았다. attitudeMatrix 의 pitch 부호 버그와 겹쳐
+// 실제 속도 벡터와 118도나 어긋나 있었다(수정 후 평균 7.9도 = 받음각 수준).
+const AIRCRAFT_MODEL_YAW_OFFSET_DEG = 0;
 const CAMERA_MODES = new Set(["blue", "red", "midpoint"]);
 
 const State = {
@@ -677,7 +680,9 @@ function attitudeMatrix(rollDeg, pitchDeg, yawDeg) {
   const cy = Math.cos(yaw);
   const sy = Math.sin(yaw);
   const rotX = [[1, 0, 0], [0, cr, -sr], [0, sr, cr]];
-  const rotY = [[cp, 0, sp], [0, 1, 0], [-sp, 0, cp]];
+  // 표시 좌표계가 z-up 이라 +y 축 회전은 기수를 내린다. pitch(+)=기수 상승이므로 -pitch.
+  // (log_data.attitude_matrix 와 동일해야 함)
+  const rotY = [[cp, 0, -sp], [0, 1, 0], [sp, 0, cp]];
   const rotZ = [[cy, -sy, 0], [sy, cy, 0], [0, 0, 1]];
   return matmul3(matmul3(rotZ, rotY), rotX);
 }

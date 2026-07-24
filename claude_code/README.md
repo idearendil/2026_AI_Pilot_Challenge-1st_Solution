@@ -26,6 +26,11 @@ python claude_code/run_local_dogfight.py --ownship-backend rl --ownship-bundle-d
 (rl 모델과 rl 모델을 사용하는 경우)
 python claude_code/run_local_dogfight.py --ownship-backend rl --ownship-bundle-dir artifacts/models/team01/basic --target-backend rl --target-bundle-dir artifacts/models/team01/basic --max-engage-time 200 --episode-step-limit 12000 --save-log --seed 0
 
+# (2)-2 어느 모델이 강한지 통계로 판정 (리플레이 없이 100판 병렬, rl=항상 stochastic, 판마다 랜덤 시드)
+python claude_code/power_test.py --ownship-backend rl --ownship-bundle-dir artifacts/models/team01/basic --target-backend bt --target-bt-dll AIP_DCS_baseline.dll --games 100
+(번들 vs 번들)
+python claude_code/power_test.py --ownship-backend rl --ownship-bundle-dir artifacts/models/team01/basic --target-backend rl --target-bundle-dir artifacts/models/team01/old --games 100
+
 # (3) 리플레이 로그는 artifacts/logs/ 아래 *_ownship_*.csv / *_target_*.csv / *_summary.json 로 저장됨 (Tacview 포맷)
 => 리플레이 로그 파일 3개를 모두 logs/ 폴더로 옮기고 아래 명령어 실행 후 브라우저에 접속해서 확인
 python tools/web_log_viewer.py --logdir logs --port 7870
@@ -49,6 +54,8 @@ python tools/web_log_viewer.py --logdir logs --port 7870
 | `normalizers.py` | 관측 running mean/std 정규화(`RunningMeanStd`) |
 | `evaluation.py` | snapshot 저장/로드 + past-self 대결 평가(`play_games`) |
 | **`run_local_dogfight.py`** | **모델 vs (모델·스크립트·DLL) 로컬 대결 + 리플레이 로그 생성** |
+| **`power_test.py`** | **두 모델을 N판(기본 100) 병렬 대결시켜 어느 쪽이 강한지 통계 판정**(Wilson CI + 이항검정, 좌우 시작 50/50 교대, rl=항상 stochastic·판별 랜덤 시드) |
+| `bt_rule.py` | BT DLL 의 rule XML(`AIP_RULE_XML`) 지정/검증 — **다른 claude_code import 보다 먼저** 써야 함 |
 | **`snapshot_to_bundle.py`** | 매 iter snapshot(`iter_NNNN.pt`) → 제출용 2-파일 번들 변환 |
 | `evaluate.py` | 학습한 번들을 로컬에서 간단 검증 |
 | `submission.py` | 대결 서버 UDP 제출 (원본 `my_submission.py` 와 동일 경로) |
@@ -184,6 +191,14 @@ python tools/web_log_viewer.py --logdir logs --port 7870
 - `damage` / `dist` / `aim` : 보상 성분별 평균(어느 신호로 배우는지 확인)
 - `ent` : 정책 엔트로피(탐험 정도), `kl` : approx_kl(trust region)
 - `ev` : value function explained variance(가치함수 학습 지표; 보상이 희소하면 낮음)
+- `ep N/M` : 이번 iter 의 PPO update 가 **실제로 돈 epoch 수 N** / 설정 상한 `M=--update-epochs`.
+  뒤에 `*` 가 붙으면 `approx_kl > --target-kl` 로 **조기 종료**된 것이다.
+  CSV 컬럼은 `update_epochs` / `update_early_stop`, wandb 는 `update/epochs_run`,
+  `update/epochs_frac`, `update/kl_early_stop` (+ `update/actor_epochs`,
+  `update/critic_epochs`).
+  > ⚠️ actor 와 critic 은 **같은 epoch 루프에서 같은 backward** 로 갱신되므로(`ppo.py`
+  > `update()`), 두 네트워크의 epoch 수는 **항상 같다**. 즉 KL 조기 종료가 걸리면 critic
+  > 학습도 함께 잘린다.
 - `EVAL vs iterN` : `--eval-interval` 마다 **탐험 끈 결정론적 정책**으로 N iter 전 self 와 대결한 승률/전적. **승률>0.5 면 best 번들로 저장**.
 
 ---

@@ -296,7 +296,10 @@ def attitude_matrix(
     cy, sy = math.cos(yaw), math.sin(yaw)
 
     rot_x = ((1.0, 0.0, 0.0), (0.0, cr, -sr), (0.0, sr, cr))
-    rot_y = ((cp, 0.0, sp), (0.0, 1.0, 0.0), (-sp, 0.0, cp))
+    # 표시 좌표계는 z-up(x=동, y=북, z=고도)이라 +y 축 회전은 기수를 **내린다**.
+    # pitch(+)=기수 상승이므로 -pitch 로 돌려야 한다. (예전엔 +pitch 라 상승/하강이
+    # 뒤집혀 보였고, forward_vector 를 쓰는 HUD ATA·WEZ 원뿔까지 같이 틀렸다.)
+    rot_y = ((cp, 0.0, -sp), (0.0, 1.0, 0.0), (sp, 0.0, cp))
     rot_z = ((cy, -sy, 0.0), (sy, cy, 0.0), (0.0, 0.0, 1.0))
     return matmul3(matmul3(rot_z, rot_y), rot_x)
 

@@ -36,6 +36,11 @@ class LogDataTest(unittest.TestCase):
         forward = forward_vector(yaw_deg=90.0, pitch_deg=0.0)
         self.assertAlmostEqual(forward[0], 1.0, places=6)
         self.assertAlmostEqual(forward[1], 0.0, places=6)
+        # pitch(+) = 기수 상승 → 표시 좌표계(z=고도)에서 z 성분이 +여야 한다.
+        climbing = forward_vector(yaw_deg=0.0, pitch_deg=30.0)
+        self.assertAlmostEqual(climbing[2], 0.5, places=6)
+        diving = forward_vector(yaw_deg=0.0, pitch_deg=-30.0)
+        self.assertAlmostEqual(diving[2], -0.5, places=6)
         self.assertTrue(math.isclose(angle_between_deg((1, 0, 0), (0, 1, 0)), 90.0))
         self.assertTrue(in_wez(500.0, 0.5, 100.0, 1000.0, 2.0))
         self.assertFalse(in_wez(50.0, 0.5, 100.0, 1000.0, 2.0))
