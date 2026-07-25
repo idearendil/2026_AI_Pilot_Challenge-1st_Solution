@@ -53,7 +53,7 @@ TRAIN_CKPT_VERSION = 1
 
 
 def save_train_state(path, *, trainer, pool, pool_state, pool_max, iteration,
-                     global_step, best, model_kwargs) -> None:
+                     global_step, best, model_kwargs, payoff=None) -> None:
     """전체 학습 상태를 하나의 .pt 로 원자적 저장(중단돼도 이어서 학습 가능).
 
     저장: model(actor+critic) state_dict, actor/critic optimizer state, obs_rms,
@@ -90,6 +90,8 @@ def save_train_state(path, *, trainer, pool, pool_state, pool_max, iteration,
                   "ema": float(e["ema"]), "state": e.get("state"), "rms": e.get("rms"),
                   "dll": e.get("dll", ""), "rule": e.get("rule", "")} for e in pool],
         "best": dict(best),
+        # PSRO payoff 행렬(pool 과 정렬된 centered antisymmetric 승률). 없으면 None.
+        "payoff": (payoff.state() if payoff is not None and payoff.n else None),
     }
     tmp = path.with_suffix(path.suffix + ".tmp")
     torch.save(ckpt, str(tmp))
@@ -175,8 +177,24 @@ def parse_args():
                    help="opponent 샘플링 softmax 온도 τ. weight_i ∝ exp(-ema_i/τ) → EMA 낮은 후보가 "
                         "더 자주 뽑힘. 작을수록 최저 EMA 후보를 강하게 선호. baseline BT 도 동일한 "
                         "softmax 로 뽑힌다(BT 상대 승률이 낮으므로 자연히 자주 뽑힘).")
-    # baseline BT(AIP_DCS_baseline.dll) 는 self-play 시 항상 opponent pool slot0 에 고정으로
-    # 들어간다. DLL/rule 은 bt_rule.DEFAULT_BT_DLL + BT_RULE_DEFAULTS 로 고정 — CLI 옵션 없음.
+    # ── PSRO opponent 샘플링(기본 켜짐). payoff 행렬의 Nash 균형을 샘플 분포로 쓴다. ──
+    p.add_argument("--psro", dest="psro", action="store_true", default=True,
+                   help="opponent 샘플링을 PSRO(payoff 행렬의 Nash 균형)로 계산(기본 켜짐). "
+                        "새 opponent 가 pool 에 추가되면 pool 의 모든 멤버와 T판 붙여 승률(payoff)을 "
+                        "채우고 Nash σ 를 opponent 분포로 쓴다. 워커 분할이라 각 워커는 σ 를 "
+                        "{자기 BT + snapshot}에 restrict·renormalize 해 샘플링한다.")
+    p.add_argument("--no-psro", dest="psro", action="store_false",
+                   help="PSRO 끄고 기존 EMA softmax 샘플링 사용.")
+    p.add_argument("--psro-eval-games", type=int, default=50,
+                   help="PSRO payoff 측정 시 각 매치 판 수 T(RL 은 stochastic).")
+    p.add_argument("--psro-uniform-mix", type=float, default=0.1,
+                   help="Nash σ 에 섞을 균등분포 비율. σ=(1-mix)·Nash+mix·uniform. Nash 가 0 을 "
+                        "주는 opponent 도 최소한 조금은 학습(망각 방지 + 워커 renorm 안정화).")
+    p.add_argument("--psro-selfplay-floor", type=float, default=0.3,
+                   help="RL snapshot 들에 보장하는 최소 총 확률 β(커리큘럼). σ=(1-β)·Nash+β·(snapshot 균등). "
+                        "초반엔 snapshot 이 전부 BT 에 져서 Nash 가 0 을 주는데, 그러면 강한 BT 만 "
+                        "상대해 학습 신호가 희박해진다. 비슷한 실력의 과거 자신(snapshot)과 β 만큼 "
+                        "self-play 하게 해 부드러운 커리큘럼을 만든다. 0 이면 순수 Nash(+uniform mix).")
     p.add_argument("--seed", type=int, default=0)
     # loiter: 표적이 선회하며 고도를 유지(자기파괴 없음) → episode 가 timeout(terminal=0)
     # 으로 끝나므로 return 이 ownship 의 추격/사격 성과로만 결정돼 학습 신호가 깨끗하다.
@@ -494,14 +512,61 @@ def main():
     if resume_ckpt is not None:
         pool_max = int(resume_ckpt["pool_max"])
 
-    def _per_worker_weights() -> list:
-        """워커별 로컬 pool([그 워커 BT, snapshot...]) 샘플 가중치를 반환.
+    # ── PSRO 상태: payoff 행렬(pool 정렬) + 캐시된 Nash σ. 병렬 트레이너에서만 활성. ──
+    from claude_code.psro import PayoffMatrix
+    use_psro = bool(args.psro) and hasattr(trainer, "eval_new_opponent")
+    payoff = PayoffMatrix()
+    _psro = {"sigma": None}   # pool 변할 때만 재계산해 캐시
 
-        BT 별로 1개씩(총 n_bt개) 벡터를 만들고 워커 i → i%n_bt 벡터를 준다. EMA 낮은 후보가
-        더 자주 뽑히도록 softmax(-ema/τ), 각 벡터 합=1. (다른 BT 는 이 워커에서 아예 로컬
-        pool 에 없으므로 자연히 확률 0.)
+    def _recompute_psro() -> None:
+        if not use_psro or payoff.n != len(pool):
+            _psro["sigma"] = None
+            return
+        nash = payoff.nash()
+        n = int(len(nash))
+        if n == 0:
+            _psro["sigma"] = None
+            return
+        sigma = np.asarray(nash, dtype=np.float64).copy()
+        # self-play floor β: RL snapshot 들에 최소 총 확률 β 보장(초반 '강한 BT만' 과난이도
+        # 방지 → 비슷한 실력의 과거 자신과 self-play 하는 부드러운 커리큘럼).
+        floor = float(args.psro_selfplay_floor)
+        snap_idx = [i for i, e in enumerate(pool) if e["kind"] == "net"]
+        if floor > 0.0 and snap_idx:
+            snap_dist = np.zeros(n, dtype=np.float64)
+            snap_dist[snap_idx] = 1.0 / len(snap_idx)      # snapshot 균등
+            sigma = (1.0 - floor) * sigma + floor * snap_dist
+        # uniform mix: 전체 균등 소량 섞어 0-weight 방지 + 워커 renorm 안정화.
+        mix = float(args.psro_uniform_mix)
+        if mix > 0.0:
+            sigma = (1.0 - mix) * sigma + mix * (np.ones(n) / n)
+        tot = float(sigma.sum())
+        _psro["sigma"] = sigma / tot if tot > 1e-12 else np.ones(n) / n
+
+    def _per_worker_weights() -> list:
+        """워커별 로컬 pool([그 워커 BT, snapshot...]) 샘플 가중치.
+
+        PSRO 활성이면 payoff 행렬의 Nash σ(글로벌 pool 정렬)를 각 워커의 호스팅 가능한
+        슬롯 {자기 BT, snapshot...}에 restrict·renormalize 한다. 아니면 EMA softmax(-ema/τ).
+        (다른 BT 는 이 워커 로컬 pool 에 없으므로 자연히 확률 0.)
         """
         snaps = [e for e in pool if e["kind"] == "net"]
+        n_snap = len(snaps)
+        sigma = _psro["sigma"] if use_psro else None
+
+        if sigma is not None and len(sigma) == len(pool):
+            def _restrict(b):   # 워커 bt_index b 의 로컬 가중치 = σ[{b} ∪ snapshot slots]
+                idxs = ([b] if n_bt else []) + list(range(n_bt, n_bt + n_snap))
+                w = np.asarray([float(sigma[i]) for i in idxs], dtype=np.float64)
+                sm = float(w.sum())
+                return (w / sm).tolist() if sm > 1e-12 else (np.ones(len(idxs)) / len(idxs)).tolist()
+            if n_bt == 0:
+                v = _restrict(0)
+                return [v for _ in range(trainer.num_workers)]
+            vecs = [_restrict(b) for b in range(n_bt)]
+            return [vecs[i % n_bt] for i in range(trainer.num_workers)]
+
+        # ── EMA softmax 폴백 ──
         snap_emas = [e["ema"] for e in snaps]
         temp = max(float(args.pool_sample_temp), 1e-6)
 
@@ -545,19 +610,39 @@ def main():
                           "n_added": int(resume_ckpt["n_added"])}
             trainer.set_opponent_pool([e for e in pool if e["kind"] == "net"],
                                       _per_worker_weights(), local_pool_max)
+            # PSRO payoff 행렬 복원(pool 과 정렬). σ 재계산.
+            if use_psro and resume_ckpt.get("payoff"):
+                payoff.load_state(resume_ckpt["payoff"])
+                if payoff.n == len(pool):
+                    _recompute_psro()
+                    trainer.pool_set_weights(_per_worker_weights())
             print(f"[claude_code/PPO] opponent pool 복원: {len(pool)}개 "
                   f"(BT {n_bt} + snapshot {len(pool)-n_bt}, "
-                  f"ema {[round(e['ema'],3) for e in pool]})")
+                  f"ema {[round(e['ema'],3) for e in pool]}, PSRO={'on' if use_psro else 'off'})")
         else:
             snap = trainer.snapshot_current()
             pool = _bt_entries() + [{"kind": "net", "gen": 0, "ema": 0.5,
                                      "state": snap["state"], "rms": snap["rms"]}]
             pool_state = {"next_gen": 1, "n_added": 0}
+            # σ 없이(=EMA/uniform) 먼저 설치 → 워커에 BT provider 생성됨 → PSRO 평가 가능.
             trainer.install_opponent_pool(local_pool_max, _per_worker_weights())
+            if use_psro:
+                # payoff: BT 멤버들(BT-vs-BT=0.5 미측정) + iter0 snapshot(BT 상대 승률 측정).
+                for _ in range(n_bt):
+                    payoff.add_member([0.5] * payoff.n)
+                wr = (trainer.eval_new_opponent(snap["state"], snap["rms"], pool[:n_bt],
+                                                args.psro_eval_games, args.seed + 900)
+                      if n_bt else [])
+                payoff.add_member(wr)   # iter0 snapshot vs BTs
+                _recompute_psro()
+                trainer.pool_set_weights(_per_worker_weights())   # 이제 Nash σ 기반
+                print(f"[claude_code/PPO] PSRO 초기 payoff 측정 완료(iter0 vs BT {n_bt}종, "
+                      f"각 {args.psro_eval_games}판). Nash σ = "
+                      f"{np.round(_psro['sigma'], 3).tolist() if _psro['sigma'] is not None else None}")
             print(f"[claude_code/PPO] opponent pool 초기화 = BT {n_bt}종 + iter0 정책 "
                   f"(글로벌 최대 {pool_max}칸 = BT {n_bt} + snapshot {snapshot_cap}, "
-                  f"EMA α={args.selfplay_ema_alpha}, 추가 임계 min-EMA(snapshot만)"
-                  f"≥{args.selfplay_gate_threshold:.2f}, τ={args.pool_sample_temp})")
+                  f"샘플링={'PSRO Nash' if use_psro else 'EMA softmax'}, 추가 임계 min-EMA"
+                  f"≥{args.selfplay_gate_threshold:.2f})")
         bt_names = [Path(e["dll"]).stem for e in pool if e["kind"] == "bt"]
         print(f"[claude_code/PPO] BT {n_bt}종 = {bt_names} (워커 round-robin 분할, "
               "각 워커 프로세스에 AIP_RULE_XML 주입 · evict 안 됨 · BT별 EMA 분리 집계)")
@@ -663,17 +748,31 @@ def main():
             # 세대 진행이 영구히 멈춘다). BT EMA 는 로깅/샘플링에만 쓰인다.
             net_emas = [e["ema"] for e in pool if e["kind"] == "net"]
             if net_emas and min(net_emas) >= gate_threshold:
+                snap = trainer.snapshot_current()   # 추가할 현재 정책 net(+obs_rms)
+                # PSRO: append 전에 새 snapshot 을 **현재 pool 의 모든 멤버**와 T판 붙여 승률 측정.
+                new_wr = (trainer.eval_new_opponent(snap["state"], snap["rms"], pool,
+                                                    args.psro_eval_games,
+                                                    args.seed + 1000 + int(s.iteration))
+                          if use_psro else None)
                 trainer.pool_add_current()
-                snap = trainer.snapshot_current()   # 추가된 후보 net(+obs_rms) 을 checkpoint 용으로 보관
                 pool.append({"kind": "net", "gen": pool_state["next_gen"], "ema": 0.5,
                              "state": snap["state"], "rms": snap["rms"]})
                 pool_state["next_gen"] += 1
+                if use_psro and new_wr is not None:
+                    payoff.add_member(new_wr)   # 새 snapshot vs 기존 모든 멤버
                 if len(pool) > pool_max:
                     pool.pop(n_bt)   # 가장 오래된 snapshot 제거 (BT 슬롯 0..n_bt-1 은 보존)
+                    if use_psro:
+                        payoff.remove_member(n_bt)
                 pool_state["n_added"] += 1
+                if use_psro:
+                    _recompute_psro()   # pool 이 바뀌었으니 Nash σ 재계산
+                    print(f"[claude_code/PPO] *PSRO gen{pool_state['next_gen']-1} 추가 후 "
+                          f"Nash σ = {np.round(_psro['sigma'], 3).tolist() if _psro['sigma'] is not None else None}",
+                          flush=True)
                 _save_best(s, {"mean_return": s.mean_return, "win_rate": raw_wr})
                 added = True
-            # 다음 iteration 을 위한 워커별 샘플링 가중치 갱신(EMA 낮은 후보 우대).
+            # 다음 iteration 을 위한 워커별 샘플링 가중치 갱신(PSRO Nash σ 또는 EMA).
             trainer.pool_set_weights(_per_worker_weights())
 
         net_emas = [e["ema"] for e in pool if e["kind"] == "net"]
@@ -707,7 +806,7 @@ def main():
             save_train_state(
                 ckpt_path, trainer=trainer, pool=pool, pool_state=pool_state,
                 pool_max=pool_max, iteration=s.iteration, global_step=s.global_step,
-                best=best, model_kwargs=model_kwargs)
+                best=best, model_kwargs=model_kwargs, payoff=payoff)
         except Exception as e:
             print(f"[claude_code/PPO] train-state 저장 실패({e})", flush=True)
 
@@ -767,6 +866,15 @@ def main():
                 for i in range(pool_max):
                     if i < len(pool):
                         log_dict[f"selfplay/pool_ema_slot{i}"] = pool[i]["ema"]
+                # PSRO Nash σ(opponent 샘플링 분포, 글로벌 pool 정렬). 슬롯별 + BT별.
+                if use_psro and _psro["sigma"] is not None and len(_psro["sigma"]) == len(pool):
+                    sig = _psro["sigma"]
+                    for i in range(len(pool)):
+                        log_dict[f"psro/sigma_slot{i}"] = float(sig[i])
+                    for b in range(n_bt):
+                        log_dict[f"psro/sigma_bt/{Path(pool[b]['dll']).stem}"] = float(sig[b])
+                    log_dict["psro/sigma_bt_total"] = float(sum(sig[:n_bt]))
+                    log_dict["psro/sigma_snap_total"] = float(sum(sig[n_bt:]))
                 wb.log(log_dict, step=s.iteration)
             except Exception as e:
                 print(f"[claude_code/PPO] wandb.log 실패({e})", flush=True)
@@ -825,7 +933,8 @@ def main():
             save_train_state(
                 ckpt_path, trainer=trainer, pool=pool, pool_state=pool_state,
                 pool_max=pool_max, iteration=progress["last_iter"],
-                global_step=progress["last_step"], best=best, model_kwargs=model_kwargs)
+                global_step=progress["last_step"], best=best, model_kwargs=model_kwargs,
+                payoff=payoff)
             print(f"[claude_code/PPO] 최종 학습 상태 checkpoint: {ckpt_path} "
                   f"(iter {progress['last_iter']}까지; 다음에 --resume-state {ckpt_path} 로 이어서 학습)")
         except Exception as e:

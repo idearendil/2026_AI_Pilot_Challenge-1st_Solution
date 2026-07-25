@@ -52,14 +52,14 @@ MY_REWARD_CONFIG = {
     "loss_reward": 0.0,     # 내 HP<=0 으로 종료(상대가 이김)
     "ownship_alt_reward": -20.0,   # 내 고도가 최소고도 이하로 떨어져 종료
     "target_alt_reward": 5.0,      # 상대 고도가 최소고도 이하로 떨어져 종료
-    "damage_scale": 10.0,   # (상대 HP감소 - 내 HP감소) * 이 값, 양측 생존 중 매 step
+    "damage_scale": 5.0,   # (상대 HP감소 - 내 HP감소) * 이 값, 양측 생존 중 매 step
     # 상황 포텐셜 shaping 계수. reward += (x_cur - x_prev) * 이 값.
     # x 는 _shaping_potential(거리[ft], A1[deg], A2[deg]) 로 대략 ~1e6 스케일이다.
     #   대표 궤적(원거리 20000ft·조준無 → 근거리 1000ft·내 조준0°·상대 90°)의
     #   포텐셜 상승 x_end-x_start ≈ 54000 → 이 값 0.0001 이면 episode 총합 ≈ 5.4 로
     #   target_alt_reward(5)·damage 한 방(≈10)과 같은 자릿수. 상대도 나를 조준하면
     #   경쟁항이 상쇄돼 총합이 줄어든다(설계 의도).
-    "shaping_reward_scale": 0.0001,
+    "shaping_reward_scale": 0.00005,
 }
 # 주의: 아래 compute_reward 는 이 dict 의 키를 **직접 인덱싱**한다(.get 폴백 없음).
 # 계수를 바꾸려면 반드시 이 dict(또는 train.py 의 --*-reward-scale 오버라이드)를 고칠 것.

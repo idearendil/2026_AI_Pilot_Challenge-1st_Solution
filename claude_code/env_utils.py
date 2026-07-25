@@ -52,6 +52,11 @@ STANDARD_ENV_CONFIG = {
     "step_ratio": 6,
     # 매 episode 학습 agent 시작 위치를 두 위치(ownship/target 설정) 중 랜덤 선택(좌우 교대).
     "randomize_start_side": True,
+    # 대회 초기 배치: 두 기체가 같은 고도의 남-북 직선 위에 있고, 북(12시) 기체는 동(3시,
+    # heading 90)을, 남(6시) 기체는 서(9시, heading 270)를 바라본다(서로 반대 방향이지만
+    # 마주보지는 않음, roll/pitch=0). 초기 거리는 매 episode 이 범위[ft]에서 랜덤. 속도는
+    # 각자 바라보는 방향으로 config 의 speed. (거리·좌우는 reset 의 _side_rng 로 결정.)
+    "start_distance_ft_range": [2000.0, 3000.0],
     "reward": {
         "mode": "default",
         "step_penalty": -0.01,
@@ -83,20 +88,49 @@ class TierGatedDogFightEnv(DogFightWrapper):
     에서 한쪽 시작 위치에 과적합하지 않게 한다.
     """
 
+    FEET_TO_METER = 0.3048
+
     def reset(self, *, seed=None, options=None):
         if getattr(self, "_side_rng", None) is None or seed is not None:
             self._side_rng = np.random.default_rng(seed)
+        # 매 episode: 대회 초기 배치(거리 랜덤 + 좌우 배정)로 두 기체 위치를 설정한다.
+        dmin, dmax = self.config.get("start_distance_ft_range", [2000.0, 3000.0])
+        dist_ft = float(self._side_rng.uniform(float(dmin), float(dmax)))
         if self.config.get("randomize_start_side", True):
-            self._apply_start_side(bool(self._side_rng.integers(0, 2)))
+            swap = bool(self._side_rng.integers(0, 2))
+        else:
+            swap = bool(getattr(self, "_forced_swap", False))
+        own, tgt = self._competition_positions(dist_ft, swap)
+        self.change_init_position("ownship", *own)
+        self.change_init_position("target", *tgt)
         return super().reset(seed=seed, options=options)
 
-    def _apply_start_side(self, swap: bool) -> None:
-        """swap=False → ownship→A(config ownship)/target→B(config target), True → 교대."""
+    def _competition_positions(self, dist_ft: float, swap: bool):
+        """대회 초기 배치의 (ownship, target) 위치 [n,e,d,roll,pitch,heading,speed] 를 만든다.
+
+        두 기체는 같은 고도의 남-북 직선 위, 거리 dist_ft(=N 축 간격). 북(12시) 기체는
+        동(3시, heading 90°), 남(6시) 기체는 서(9시, heading 270°)를 바라본다. roll/pitch=0.
+        고도·속도·중심(N,E)은 config 의 ownship/target 값에서 가져온다. swap=True 면 ownship↔target
+        위치 교대(좌우 교대 = 학습 시 시작 위치 과적합 방지, power_test 의 50/50).
+        """
         a = list(self.config["ownship"])   # [n, e, d, roll, pitch, heading, speed]
         b = list(self.config["target"])
-        own, tgt = (b, a) if swap else (a, b)
-        self.change_init_position("ownship", own[0], own[1], own[2], own[3], own[4], own[5], own[6])
-        self.change_init_position("target", tgt[0], tgt[1], tgt[2], tgt[3], tgt[4], tgt[5], tgt[6])
+        center_n = 0.5 * (float(a[0]) + float(b[0]))
+        center_e = 0.5 * (float(a[1]) + float(b[1]))
+        alt_d = float(a[2])                 # 같은 고도
+        speed = float(a[6])                 # 바라보는 방향으로의 속도 크기
+        half = 0.5 * float(dist_ft) * self.FEET_TO_METER
+        north = [center_n + half, center_e, alt_d, 0.0, 0.0, 90.0, speed]   # 12시 → 동(3시)
+        south = [center_n - half, center_e, alt_d, 0.0, 0.0, 270.0, speed]  # 6시 → 서(9시)
+        return (south, north) if swap else (north, south)
+
+    def _apply_start_side(self, swap: bool) -> None:
+        """다음 reset 의 좌우 배정을 강제 지정한다(power_test 의 정확한 50/50 교대용).
+
+        실제 위치는 reset 에서 대회 배치(거리 랜덤 포함)로 적용된다. randomize_start_side=True
+        면 reset 이 좌우를 랜덤으로 정하므로 이 강제값은 무시된다.
+        """
+        self._forced_swap = bool(swap)
 
     def update_damage(self):
         from claude_code.my_observation import damage_rate, METER_TO_FEET

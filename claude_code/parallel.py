@@ -379,6 +379,47 @@ def _make_worker_cls():
                 self._ep_len = 0
             return results
 
+        def eval_pair(self, a_state, a_rms, b_is_bt, b_state, b_rms, seeds, stochastic=True):
+            """PSRO payoff 측정용: 정책 A(ownship)를 상대 B(target)와 seeds 만큼 붙여 A 의
+            승/패/무를 반환한다. B 가 BT 면 **이 워커에 배정된 BT**(self._bt_provider)를 쓴다
+            (driver 가 해당 BT 워커 그룹에 매치를 보냄). B 가 snapshot 이면 그 net 으로 상대 구성.
+            평가 후 collect 연속성을 복구한다.
+            """
+            from claude_code import evaluation
+            model_a = make_actor_critic(**self._model_kwargs)
+            model_a.load_state_dict({k: torch.as_tensor(v) for k, v in a_state.items()})
+            model_a.eval()
+            a_mean = np.asarray(a_rms["mean"]) if a_rms else None
+            a_var = np.asarray(a_rms["var"]) if a_rms else None
+
+            prev = self.env._target_action_provider
+            if b_is_bt:
+                # 이 워커에 배정된 BT provider(pool_init 에서 생성됨). driver 가 이 BT 매치를
+                # 이 워커 그룹에만 보낸다.
+                target = getattr(self, "_bt_provider", None)
+                self.env._target_action_provider = target if target is not None else prev
+            else:
+                mb = make_actor_critic(**self._model_kwargs)
+                mb.load_state_dict({k: torch.as_tensor(v) for k, v in b_state.items()})
+                mb.eval()
+                self.env._target_action_provider = evaluation.make_opponent(
+                    self.env, mb, b_rms, stochastic)
+            try:
+                results = evaluation.play_games(
+                    self.env, model_a, a_mean, a_var, seeds, stochastic, self.reconstruct, "cpu")
+            finally:
+                self.env._target_action_provider = prev
+                if self._reset_recon is not None:
+                    self._reset_recon()
+                obs, _ = self.env.reset()
+                if self._reset_recon is not None:
+                    self._reset_recon()
+                self._next_obs = np.asarray(obs, dtype=np.float32)
+                self._next_done = False
+                self._ep_return = 0.0
+                self._ep_len = 0
+            return evaluation.summarize(results)
+
     return RolloutWorker
 
 
@@ -527,6 +568,46 @@ class ParallelPPOTrainer:
                 opp_ref, opp_model_kwargs, opp_rms_dict, mean, var, ch, stochastic))
         results = [r for sub in ray.get(futs) for r in sub]
         return evaluation.summarize(results)
+
+    # ── PSRO: 새 opponent 를 pool 의 모든 멤버와 붙여 승률(payoff) 측정 ──────────
+    def eval_new_opponent(self, new_state, new_rms, pool, n_games, base_seed):
+        """정책 new_state 를 pool 의 각 멤버와 n_games 판씩 붙여 new 의 승률 리스트(멤버 순)를
+        반환한다. BT 매치는 그 BT 를 로드한 워커 그룹에, snapshot 매치는 임의 워커에 배정한다.
+        (한 프로세스=BT 1개 제약 때문에 BT 매치는 아무 워커나 못 쓴다.)
+
+        pool[i]: {"kind": "bt"|"net", "bt_index": g, "state": np, "rms": {...}} 형태.
+        """
+        import ray
+        seeds = [int(base_seed) + k for k in range(int(n_games))]
+        # bt_index → 그 BT 를 호스팅하는 워커 인덱스들
+        workers_by_bt = {}
+        for wi, (_d, _r, b) in enumerate(self._bt_assign):
+            workers_by_bt.setdefault(int(b), []).append(wi)
+
+        new_ref = ray.put(new_state)
+        futs, order = [], []
+        rr = 0
+        for m_idx, member in enumerate(pool):
+            if member.get("kind") == "bt":
+                g = int(member.get("bt_index", 0))
+                cand = workers_by_bt.get(g) or list(range(self.num_workers))
+                w = cand[m_idx % len(cand)]
+                fut = self.workers[w].eval_pair.remote(new_ref, new_rms, True, None, None,
+                                                       seeds, True)
+            else:
+                w = rr % self.num_workers
+                rr += 1
+                fut = self.workers[w].eval_pair.remote(new_ref, new_rms, False,
+                                                       member.get("state"), member.get("rms"),
+                                                       seeds, True)
+            futs.append(fut)
+            order.append(m_idx)
+        summaries = ray.get(futs)
+        win_rates = [0.5] * len(pool)
+        for m_idx, summ in zip(order, summaries):
+            wr = summ.get("win_rate")
+            win_rates[m_idx] = float(wr) if wr is not None and wr == wr else 0.5
+        return win_rates
 
     def set_frozen_opponent(self, state_dict, rms_mean, rms_var, rms_count):
         """모든 worker 의 self-play 상대를 '초기 actor net 고정' 으로 교체(broadcast)."""
