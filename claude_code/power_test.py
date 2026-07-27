@@ -200,11 +200,11 @@ def _make_worker_cls():
 
             out = []
             zero = np.zeros(4, dtype=np.float32)
-            for seed, swap in jobs:
+            for seed, swap, head_swap in jobs:
                 # 정책 샘플링은 torch RNG → 판마다 다른 시드로 고정(재현 가능한 랜덤).
                 torch.manual_seed(int(seed))
-                # 시작 위치 좌우 교대(randomize_start_side 는 꺼두고 여기서 정확히 제어).
-                self.env._apply_start_side(bool(swap))
+                # 북남(swap)·방향(head_swap) 배정을 여기서 정확히 제어(randomize_start_side 는 꺼둠).
+                self.env._apply_start_side(bool(swap), bool(head_swap))
                 obs, _ = self.env.reset(seed=int(seed))
                 if self.own_provider is not None:
                     self.own_provider.reset()
@@ -223,7 +223,8 @@ def _make_worker_cls():
                 tgt_hp = float(info.get("target_health", float("nan")))
                 end = str(info.get("end_condition", ""))
                 out.append({
-                    "seed": int(seed), "swap": int(swap), "steps": steps,
+                    "seed": int(seed), "swap": int(swap), "head": int(head_swap),
+                    "steps": steps,
                     "own_hp": own_hp, "tgt_hp": tgt_hp, "end": end,
                     "outcome": game_outcome(end, own_hp, tgt_hp),
                     "env_outcome": str(info.get("outcome", "")),
@@ -336,7 +337,10 @@ def main():
     master_seed = args.seed if args.seed >= 0 else int.from_bytes(os.urandom(4), "little")
     rng = np.random.default_rng(master_seed)
     seeds = [int(x) for x in rng.integers(0, 2 ** 31 - 1, size=games)]
+    # 북남(swap)·방향(head_swap)을 독립 교대: fixed_side 면 둘 다 고정(0),
+    # 아니면 4가지 조합(북/남 × 90/270)이 균형 있게 돌게 한다(swap=i%2, head=(i//2)%2).
     swaps = [0] * games if args.fixed_side else [i % 2 for i in range(games)]
+    head_swaps = [0] * games if args.fixed_side else [(i // 2) % 2 for i in range(games)]
 
     own_desc = (f"rl({args.ownship_bundle_dir})" if args.ownship_backend == "rl"
                 else f"bt({args.ownship_bt_dll})")
@@ -376,8 +380,8 @@ def main():
 
     # 판을 worker 에 라운드로빈 분배(좌우 교대가 worker 별로 치우치지 않게).
     jobs = [[] for _ in range(n_workers)]
-    for i, (s, w) in enumerate(zip(seeds, swaps)):
-        jobs[i % n_workers].append((s, w))
+    for i, (s, w, h) in enumerate(zip(seeds, swaps, head_swaps)):
+        jobs[i % n_workers].append((s, w, h))
 
     import time
 

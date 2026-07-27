@@ -50,13 +50,26 @@ STANDARD_ENV_CONFIG = {
     "max_engage_time": 200.0,
     "episode_step_limit": 3600,
     "step_ratio": 6,
-    # 매 episode 학습 agent 시작 위치를 두 위치(ownship/target 설정) 중 랜덤 선택(좌우 교대).
+    # 매 episode ownship 을 두 자리(북/heading90° ↔ 남/heading270°) 중 랜덤 배정(target 은 반대 자리).
+    # 대회에서 우리 모델이 ownship/target 중 어느 쪽이 될지 랜덤이라, 학습도 ownship heading 을
+    # 90°/270° 로 랜덤하게 겪게 한다. 두 기체 heading 은 항상 반대(마주보지 않음).
     "randomize_start_side": True,
-    # 대회 초기 배치: 두 기체가 같은 고도의 남-북 직선 위에 있고, 북(12시) 기체는 동(3시,
-    # heading 90)을, 남(6시) 기체는 서(9시, heading 270)를 바라본다(서로 반대 방향이지만
-    # 마주보지는 않음, roll/pitch=0). 초기 거리는 매 episode 이 범위[ft]에서 랜덤. 속도는
-    # 각자 바라보는 방향으로 config 의 speed. (거리·좌우는 reset 의 _side_rng 로 결정.)
-    "start_distance_ft_range": [2000.0, 3000.0],
+    # ── 대회 초기 배치(팀 제공 스펙: seeded_north_south_opposite_heading) ──────────────
+    # 두 기체가 같은 고도의 남-북 직선(center_n, center_e) 위에 dist 만큼 떨어져 있고, 기본
+    # 배치에서 북(위) 기체는 동(heading 90°), 남(아래) 기체는 서(heading 270°)를 향한다(서로
+    # 반대 방향이라 마주보지 않음, roll/pitch=0). randomize_start_side 면 ownship 이 두 자리 중
+    # 랜덤 → ownship heading 이 90°/270° 랜덤. 매 episode 아래 분포에서 시드 기반으로 뽑는다:
+    #   거리   = distance_ft_choices 중 1택(discrete)
+    #   고도   = altitude_ft_range 에서 uniform  → d = -alt_ft * 0.3048 (NED down)
+    #   속도   = speed_mps_range 에서 uniform
+    # 고도·속도는 두 기체가 공유한다(단일 range → 대칭 시작, 초기 에너지 동일).
+    "start_distance_ft_choices": [2000.0, 2500.0, 3000.0],
+    "start_altitude_ft_range": [2000.0, 30000.0],
+    "start_speed_mps_range": [200.0, 300.0],
+    "start_center_n_m": 3500.0,
+    "start_center_e_m": 0.0,
+    "ownship_heading_deg": 90.0,
+    "target_heading_deg": 270.0,
     "reward": {
         "mode": "default",
         "step_penalty": -0.01,
@@ -93,44 +106,59 @@ class TierGatedDogFightEnv(DogFightWrapper):
     def reset(self, *, seed=None, options=None):
         if getattr(self, "_side_rng", None) is None or seed is not None:
             self._side_rng = np.random.default_rng(seed)
-        # 매 episode: 대회 초기 배치(거리 랜덤 + 좌우 배정)로 두 기체 위치를 설정한다.
-        dmin, dmax = self.config.get("start_distance_ft_range", [2000.0, 3000.0])
-        dist_ft = float(self._side_rng.uniform(float(dmin), float(dmax)))
-        if self.config.get("randomize_start_side", True):
-            swap = bool(self._side_rng.integers(0, 2))
+        # 매 episode: 대회 초기 배치(거리 3택1 + 고도/속도 범위 랜덤 + 북남·방향 독립 배정)로 놓는다.
+        rng = self._side_rng
+        cfg = self.config
+        choices = cfg.get("start_distance_ft_choices", [2000.0, 2500.0, 3000.0])
+        dist_ft = float(rng.choice(np.asarray(choices, dtype=np.float64)))
+        alt_lo, alt_hi = cfg.get("start_altitude_ft_range", [2000.0, 30000.0])
+        alt_ft = float(rng.uniform(float(alt_lo), float(alt_hi)))
+        spd_lo, spd_hi = cfg.get("start_speed_mps_range", [200.0, 300.0])
+        speed = float(rng.uniform(float(spd_lo), float(spd_hi)))
+        if cfg.get("randomize_start_side", True):
+            side_swap = bool(rng.integers(0, 2))   # ownship 북/남 랜덤
+            head_swap = bool(rng.integers(0, 2))   # ownship 90°/270° 랜덤(위치와 독립)
         else:
-            swap = bool(getattr(self, "_forced_swap", False))
-        own, tgt = self._competition_positions(dist_ft, swap)
+            side_swap = bool(getattr(self, "_forced_swap", False))
+            head_swap = bool(getattr(self, "_forced_head_swap", False))
+        own, tgt = self._competition_positions(dist_ft, alt_ft, speed, side_swap, head_swap)
         self.change_init_position("ownship", *own)
         self.change_init_position("target", *tgt)
         return super().reset(seed=seed, options=options)
 
-    def _competition_positions(self, dist_ft: float, swap: bool):
-        """대회 초기 배치의 (ownship, target) 위치 [n,e,d,roll,pitch,heading,speed] 를 만든다.
+    def _competition_positions(self, dist_ft, alt_ft, speed, side_swap, head_swap):
+        """대회 초기 배치의 (ownship, target) [n,e,d,roll,pitch,heading,speed] 를 만든다.
 
-        두 기체는 같은 고도의 남-북 직선 위, 거리 dist_ft(=N 축 간격). 북(12시) 기체는
-        동(3시, heading 90°), 남(6시) 기체는 서(9시, heading 270°)를 바라본다. roll/pitch=0.
-        고도·속도·중심(N,E)은 config 의 ownship/target 값에서 가져온다. swap=True 면 ownship↔target
-        위치 교대(좌우 교대 = 학습 시 시작 위치 과적합 방지, power_test 의 50/50).
+        두 기체는 같은 고도(alt_ft)의 남-북 직선(start_center_n/e) 위, N 축 간격 = dist_ft.
+        위치(북/남)와 heading(90°/270°)을 각각 독립 랜덤 비트로 배정한다:
+          side_swap=False → ownship 북(위),  True → ownship 남(아래)  (target 은 반대 자리)
+          head_swap=False → ownship 90°(동), True → ownship 270°(서)  (target 은 반대 방향)
+        두 heading 은 항상 반대(하나 90°, 하나 270°)라 어느 조합이든 마주보지 않는다(roll/pitch=0,
+        속도는 둘 다 speed). 4가지 조합(북/남 × 90°/270°)이 모두 나올 수 있다.
         """
-        a = list(self.config["ownship"])   # [n, e, d, roll, pitch, heading, speed]
-        b = list(self.config["target"])
-        center_n = 0.5 * (float(a[0]) + float(b[0]))
-        center_e = 0.5 * (float(a[1]) + float(b[1]))
-        alt_d = float(a[2])                 # 같은 고도
-        speed = float(a[6])                 # 바라보는 방향으로의 속도 크기
+        cfg = self.config
+        center_n = float(cfg.get("start_center_n_m", 3500.0))
+        center_e = float(cfg.get("start_center_e_m", 0.0))
+        hdg_a = float(cfg.get("ownship_heading_deg", 90.0))    # head_swap=False 일 때 ownship heading
+        hdg_b = float(cfg.get("target_heading_deg", 270.0))    # 그 반대(= 상대 heading)
+        alt_d = -float(alt_ft) * self.FEET_TO_METER            # NED down: 음수 = 고도(위)
         half = 0.5 * float(dist_ft) * self.FEET_TO_METER
-        north = [center_n + half, center_e, alt_d, 0.0, 0.0, 90.0, speed]   # 12시 → 동(3시)
-        south = [center_n - half, center_e, alt_d, 0.0, 0.0, 270.0, speed]  # 6시 → 서(9시)
-        return (south, north) if swap else (north, south)
+        own_n = center_n + (-half if side_swap else half)      # side_swap 이면 ownship 을 남(아래)으로
+        tgt_n = center_n + (half if side_swap else -half)
+        own_hdg = hdg_b if head_swap else hdg_a                # head_swap 이면 ownship 이 270°
+        tgt_hdg = hdg_a if head_swap else hdg_b                # target 은 항상 ownship 반대
+        own = [own_n, center_e, alt_d, 0.0, 0.0, own_hdg, float(speed)]
+        tgt = [tgt_n, center_e, alt_d, 0.0, 0.0, tgt_hdg, float(speed)]
+        return own, tgt
 
-    def _apply_start_side(self, swap: bool) -> None:
-        """다음 reset 의 좌우 배정을 강제 지정한다(power_test 의 정확한 50/50 교대용).
+    def _apply_start_side(self, swap: bool, head_swap: bool = False) -> None:
+        """다음 reset 의 북남(swap)·방향(head_swap) 배정을 강제 지정한다(power_test 의 균형 교대용).
 
-        실제 위치는 reset 에서 대회 배치(거리 랜덤 포함)로 적용된다. randomize_start_side=True
-        면 reset 이 좌우를 랜덤으로 정하므로 이 강제값은 무시된다.
+        실제 위치는 reset 에서 대회 배치(거리·고도·속도 랜덤 포함)로 적용된다.
+        randomize_start_side=True 면 reset 이 둘 다 랜덤으로 정하므로 이 강제값은 무시된다.
         """
         self._forced_swap = bool(swap)
+        self._forced_head_swap = bool(head_swap)
 
     def update_damage(self):
         from claude_code.my_observation import damage_rate, METER_TO_FEET
