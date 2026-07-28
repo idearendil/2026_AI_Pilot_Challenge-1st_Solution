@@ -13,9 +13,11 @@
            terminal state 에서는 Φ(s')≡0 으로 강제 → 마지막 transition 이 -Φ(s) 로 텔레스코핑되어
            potential 차분과 종료 보상이 자연스럽게 이어진다. 이 형태는 정책 불변(policy-invariant).
            총 포텐셜 Φ = 아래 3개의 합:
-             (1) 거리·조준 포텐셜 :  _shaping_potential(distance[ft], A1, A2) * shaping_reward_scale
+             (1) 거리·조준 포텐셜 :  (_shaping_potential(distance[ft], A1, A2) - baseline) * shaping_reward_scale
                    A1 = 아군→상대 LOS(|ATA|), A2 = 상대→아군 LOS(|ATA|). 가깝고(WEZ 안) 내가 잘
-                   조준하고 상대는 못 조준할수록 커진다. 원값 ~1e6 라 계수 0.00005 로 축약.
+                   조준하고 상대는 못 조준할수록 커진다. 원값이 ~1e6 근처라 baseline(_SHAPING_BASELINE)
+                   을 빼 O(1) 로 re-center 한 뒤 계수 0.00005 를 곱한다(안 빼면 PBRS 의 (1-γ)Φ drift
+                   로 episode 합이 ~-1000 까지 부푼다). 차분(gradient)은 baseline 과 무관해 불변.
              (2) HP(damage) 포텐셜 :  (내 HP - 상대 HP) * damage_potential_scale(10)   → [-10, +10]
              (3) 고도 포텐셜       :  (min(내고도, cap) - min(상대고도, cap)) / div
                    내 고도·상대 고도는 StateIndex.ALT(미터). cap=4000m, div=300m(=최소고도).
@@ -83,6 +85,14 @@ _prev_phi: float | None = None     # 직전 step 의 총 포텐셜 Φ(s)
 _prev_sim_time: float | None = None
 
 
+# _shaping_potential 은 세 구간 모두 ~1e6 근처의 값을 낸다(985000·999500·1000000-d).
+# PBRS(γ·Φ'-Φ)는 (Φ'-Φ) - (1-γ)Φ 로 전개되는데, 이 거대한 상수 baseline(~50, ×scale 후)이
+# (1-γ)Φ 항으로 매 step ~-0.5 씩 정보 없는 drift 를 만들어 episode 합이 ~-1000 까지 부푼다
+# (정책은 할인 objective 에서 -Φ(s0) 상수라 불변이지만 value target 이 커져 SNR 이 나빠짐).
+# 그래서 거리항에서 이 baseline 을 빼 Φ 를 O(1) 크기로 re-center 한다(차분=gradient 는 불변).
+_SHAPING_BASELINE = 1_000_000.0
+
+
 def _shaping_potential(distance_ft: float, a1_deg: float, a2_deg: float) -> float:
     """거리(ft)/조준(A1,A2 deg, 0~180)을 하나로 합친 상황 포텐셜.
 
@@ -118,7 +128,8 @@ def _total_potential(reward_config, geo_info, ownship_state, target_state,
     dist_ft = float(geo_info._get_distance(ownship_state, target_state)) / _FT_TO_M
     a1 = abs(float(geo_info._get_antenna_train_angle(ownship_state, target_state, False)))
     a2 = abs(float(geo_info._get_antenna_train_angle(target_state, ownship_state, False)))
-    phi_range = _shaping_potential(dist_ft, a1, a2) * float(reward_config["shaping_reward_scale"])
+    phi_range = ((_shaping_potential(dist_ft, a1, a2) - _SHAPING_BASELINE)
+                 * float(reward_config["shaping_reward_scale"]))
     # (2) HP(damage) 포텐셜: (내 HP - 상대 HP) * scale.
     phi_hp = (own_hp - tgt_hp) * float(reward_config["damage_potential_scale"])
     # (3) 고도 포텐셜: (min(내고도, cap) - min(상대고도, cap)) / div. 고도는 ALT(미터).
