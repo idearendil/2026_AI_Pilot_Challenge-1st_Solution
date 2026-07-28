@@ -40,7 +40,7 @@ for _p in (ROOT, ROOT / "src"):
 from claude_code.bt_rule import BT_RULE_DEFAULTS, ENV_KEY  # noqa: E402  (leaf 모듈)
 
 _DEF_OWNSHIP_BT = "AIP_DCS_ownship.dll"
-_DEF_TARGET_BT = "Lee_BT1.dll"   # 기존 baseline. Jeon_BT1.dll / Jeon_BT2.dll 로도 지정 가능
+_DEF_TARGET_BT = "Lee_BT1.dll"   # 기존 baseline. Jeon_BT1 / Jeon_BT2 / Shin_BT1.dll 로도 지정 가능
 
 
 def _resolve_bt_rule(ns) -> str | None:
@@ -253,7 +253,7 @@ def parse_args():
     p.add_argument("--target-bt-dll", default=_DEF_TARGET_BT)
     p.add_argument("--bt-rule-xml", default="",
                    help="BT rule XML(기본: DLL 별 자동 선택. Lee_BT1.dll/Jeon_BT1.dll/"
-                        "Jeon_BT2.dll → 각 동명 .xml)")
+                        "Jeon_BT2.dll/Shin_BT1.dll → 각 동명 .xml)")
     p.add_argument("--target-bt-mode", choices=["behavior_tree", "provider"],
                    default="behavior_tree",
                    help="target bt 를 부르는 경로. behavior_tree(기본) = env 내장 경로"

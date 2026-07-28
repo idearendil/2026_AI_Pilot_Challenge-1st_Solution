@@ -1,0 +1,40 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<root main_tree_to_execute="MainTree">
+  <BehaviorTree ID="MainTree">
+    <Sequence>
+      <SelectTarget          BB="{BB}"/>
+      <DirectionVectorUpdate BB="{BB}"/>
+      <UpdatePhase           BB="{BB}"/>
+      <UpdateGeometry        BB="{BB}"/>
+      <UpdateEnemyTurnCircle BB="{BB}"/>
+
+      <Fallback>
+        <Sequence>
+          <!-- FloorFt / MarginFt 는 네가 조정한 값으로 -->
+          <DECO_GroundDanger BB="{BB}" FloorFt="2000" MarginFt="1500"/>
+          <Task_ClimbRecover BB="{BB}"/>
+        </Sequence>
+
+        <Sequence>
+          <DECO_InMyWEZ BB="{BB}" EnterDeg="30" ExitDeg="45" RangeBufFt="1000"/>
+          <Task_Track   BB="{BB}" AlphaBias="true" LagBlendDeg="10" HoldRangeFt="800"/>
+        </Sequence>
+
+        <Sequence>
+          <DECO_ControlZone BB="{BB}" Approach="true" MinRangeFt="1800"
+                            MaxRangeFt="10000" EnterDeg="90" MinEnemyLOSDeg="60"/>
+          <Task_ControlZone BB="{BB}" HoldRangeFt="1800"/>
+        </Sequence>
+
+        <Sequence>
+          <DECO_FarNeutral    BB="{BB}" RangeFt="7000"/>
+          <Task_LeadIntercept BB="{BB}"/>
+        </Sequence>
+
+        <Task_PurePursuit BB="{BB}"/>
+      </Fallback>
+
+      <ComputeThrottle BB="{BB}" KpT="0.02" KdT="0.01" DThrMaxPerTick="0.05"/>
+    </Sequence>
+  </BehaviorTree>
+</root>

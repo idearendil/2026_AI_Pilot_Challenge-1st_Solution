@@ -31,6 +31,7 @@ BT_RULE_DEFAULTS = {
     "Lee_BT1.dll": "./Lee_BT1.xml",     # 기존 baseline(BaselineCore) 을 이름만 바꾼 것
     "Jeon_BT1.dll": "./Jeon_BT1.xml",   # 추가 BT #1 (WEZ 추적 + 지면 회피)
     "Jeon_BT2.dll": "./Jeon_BT2.xml",   # 추가 BT #2 (FarNeutral + PurePursuit)
+    "Shin_BT1.dll": "./Shin_BT1.xml",   # 추가 BT #3
 }
 DEFAULT_BT_DLL = "Lee_BT1.dll"
 
@@ -39,7 +40,7 @@ DEFAULT_BT_DLL = "Lee_BT1.dll"
 BT_OPPONENTS = [
     ("Lee_BT1.dll", "./Lee_BT1.xml"),
     ("Jeon_BT1.dll", "./Jeon_BT1.xml"),
-    ("Jeon_BT2.dll", "./Jeon_BT2.xml"),
+    ("Shin_BT1.dll", "./Shin_BT1.xml"),
 ]
 
 
