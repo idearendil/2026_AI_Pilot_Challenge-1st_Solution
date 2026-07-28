@@ -170,7 +170,7 @@ def parse_args():
     p.add_argument("--pool-size", type=int, default=7,
                    help="opponent pool 총 슬롯 수(BT 후보 전부 포함). 초과 시 가장 오래 전에 "
                         "추가된 **snapshot** 후보를 제거(FIFO). BT 는 절대 제거되지 않는다. "
-                        "기본 7 = BT 3(Lee_BT1/Jeon_BT1/Shin_BT1) + snapshot 4.")
+                        "기본 7 = BT 2(Lee_BT1/Jeon_BT1) + snapshot 5.")
     p.add_argument("--pool-sample-temp", type=float, default=0.3,
                    help="opponent 샘플링 EMA 가중부의 softmax 온도 τ. weight_i ∝ exp(-ema_i/τ) → "
                         "우리팀 승률(EMA)이 낮은(=어려운) 후보가 더 자주 뽑힘. 작을수록 최저 EMA "

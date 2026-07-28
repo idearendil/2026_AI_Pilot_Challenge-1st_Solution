@@ -37,10 +37,11 @@ DEFAULT_BT_DLL = "Lee_BT1.dll"
 
 # 학습 opponent pool 에 넣을 BT 3종(dll, rule XML). 순서 = pool 슬롯 순서.
 # 한 프로세스 = 1 rule 제약 때문에, 학습에서는 이 목록을 **워커별로 round-robin 배정**한다.
+# Shin_BT1 은 학습 중 native BT Step 에서 access violation 크래시가 잦아 제외했다(2026-07).
+# (DLL 4종은 바이트 동일 = 같은 바이너리 복사본이라 원인은 rule 트리가 태우는 노드/상태.)
 BT_OPPONENTS = [
     ("Lee_BT1.dll", "./Lee_BT1.xml"),
     ("Jeon_BT1.dll", "./Jeon_BT1.xml"),
-    ("Shin_BT1.dll", "./Shin_BT1.xml"),
 ]
 
 
