@@ -135,20 +135,27 @@ def compute_reward(
     #   Φ(s) = _shaping_potential(거리[ft], A1, A2) * shaping_scale,
     #   shaping reward = γΦ(s') − Φ(s).  (γ=1 이면 기존 단순 차분과 동일.)
     # γ 를 학습 gamma 와 맞추면 정책 불변성이 성립한다(reward_config["gamma"]).
+    # terminal state 에서는 Φ(terminal) ≡ 0 으로 강제한다(정석 episodic PBRS 조건).
+    #   → 마지막 transition 의 shaping = γ·0 − Φ(s_prev) = −_prev_x * scale.
     # SIM_TIME 으로 에피소드 경계 감지(거꾸로 가거나 처음이면 새 episode → 보상 0).
+    done = bool(terminated or truncated)
     cur_sim_time = float(ownship_state[StateIndex.SIM_TIME])
     new_episode = _prev_x is None or cur_sim_time <= _prev_sim_time
     shaping_scale = float(reward_config["shaping_reward_scale"])
     gamma = float(reward_config["gamma"])
     r_shaping = 0.0
     if shaping_scale != 0.0:
-        # _get_distance 는 meter → ft 로 환산. A1/A2 는 3D ATA(proj=False, 0~180).
-        dist_ft = float(geo_info._get_distance(ownship_state, target_state)) / _FT_TO_M
-        a1 = abs(float(
-            geo_info._get_antenna_train_angle(ownship_state, target_state, False)))
-        a2 = abs(float(
-            geo_info._get_antenna_train_angle(target_state, ownship_state, False)))
-        cur_x = _shaping_potential(dist_ft, a1, a2)
+        if done:
+            cur_x = 0.0   # Φ(terminal) ≡ 0
+        else:
+            # _get_distance 는 meter → ft 로 환산. A1/A2 는 3D ATA(proj=False, 0~180).
+            dist_ft = float(
+                geo_info._get_distance(ownship_state, target_state)) / _FT_TO_M
+            a1 = abs(float(
+                geo_info._get_antenna_train_angle(ownship_state, target_state, False)))
+            a2 = abs(float(
+                geo_info._get_antenna_train_angle(target_state, ownship_state, False)))
+            cur_x = _shaping_potential(dist_ft, a1, a2)
         if not new_episode:
             # γΦ(s') − Φ(s) = (γ·cur_x − _prev_x) * shaping_scale
             r_shaping = (gamma * cur_x - _prev_x) * shaping_scale
