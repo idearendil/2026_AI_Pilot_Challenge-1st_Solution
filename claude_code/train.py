@@ -271,6 +271,8 @@ def main():
     reward_overrides = {}
     if args.shaping_reward_scale is not None:
         reward_overrides["shaping_reward_scale"] = args.shaping_reward_scale
+    # PBRS(shaping = γΦ(s')−Φ(s)) 의 γ 를 학습 gamma 와 일치시킨다(정책 불변성 성립 조건).
+    reward_overrides["gamma"] = args.gamma
     reward_overrides = reward_overrides or None
     # "opponent 에게 준 damage" 원값 복원용 damage_scale (my_reward: r_damage = 준damage×scale,
     # 받은damage 가중치 0 이므로 준damage = damage_reward / scale).

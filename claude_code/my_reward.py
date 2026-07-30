@@ -60,6 +60,9 @@ MY_REWARD_CONFIG = {
     #   target_alt_reward(5)·damage 한 방(≈10)과 같은 자릿수. 상대도 나를 조준하면
     #   경쟁항이 상쇄돼 총합이 줄어든다(설계 의도).
     "shaping_reward_scale": 0.00005,
+    # PBRS: shaping reward = γΦ(s')−Φ(s) 의 γ. 정책 불변성이 성립하려면 학습 gamma 와
+    # 같아야 하므로 train.py 가 args.gamma 로 이 값을 덮어쓴다(덮어쓰지 않으면 이 기본값).
+    "gamma": 0.98,
 }
 # 주의: 아래 compute_reward 는 이 dict 의 키를 **직접 인덱싱**한다(.get 폴백 없음).
 # 계수를 바꾸려면 반드시 이 dict(또는 train.py 의 --*-reward-scale 오버라이드)를 고칠 것.
@@ -128,11 +131,15 @@ def compute_reward(
             reward_config["damage_scale"]
         )
 
-    # [보조] 상황 포텐셜 shaping: 거리(ft)/조준(A1,A2)을 합친 포텐셜 x 의 step 차분.
+    # [보조] 상황 포텐셜 shaping: PBRS(potential-based reward shaping).
+    #   Φ(s) = _shaping_potential(거리[ft], A1, A2) * shaping_scale,
+    #   shaping reward = γΦ(s') − Φ(s).  (γ=1 이면 기존 단순 차분과 동일.)
+    # γ 를 학습 gamma 와 맞추면 정책 불변성이 성립한다(reward_config["gamma"]).
     # SIM_TIME 으로 에피소드 경계 감지(거꾸로 가거나 처음이면 새 episode → 보상 0).
     cur_sim_time = float(ownship_state[StateIndex.SIM_TIME])
     new_episode = _prev_x is None or cur_sim_time <= _prev_sim_time
     shaping_scale = float(reward_config["shaping_reward_scale"])
+    gamma = float(reward_config["gamma"])
     r_shaping = 0.0
     if shaping_scale != 0.0:
         # _get_distance 는 meter → ft 로 환산. A1/A2 는 3D ATA(proj=False, 0~180).
@@ -143,7 +150,8 @@ def compute_reward(
             geo_info._get_antenna_train_angle(target_state, ownship_state, False)))
         cur_x = _shaping_potential(dist_ft, a1, a2)
         if not new_episode:
-            r_shaping = (cur_x - _prev_x) * shaping_scale
+            # γΦ(s') − Φ(s) = (γ·cur_x − _prev_x) * shaping_scale
+            r_shaping = (gamma * cur_x - _prev_x) * shaping_scale
         _prev_x = cur_x
     _prev_sim_time = cur_sim_time
 
