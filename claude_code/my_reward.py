@@ -16,10 +16,10 @@
            거리가 가깝고(단, WEZ 안쪽), 내가 잘 조준하고, 상대는 못 조준할수록 x 가 커진다.
            차분 형태라 텔레스코핑(episode 총합 = (x_end - x_start) * scale) → bounded.
            _shaping_potential 정의(연속함수, distance 는 ft, A 는 deg 0~180):
-             distance ∈ [0, 500):     (d+14000)*(90-A1)/90*2.5 - (d+14000)*(90-A2)/90*2.5 + 999500
-             distance ∈ [500, 15000): (15000-d) + (15000-d)*(90-A1)/90*2.5 - (15000-d)*(90-A2)/90*2.5 + 985000
-             distance ∈ [15000, ∞):   1000000 - d
-           (경계 500ft·15000ft 에서 연속. 값은 대략 ~1e6 근처.)
+             distance ∈ [0, 500):     (d+14000)*(90-A1)/90*2.5 - (d+14000)*(90-A2)/90*2.5 - 500
+             distance ∈ [500, 15000): (15000-d) + (15000-d)*(90-A1)/90*2.5 - (15000-d)*(90-A2)/90*2.5 - 15000
+             distance ∈ [15000, ∞):   -d
+           (경계 500ft·15000ft 에서 연속. 상수항을 baseline 1e6 만큼 낮춰 0 근처로 센터링.)
 
 claude_code/train.py 는 기본적으로 이 모듈을 사용한다(끄려면 --reward-module "").
 
@@ -53,10 +53,12 @@ MY_REWARD_CONFIG = {
     "ownship_alt_reward": -20.0,   # 내 고도가 최소고도 이하로 떨어져 종료
     "target_alt_reward": 5.0,      # 상대 고도가 최소고도 이하로 떨어져 종료
     "damage_scale": 5.0,   # (상대 HP감소 - 내 HP감소) * 이 값, 양측 생존 중 매 step
-    # 상황 포텐셜 shaping 계수. reward += (x_cur - x_prev) * 이 값.
-    # x 는 _shaping_potential(거리[ft], A1[deg], A2[deg]) 로 대략 ~1e6 스케일이다.
+    # 상황 포텐셜 shaping 계수. shaping = (γ·x_cur − x_prev) * 이 값 (PBRS).
+    # x 는 _shaping_potential(거리[ft], A1[deg], A2[deg]) 로 baseline 1e6 을 뺀
+    # 0 중심(대략 ±5만 스케일)이다. 상수 offset 을 없애 γ<1 PBRS 의 −(1−γ)·ΣΦ drift 를
+    # 제거했다(shaping 합이 −1400 로 발산하던 문제 해결).
     #   대표 궤적(원거리 20000ft·조준無 → 근거리 1000ft·내 조준0°·상대 90°)의
-    #   포텐셜 상승 x_end-x_start ≈ 54000 → 이 값 0.0001 이면 episode 총합 ≈ 5.4 로
+    #   포텐셜 상승 x_end-x_start ≈ 54000 → 이 값 0.0001 이면 차분 총합 ≈ 5.4 로
     #   target_alt_reward(5)·damage 한 방(≈10)과 같은 자릿수. 상대도 나를 조준하면
     #   경쟁항이 상쇄돼 총합이 줄어든다(설계 의도).
     "shaping_reward_scale": 0.00005,
@@ -85,18 +87,23 @@ def _shaping_potential(distance_ft: float, a1_deg: float, a2_deg: float) -> floa
     경계 500ft·15000ft 에서 연속. (90-A) 항은 A>90(등 뒤) 이면 음수가 되어 자연스럽게
     페널티로 작동하므로 clamp 하지 않는다.
     """
+    # 상수항을 baseline 1,000,000 만큼 낮춰 Φ 를 0 근처로 센터링한다.
+    #   (999500, 985000, 1000000) - 1000000 = (-500, -15000, 0)
+    # PBRS 는 γ<1 이라 Φ 의 상수 offset C 가 스텝마다 −(1−γ)C 만큼 drift 를 쌓는데,
+    # ~1e6 offset × scale ≈ 50 이 (1−γ)·T 스텝에 걸쳐 shaping 합을 −1400~−2000 으로
+    # 끌어내렸다. 세 branch 에서 같은 값을 빼므로 경계 500/15000ft 연속성은 유지된다.
     if distance_ft <= 500.0:
         base = distance_ft + 14000.0
         return (base * (90.0 - a1_deg) / 90.0 * 2.5
                 - base * (90.0 - a2_deg) / 90.0 * 2.5
-                + 999500.0)
+                - 500.0)
     if distance_ft <= 15000.0:
         base = 15000.0 - distance_ft
         return (base
                 + base * (90.0 - a1_deg) / 90.0 * 2.5
                 - base * (90.0 - a2_deg) / 90.0 * 2.5
-                + 985000.0)
-    return 1000000.0 - distance_ft
+                - 15000.0)
+    return -distance_ft
 
 
 def reset_distance_tracker() -> None:
