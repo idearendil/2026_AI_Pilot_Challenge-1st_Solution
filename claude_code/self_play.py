@@ -41,6 +41,31 @@ def make_bt_provider(dll_name: str = DEFAULT_BT_DLL, rule_xml: str = ""):
     return BTActionProvider(dll_name=dll_name)
 
 
+def make_mpc_provider(mpc_root: str, mpc_config: str = ""):
+    """팀 공유 MPC agent 를 opponent pool 후보로 쓰는 ActionProvider 를 만든다.
+
+    BT 와 달리 MPC 는 전역 rule(AIP_RULE_XML)·프로세스 제약이 없어(자체 native predictor
+    DLL 을 인스턴스별로 로드) 모든 워커에 동일하게 넣을 수 있다. 워커마다 1개씩 생성한다.
+
+    import 규약: 번들의 mpc 패키지는 <mpc_root>/src 에서, dogfight 는 메인 repo 에서
+    해석돼야 한다. 메인 src 는 이미 sys.path 앞쪽에 있으므로 번들 src 는 **뒤에** 붙인다
+    (둘 다 dogfight 를 갖지만 앞선 메인이 이김; mpc 는 번들에만 있어 문제없음).
+    MPCActionProvider(root=...) 는 native DLL·config·F16 XML 자산을 이 root 밑에서 찾는다.
+    """
+    import sys as _sys
+    from pathlib import Path as _Path
+
+    root = _Path(mpc_root).resolve()
+    bundle_src = str(root / "src")
+    if bundle_src not in _sys.path:
+        _sys.path.append(bundle_src)
+    from mpc.config import load_config
+    from mpc.provider import MPCActionProvider
+
+    cfg_path = mpc_config or str(root / "configs" / "mpc.yaml")
+    return MPCActionProvider(root=root, config=load_config(cfg_path))
+
+
 class SelfPlayProvider(ActionProvider):
     def __init__(self, model, obs_rms, observation_fn=None, observation_mode="claude16r",
                  step_ratio: int = 6, device: str = "cpu", explore: bool = False):
@@ -178,4 +203,4 @@ class PoolSelfPlayProvider(ActionProvider):
 
 
 __all__ = ["SelfPlayProvider", "PoolSelfPlayProvider", "make_bt_provider",
-           "BT_RULE_DEFAULTS", "DEFAULT_BT_DLL"]
+           "make_mpc_provider", "BT_RULE_DEFAULTS", "DEFAULT_BT_DLL"]

@@ -185,24 +185,41 @@ def _make_worker_cls():
                 self._bt_provider = make_bt_provider(bt_dll, bt_rule)
             return self._bt_provider
 
+        def _get_mpc_provider(self, mpc_root, mpc_config):
+            """MPC 상대 provider(worker 당 1개, 재사용). native predictor DLL 은 1회만 로드.
+
+            BT 와 달리 프로세스 제약이 없어 모든 워커가 동일 MPC 를 로컬 pool 에 갖는다.
+            """
+            if getattr(self, "_mpc_provider", None) is None:
+                from claude_code.self_play import make_mpc_provider
+                self._mpc_provider = make_mpc_provider(mpc_root, mpc_config)
+            return self._mpc_provider
+
         def pool_init(self, state_dict, mean, var, count, weights, pool_max, seed,
-                      bt_dll="", bt_rule="", bt_index=0, n_bt=0):
+                      bt_dll="", bt_rule="", bt_index=0, n_bt=0,
+                      mpc_root="", mpc_config="", n_mpc=0):
             """opponent pool 초기화. target provider 를 pool 로 교체.
 
-            이 워커의 **로컬** pool = [이 워커에 배정된 BT 1개(있으면)] + [snapshot...].
-            bt_index = 이 BT 의 **글로벌** 슬롯(0..n_bt-1), n_bt = 전체 BT 수(글로벌).
-            로컬 슬롯(0=BT, 1+=snapshot)을 글로벌 슬롯으로 매핑해 driver 가 BT별 EMA 를
-            분리 집계한다. bt_dll 이 있으면 로컬 slot0=BT(고정, 절대 evict 안 됨).
+            이 워커의 **로컬** pool = [배정된 BT 1개(있으면)] + [MPC(있으면, 모든 워커 공통)]
+            + [snapshot...]. bt_index = 이 BT 의 **글로벌** 슬롯(0..n_bt-1),
+            n_bt = 전체 BT 수, n_mpc = MPC 수(0/1, 글로벌 슬롯 n_bt).
+            로컬 슬롯을 글로벌 슬롯으로 매핑해(collect 참고) driver 가 상대별 EMA 를 분리
+            집계한다. BT·MPC 슬롯은 고정(절대 evict 안 됨).
             """
             from claude_code.self_play import PoolSelfPlayProvider
             self._pool_max = max(1, int(pool_max))
             self._bt_index = int(bt_index)
             self._n_bt = int(n_bt)
+            self._n_mpc = int(n_mpc)
             provs = []
             self._bt_slots = 0
             if bt_dll:
                 provs.append(self._get_bt_provider(bt_dll, bt_rule))
                 self._bt_slots = 1
+            self._mpc_slots = 0
+            if mpc_root and n_mpc:
+                provs.append(self._get_mpc_provider(mpc_root, mpc_config))
+                self._mpc_slots = 1
             provs.append(self._build_opp_provider(state_dict, mean, var, count))
             self._pool_provider = PoolSelfPlayProvider(provs, weights, seed=int(seed))
             self.env._target_action_provider = self._pool_provider
@@ -210,13 +227,14 @@ def _make_worker_cls():
         def pool_add(self, state_dict, mean, var, count):
             """현재 정책 frozen copy 를 pool 에 추가(초과 시 oldest **snapshot** 제거) + env 리셋.
 
-            slot0 이 BT 면(_bt_slots=1) index 1 부터 제거하므로 BT 는 유지된다.
+            고정 슬롯(BT _bt_slots + MPC _mpc_slots) 다음 index 부터 제거하므로 BT·MPC 는 유지된다.
             """
             prov = self._build_opp_provider(state_dict, mean, var, count)
             providers = list(self._pool_provider.providers)
             providers.append(prov)
+            fixed_slots = int(getattr(self, "_bt_slots", 0)) + int(getattr(self, "_mpc_slots", 0))
             if len(providers) > self._pool_max:
-                providers.pop(int(getattr(self, "_bt_slots", 0)))
+                providers.pop(fixed_slots)
             self._pool_provider.set_pool(providers)
             if self._reset_recon is not None:
                 self._reset_recon()
@@ -234,21 +252,28 @@ def _make_worker_cls():
                 self._pool_provider.set_weights(weights)
 
         def pool_set_all(self, state_dicts, means, vars_, counts, weights, pool_max, seed,
-                         bt_dll="", bt_rule="", bt_index=0, n_bt=0):
+                         bt_dll="", bt_rule="", bt_index=0, n_bt=0,
+                         mpc_root="", mpc_config="", n_mpc=0):
             """checkpoint 의 opponent pool 을 이 워커의 로컬 pool 로 복원.
 
-            state_dicts 는 **snapshot 후보만** 오래된→최신. bt_dll 이 있으면 이 워커에
-            배정된 BT 1개를 로컬 slot0 에 넣는다. bt_index/n_bt 는 글로벌 매핑용.
+            state_dicts 는 **snapshot 후보만** 오래된→최신. bt_dll 이 있으면 배정된 BT 1개를,
+            mpc_root/n_mpc 가 있으면 MPC 1개를 고정 슬롯으로 넣는다(BT 다음, snapshot 앞).
+            bt_index/n_bt/n_mpc 는 글로벌 매핑용.
             """
             from claude_code.self_play import PoolSelfPlayProvider
             self._pool_max = max(1, int(pool_max))
             self._bt_index = int(bt_index)
             self._n_bt = int(n_bt)
+            self._n_mpc = int(n_mpc)
             provs = []
             self._bt_slots = 0
             if bt_dll:
                 provs.append(self._get_bt_provider(bt_dll, bt_rule))
                 self._bt_slots = 1
+            self._mpc_slots = 0
+            if mpc_root and n_mpc:
+                provs.append(self._get_mpc_provider(mpc_root, mpc_config))
+                self._mpc_slots = 1
             provs += [self._build_opp_provider(st, mn, vr, ct)
                       for st, mn, vr, ct in zip(state_dicts, means, vars_, counts)]
             self._pool_provider = PoolSelfPlayProvider(provs, weights, seed=int(seed))
@@ -311,13 +336,20 @@ def _make_worker_cls():
                         ep_outcomes.append(oc)
                         prov = getattr(self.env, "_target_action_provider", None)
                         local = int(getattr(prov, "last_index", 0))
-                        # 로컬 슬롯(0=이 워커 BT, 1+=snapshot) → 글로벌 슬롯 매핑.
-                        # BT: 글로벌 bt_index. snapshot: n_bt + (로컬 snapshot 순번).
+                        # 로컬 슬롯([BT?][MPC?][snapshot...]) → 글로벌 슬롯([BT n_bt][MPC n_mpc][snap]).
+                        #   BT   : 글로벌 bt_index (0..n_bt-1)
+                        #   MPC  : 글로벌 n_bt (모든 워커 공통 단일 슬롯)
+                        #   snap : n_bt + n_mpc + (로컬 snapshot 순번)
                         bt_slots = int(getattr(self, "_bt_slots", 0))
+                        mpc_slots = int(getattr(self, "_mpc_slots", 0))
+                        n_bt = int(getattr(self, "_n_bt", 0))
+                        n_mpc = int(getattr(self, "_n_mpc", 0))
                         if bt_slots and local < bt_slots:
                             gidx = int(getattr(self, "_bt_index", 0))
+                        elif mpc_slots and local < bt_slots + mpc_slots:
+                            gidx = n_bt                       # MPC 글로벌 슬롯
                         else:
-                            gidx = int(getattr(self, "_n_bt", 0)) + (local - bt_slots)
+                            gidx = n_bt + n_mpc + (local - bt_slots - mpc_slots)
                         ep_opp_indices.append(gidx)
                     self._ep_return = 0.0
                     self._ep_len = 0
@@ -379,47 +411,6 @@ def _make_worker_cls():
                 self._ep_len = 0
             return results
 
-        def eval_pair(self, a_state, a_rms, b_is_bt, b_state, b_rms, seeds, stochastic=True):
-            """PSRO payoff 측정용: 정책 A(ownship)를 상대 B(target)와 seeds 만큼 붙여 A 의
-            승/패/무를 반환한다. B 가 BT 면 **이 워커에 배정된 BT**(self._bt_provider)를 쓴다
-            (driver 가 해당 BT 워커 그룹에 매치를 보냄). B 가 snapshot 이면 그 net 으로 상대 구성.
-            평가 후 collect 연속성을 복구한다.
-            """
-            from claude_code import evaluation
-            model_a = make_actor_critic(**self._model_kwargs)
-            model_a.load_state_dict({k: torch.as_tensor(v) for k, v in a_state.items()})
-            model_a.eval()
-            a_mean = np.asarray(a_rms["mean"]) if a_rms else None
-            a_var = np.asarray(a_rms["var"]) if a_rms else None
-
-            prev = self.env._target_action_provider
-            if b_is_bt:
-                # 이 워커에 배정된 BT provider(pool_init 에서 생성됨). driver 가 이 BT 매치를
-                # 이 워커 그룹에만 보낸다.
-                target = getattr(self, "_bt_provider", None)
-                self.env._target_action_provider = target if target is not None else prev
-            else:
-                mb = make_actor_critic(**self._model_kwargs)
-                mb.load_state_dict({k: torch.as_tensor(v) for k, v in b_state.items()})
-                mb.eval()
-                self.env._target_action_provider = evaluation.make_opponent(
-                    self.env, mb, b_rms, stochastic)
-            try:
-                results = evaluation.play_games(
-                    self.env, model_a, a_mean, a_var, seeds, stochastic, self.reconstruct, "cpu")
-            finally:
-                self.env._target_action_provider = prev
-                if self._reset_recon is not None:
-                    self._reset_recon()
-                obs, _ = self.env.reset()
-                if self._reset_recon is not None:
-                    self._reset_recon()
-                self._next_obs = np.asarray(obs, dtype=np.float32)
-                self._next_done = False
-                self._ep_return = 0.0
-                self._ep_len = 0
-            return evaluation.summarize(results)
-
     return RolloutWorker
 
 
@@ -430,13 +421,17 @@ class ParallelPPOTrainer:
 
     def __init__(self, env_kwargs, config: PPOConfig, num_workers: int,
                  self_play: bool, obs_dim: int, act_dim: int,
-                 bt_opponents=None):
+                 bt_opponents=None, mpc_opponent=None):
         import ray
         self.cfg = config
         self.num_workers = max(1, int(num_workers))
         self.obs_dim = obs_dim
         self.act_dim = act_dim
         self.global_step = 0
+        # MPC(team-share) 고정 상대. (mpc_root, mpc_config) 또는 None. BT 와 달리 프로세스
+        # 제약이 없어 모든 워커에 동일하게 넣는다(글로벌 단일 슬롯 n_bt). n_mpc = 0/1.
+        self._mpc_root, self._mpc_config = (mpc_opponent or ("", ""))
+        self._n_mpc = 1 if self._mpc_root else 0
         # opponent pool 에 넣을 BT 목록 [(dll, rule), ...]. 워커를 여기에 round-robin 배정한다.
         # 한 프로세스 = BT rule 1개 제약 때문에, 워커별로 다른 BT 를 고정 배정하고 그 rule 을
         # 워커 프로세스 시작 시점(runtime_env)에 AIP_RULE_XML 로 주입한다(claude_code.bt_rule).
@@ -569,46 +564,6 @@ class ParallelPPOTrainer:
         results = [r for sub in ray.get(futs) for r in sub]
         return evaluation.summarize(results)
 
-    # ── PSRO: 새 opponent 를 pool 의 모든 멤버와 붙여 승률(payoff) 측정 ──────────
-    def eval_new_opponent(self, new_state, new_rms, pool, n_games, base_seed):
-        """정책 new_state 를 pool 의 각 멤버와 n_games 판씩 붙여 new 의 승률 리스트(멤버 순)를
-        반환한다. BT 매치는 그 BT 를 로드한 워커 그룹에, snapshot 매치는 임의 워커에 배정한다.
-        (한 프로세스=BT 1개 제약 때문에 BT 매치는 아무 워커나 못 쓴다.)
-
-        pool[i]: {"kind": "bt"|"net", "bt_index": g, "state": np, "rms": {...}} 형태.
-        """
-        import ray
-        seeds = [int(base_seed) + k for k in range(int(n_games))]
-        # bt_index → 그 BT 를 호스팅하는 워커 인덱스들
-        workers_by_bt = {}
-        for wi, (_d, _r, b) in enumerate(self._bt_assign):
-            workers_by_bt.setdefault(int(b), []).append(wi)
-
-        new_ref = ray.put(new_state)
-        futs, order = [], []
-        rr = 0
-        for m_idx, member in enumerate(pool):
-            if member.get("kind") == "bt":
-                g = int(member.get("bt_index", 0))
-                cand = workers_by_bt.get(g) or list(range(self.num_workers))
-                w = cand[m_idx % len(cand)]
-                fut = self.workers[w].eval_pair.remote(new_ref, new_rms, True, None, None,
-                                                       seeds, True)
-            else:
-                w = rr % self.num_workers
-                rr += 1
-                fut = self.workers[w].eval_pair.remote(new_ref, new_rms, False,
-                                                       member.get("state"), member.get("rms"),
-                                                       seeds, True)
-            futs.append(fut)
-            order.append(m_idx)
-        summaries = ray.get(futs)
-        win_rates = [0.5] * len(pool)
-        for m_idx, summ in zip(order, summaries):
-            wr = summ.get("win_rate")
-            win_rates[m_idx] = float(wr) if wr is not None and wr == wr else 0.5
-        return win_rates
-
     def set_frozen_opponent(self, state_dict, rms_mean, rms_var, rms_count):
         """모든 worker 의 self-play 상대를 '초기 actor net 고정' 으로 교체(broadcast)."""
         import ray
@@ -636,7 +591,8 @@ class ParallelPPOTrainer:
         ray.get([
             w.pool_init.remote(ref, mean, var, count, list(per_worker_weights[i]),
                                self._pool_max, self.cfg.seed + 101 + i,
-                               dll, rule, bti, self._n_bt)
+                               dll, rule, bti, self._n_bt,
+                               self._mpc_root, self._mpc_config, self._n_mpc)
             for i, (w, (dll, rule, bti)) in enumerate(zip(self.workers, self._bt_assign))
         ])
 
@@ -679,7 +635,8 @@ class ParallelPPOTrainer:
         ray.get([
             w.pool_set_all.remote(sref, means, vars_, counts, list(per_worker_weights[i]),
                                   self._pool_max, self.cfg.seed + 101 + i,
-                                  dll, rule, bti, self._n_bt)
+                                  dll, rule, bti, self._n_bt,
+                                  self._mpc_root, self._mpc_config, self._n_mpc)
             for i, (w, (dll, rule, bti)) in enumerate(zip(self.workers, self._bt_assign))
         ])
 

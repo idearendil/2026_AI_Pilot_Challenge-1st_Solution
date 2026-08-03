@@ -13,7 +13,7 @@
 
 ```
 # (1)-1 phase 1 학습(reward 식에 distance 항 추가됨)  — 결과 번들이 artifacts/models/team01/ppo_phase1 에 저장됨
-python claude_code/train.py --output-name ppo --output-tag psro
+python claude_code/train.py --output-name ppo --output-tag ppo_phase1
 # (1)-2 phase 2 학습(reward 식에 distance 항 제거됨)  — 결과 번들이 artifacts/models/team01/ppo_phase2 에 저장됨
 (아직 phase2 학습을 하고 나서도 서로 damage를 잘 주진 못함...)
 python claude_code/train.py --output-name team01 --output-tag ppo_phase2 --resume-from claude_code/models/team01/ppo_phase1/iter_0150.pt --distance-reward-scale 0

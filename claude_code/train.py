@@ -179,6 +179,15 @@ def parse_args():
                    help="opponent 샘플 확률 중 '균등 분배' 비율 f. p_i = f·(1/m) + (1-f)·softmax(-ema_i/τ) "
                         "(m=로컬 후보 수). 확률의 f 는 모든 후보에 똑같이, 나머지 (1-f) 만 EMA 승률에 "
                         "따라 분배한다. 초반에 강한 BT 만 뽑혀 과난이도가 되는 걸 막는 바닥(기본 0.5).")
+    # MPC(team-share) 고정 상대. BT 와 달리 프로세스 제약이 없어 **모든 워커**에 동일하게
+    # 들어간다(글로벌 단일 슬롯). native predictor DLL 이 무거워 num_workers>1(Ray) 에서만 지원.
+    p.add_argument("--mpc-opponent", action="store_true",
+                   help="opponent pool 에 팀 공유 MPC agent 를 고정 상대로 추가(never-evict, 모든 워커 공통). "
+                        "글로벌 슬롯이 BT 다음·snapshot 앞에 1칸 늘어난다(--pool-size 에 포함).")
+    p.add_argument("--mpc-root", default="Release_MPC_team_share",
+                   help="MPC 번들 루트(=native DLL·config·F16 XML 자산 위치). 프로젝트 루트 기준 상대경로 허용.")
+    p.add_argument("--mpc-config", default="",
+                   help="MPC config yaml 경로(비우면 <mpc-root>/configs/mpc.yaml).")
     p.add_argument("--seed", type=int, default=0)
     # loiter: 표적이 선회하며 고도를 유지(자기파괴 없음) → episode 가 timeout(terminal=0)
     # 으로 끝나므로 return 이 ownship 의 추격/사격 성과로만 결정돼 학습 신호가 깨끗하다.
@@ -336,13 +345,33 @@ def main():
     bt_list = (list(BT_OPPONENTS)[:min(len(BT_OPPONENTS), int(args.num_workers))]
                if bt_enabled else [])
 
+    # MPC 고정 상대(옵션). BT 와 달리 프로세스 제약이 없어 모든 워커에 동일하게 넣는다.
+    # native predictor 가 무거워 병렬(Ray) 경로에서만 지원한다.
+    mpc_opponent = None
+    if args.mpc_opponent:
+        if not args.self_play:
+            raise SystemExit("--mpc-opponent 는 self-play opponent pool 경로에서만 씁니다(--self-play 필요).")
+        if args.num_workers <= 1:
+            raise SystemExit("--mpc-opponent 는 num_workers>1(Ray 병렬)에서만 지원합니다.")
+        mpc_root = Path(args.mpc_root)
+        if not mpc_root.is_absolute():
+            mpc_root = ROOT / mpc_root
+        mpc_root = mpc_root.resolve()
+        mpc_cfg = args.mpc_config
+        if not mpc_cfg:
+            mpc_cfg = str(mpc_root / "configs" / "mpc.yaml")
+        if not Path(mpc_cfg).exists():
+            raise SystemExit(f"--mpc-opponent: MPC config 를 찾을 수 없습니다: {mpc_cfg}")
+        mpc_opponent = (str(mpc_root), str(mpc_cfg))
+        print(f"[claude_code/PPO] MPC 고정 상대 활성: root={mpc_root} config={mpc_cfg}")
+
     # 데이터 수집: num_workers>1 이면 Ray 병렬, 아니면 단일 프로세스.
     if args.num_workers > 1:
         from claude_code.parallel import ParallelPPOTrainer
         env.close()   # driver 는 rollout env 를 step 하지 않음 (worker 가 가짐)
         trainer = ParallelPPOTrainer(env_kwargs, cfg, args.num_workers,
                                      args.self_play, obs_dim, act_dim,
-                                     bt_opponents=bt_list)
+                                     bt_opponents=bt_list, mpc_opponent=mpc_opponent)
     else:
         trainer = PPOTrainer(env, cfg, bt_opponents=bt_list)
     # gated self-play 상대는 resume(weights 확정) 후에 '현재 정책의 frozen copy' 로 설치한다.
@@ -401,9 +430,11 @@ def main():
                     "selfplay_gate_threshold": (None if args.frozen_opponent
                                                 else args.selfplay_gate_threshold),
                     "selfplay_ema_alpha": args.selfplay_ema_alpha,
-                    "pool_size": (len(bt_list)
+                    "pool_size": (len(bt_list) + (1 if mpc_opponent else 0)
                                   + (1 if args.frozen_opponent
-                                     else max(1, int(args.pool_size) - len(bt_list)))),
+                                     else max(1, int(args.pool_size) - len(bt_list)
+                                              - (1 if mpc_opponent else 0)))),
+                    "mpc_opponent": bool(mpc_opponent),
                     "pool_sample_temp": args.pool_sample_temp,
                     "bt_opponents": ([d for d, _ in bt_list] if bt_enabled else None),
                     "reward_module": args.reward_module,
@@ -486,13 +517,16 @@ def main():
     # --frozen-opponent 이면 임계값을 무한대로 둬서 영구 고정(승격 안 함).
     gate_threshold = float("inf") if args.frozen_opponent else float(args.selfplay_gate_threshold)
     # bt_list 는 위(trainer 생성 전)에서 이미 계산(워커 수로 cap). trainer._bt_assign 과 일치.
-    # 글로벌 pool 슬롯: [BT n_bt개] + [snapshot cap개]. 워커를 BT 별로 round-robin 분할한다.
+    # 글로벌 pool 슬롯: [BT n_bt개] + [MPC n_mpc개] + [snapshot cap개]. BT 는 워커 round-robin,
+    # MPC 는 모든 워커 공통(글로벌 단일 슬롯 n_bt). 둘 다 절대 evict 안 됨.
     n_bt = len(bt_list)
-    # --pool-size = 총 슬롯 수(BT 전부 포함). snapshot 정원 = pool_size - n_bt (최소 1).
+    n_mpc = 1 if mpc_opponent else 0
+    # --pool-size = 총 슬롯 수(BT·MPC 전부 포함). snapshot 정원 = pool_size - n_bt - n_mpc (최소 1).
     # frozen 이면 snapshot 1개 고정.
-    snapshot_cap = 1 if args.frozen_opponent else max(1, int(args.pool_size) - n_bt)
-    pool_max = n_bt + snapshot_cap                       # 글로벌 총 슬롯(BT n_bt + snapshot cap)
-    local_pool_max = (1 + snapshot_cap) if n_bt else snapshot_cap   # 워커 로컬(BT 1 + snapshot)
+    snapshot_cap = 1 if args.frozen_opponent else max(1, int(args.pool_size) - n_bt - n_mpc)
+    pool_max = n_bt + n_mpc + snapshot_cap               # 글로벌 총 슬롯
+    # 워커 로컬 = [BT 1개(있으면)] + [MPC(모든 워커 공통)] + [snapshot cap].
+    local_pool_max = (1 if n_bt else 0) + n_mpc + snapshot_cap
     if resume_ckpt is not None:
         pool_max = int(resume_ckpt["pool_max"])
 
@@ -507,6 +541,9 @@ def main():
         (다른 BT 는 이 워커 로컬 pool 에 없으므로 자연히 확률 0.)
         """
         snap_emas = [e["ema"] for e in pool if e["kind"] == "net"]
+        # MPC 는 글로벌 슬롯 n_bt(=BT 다음). 로컬 벡터 순서 = [BT?][MPC?][snapshots] 로,
+        # 워커의 로컬 provider 순서와 정확히 일치시켜야 한다.
+        mpc_emas = [pool[n_bt]["ema"]] if n_mpc else []
         temp = max(float(args.pool_sample_temp), 1e-6)
         floor = min(max(float(args.pool_uniform_floor), 0.0), 1.0)
 
@@ -524,14 +561,15 @@ def main():
             return (p / sm).tolist() if sm > 1e-12 else (np.ones(m) / m).tolist()
 
         if n_bt == 0:
-            v = _mix(snap_emas)
+            v = _mix(mpc_emas + snap_emas)
             return [v for _ in range(trainer.num_workers)]
-        vecs = [_mix([pool[b]["ema"]] + snap_emas) for b in range(n_bt)]
+        vecs = [_mix([pool[b]["ema"]] + mpc_emas + snap_emas) for b in range(n_bt)]
         return [vecs[i % n_bt] for i in range(trainer.num_workers)]
 
     # opponent pool 메타데이터(train.py 소유, checkpoint 저장 대상). 글로벌 슬롯 순서:
-    #   slots 0..n_bt-1 = BT(kind="bt", bt_index, dll, rule) — 절대 evict 안 됨,
-    #   slots n_bt..    = snapshot(kind="net", gen, ema, state, rms).
+    #   slots 0..n_bt-1        = BT(kind="bt", bt_index, dll, rule) — 워커 round-robin, evict 안 됨,
+    #   slot  n_bt (n_mpc=1)   = MPC(kind="mpc") — 모든 워커 공통, evict 안 됨,
+    #   slots n_bt+n_mpc..     = snapshot(kind="net", gen, ema, state, rms).
     pool: list = []
     pool_state = {"next_gen": 1, "n_added": 0}
 
@@ -540,6 +578,11 @@ def main():
                  "state": None, "rms": None, "dll": dll, "rule": rule}
                 for b, (dll, rule) in enumerate(bt_list)]
 
+    def _mpc_entries() -> list:
+        # MPC 는 net 아님 → state/rms 없음. 정체성은 CLI(--mpc-*)에서 워커가 재생성한다.
+        return ([{"kind": "mpc", "bt_index": 0, "gen": -100, "ema": 0.5,
+                  "state": None, "rms": None, "dll": "", "rule": ""}] if n_mpc else [])
+
     if args.self_play:
         if resume_ckpt is not None:
             pool = [{"kind": e.get("kind", "net"), "bt_index": e.get("bt_index", 0),
@@ -547,24 +590,33 @@ def main():
                      "state": e.get("state"), "rms": e.get("rms"),
                      "dll": e.get("dll", ""), "rule": e.get("rule", "")}
                     for e in resume_ckpt["pool"]]
-            # 복원된 pool 의 BT 개수/snapshot 정원으로 local_pool_max 재계산.
+            # 복원된 pool 의 BT/MPC 개수로 재계산. (MPC 는 글로벌·로컬 모두 1칸이라 로컬 정원에서
+            # BT 만 (n_bt-1)칸 줄어든다 → local = pool_max - n_bt + 1(있으면) / pool_max(없으면).)
             n_bt = sum(1 for e in pool if e["kind"] == "bt")
+            n_mpc = sum(1 for e in pool if e["kind"] == "mpc")
+            # 복원된 pool 의 MPC 유무와 이번 실행의 --mpc-opponent 가 일치해야 한다. 불일치면
+            # driver(글로벌 슬롯 n_bt=MPC 기대)와 워커(로컬 MPC 없음)가 어긋나 EMA 귀속이 깨진다.
+            if n_mpc != (1 if mpc_opponent else 0):
+                raise SystemExit(
+                    f"resume-state pool 의 MPC 슬롯({n_mpc})과 현재 --mpc-opponent"
+                    f"({'on' if mpc_opponent else 'off'})가 불일치합니다. 학습 시작 때와 동일하게 "
+                    "--mpc-opponent 를 주거나 빼서 이어서 학습하세요.")
             local_pool_max = pool_max - n_bt + 1 if n_bt else pool_max
             pool_state = {"next_gen": int(resume_ckpt["next_gen"]),
                           "n_added": int(resume_ckpt["n_added"])}
             trainer.set_opponent_pool([e for e in pool if e["kind"] == "net"],
                                       _per_worker_weights(), local_pool_max)
             print(f"[claude_code/PPO] opponent pool 복원: {len(pool)}개 "
-                  f"(BT {n_bt} + snapshot {len(pool)-n_bt}, "
+                  f"(BT {n_bt} + MPC {n_mpc} + snapshot {len(pool)-n_bt-n_mpc}, "
                   f"ema {[round(e['ema'],3) for e in pool]})")
         else:
             snap = trainer.snapshot_current()
-            pool = _bt_entries() + [{"kind": "net", "gen": 0, "ema": 0.5,
+            pool = _bt_entries() + _mpc_entries() + [{"kind": "net", "gen": 0, "ema": 0.5,
                                      "state": snap["state"], "rms": snap["rms"]}]
             pool_state = {"next_gen": 1, "n_added": 0}
             trainer.install_opponent_pool(local_pool_max, _per_worker_weights())
-            print(f"[claude_code/PPO] opponent pool 초기화 = BT {n_bt}종 + iter0 정책 "
-                  f"(글로벌 최대 {pool_max}칸 = BT {n_bt} + snapshot {snapshot_cap}, "
+            print(f"[claude_code/PPO] opponent pool 초기화 = BT {n_bt}종 + MPC {n_mpc} + iter0 정책 "
+                  f"(글로벌 최대 {pool_max}칸 = BT {n_bt} + MPC {n_mpc} + snapshot {snapshot_cap}, "
                   f"샘플링=EMA 균등{args.pool_uniform_floor:.2f}+softmax(τ={args.pool_sample_temp}), "
                   f"추가 임계 min-EMA≥{args.selfplay_gate_threshold:.2f})")
         bt_names = [Path(e["dll"]).stem for e in pool if e["kind"] == "bt"]
@@ -660,6 +712,11 @@ def main():
         bt_games = int(sum(bt_games_each))
         _bt_wins = int(sum((per_opp.get(b) or {}).get("win", 0) for b in range(n_bt)))
         bt_wr = (_bt_wins / bt_games) if bt_games > 0 else float("nan")
+        # MPC 고정 슬롯(글로벌 index n_bt)의 이번 iter 성적. 로깅용.
+        mpc_stat = per_opp.get(n_bt) if n_mpc else None
+        mpc_games = int(mpc_stat.get("decided", 0)) if mpc_stat else 0
+        mpc_wr = (float(mpc_stat["raw_win_rate"]) if (mpc_stat and mpc_games > 0)
+                  else float("nan"))
         if args.self_play:
             alpha = args.selfplay_ema_alpha
             # 이번 iter 에 실제로 게임이 있었던 후보만 EMA 갱신(안 뽑힌 후보는 유지).
@@ -679,7 +736,7 @@ def main():
                              "state": snap["state"], "rms": snap["rms"]})
                 pool_state["next_gen"] += 1
                 if len(pool) > pool_max:
-                    pool.pop(n_bt)   # 가장 오래된 snapshot 제거 (BT 슬롯 0..n_bt-1 은 보존)
+                    pool.pop(n_bt + n_mpc)   # 가장 오래된 snapshot 제거 (BT·MPC 고정 슬롯 보존)
                 pool_state["n_added"] += 1
                 _save_best(s, {"mean_return": s.mean_return, "win_rate": raw_wr})
                 added = True
@@ -773,7 +830,12 @@ def main():
                         log_dict[f"selfplay/bt_ema/{name}"] = pool[b]["ema"]
                         log_dict[f"selfplay/bt_win_rate/{name}"] = bt_wr_each[b]
                         log_dict[f"selfplay/bt_games/{name}"] = bt_games_each[b]
-                # 후보별 EMA (슬롯 0..n_bt-1=BT, 그 뒤 snapshot). 빈 슬롯은 로깅 생략.
+                if n_mpc:
+                    # MPC 고정 상대(글로벌 슬롯 n_bt)의 EMA/승률/게임수.
+                    log_dict["selfplay/mpc_ema"] = pool[n_bt]["ema"]
+                    log_dict["selfplay/mpc_win_rate"] = mpc_wr
+                    log_dict["selfplay/mpc_games"] = mpc_games
+                # 후보별 EMA (슬롯 0..n_bt-1=BT, n_bt=MPC, 그 뒤 snapshot). 빈 슬롯은 로깅 생략.
                 for i in range(pool_max):
                     if i < len(pool):
                         log_dict[f"selfplay/pool_ema_slot{i}"] = pool[i]["ema"]
@@ -784,9 +846,11 @@ def main():
         sp_msg = ""
         if args.self_play:
             bt_msg = (f" bt[ema {ema_bt:.3f} wr {bt_wr:.2f} n{bt_games}]" if n_bt else "")
+            mpc_msg = (f" mpc[ema {pool[n_bt]['ema']:.3f} wr {mpc_wr:.2f} n{mpc_games}]"
+                       if n_mpc else "")
             sp_msg = (f" | pool{len(pool)} W/L/D {wins}/{losses}/{draws} "
                       f"raw_wr {raw_wr:.2f} ema[min {ema_min:.3f} mean {ema_mean:.3f}]"
-                      f"{bt_msg}"
+                      f"{bt_msg}{mpc_msg}"
                       f"{' *POOL+ (added current, best saved)*' if added else ''}")
 
         print(

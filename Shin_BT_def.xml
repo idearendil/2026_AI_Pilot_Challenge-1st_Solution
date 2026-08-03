@@ -21,9 +21,27 @@
         </Sequence>
 
         <Sequence>
+          <!-- BEM DBFM: 상대가 나를 조준(방어 상황)하면 급선회, 상대가 오버슛하면 시저스로 전환 -->
+          <DECO_Defensive BB="{BB}"/>
+          <Fallback>
+            <Sequence>
+              <DECO_Overshoot BB="{BB}"/>
+              <Task_Scissors BB="{BB}"/>
+            </Sequence>
+            <Task_HardTurn BB="{BB}"/>
+          </Fallback>
+        </Sequence>
+
+        <Sequence>
           <DECO_ControlZone BB="{BB}" Approach="true" MinRangeFt="1800"
                             MaxRangeFt="10000" EnterDeg="90" MinEnemyLOSDeg="60"/>
           <Task_ControlZone BB="{BB}" HoldRangeFt="1800"/>
+        </Sequence>
+
+        <Sequence>
+          <DECO_ControlZone BB="{BB}" MinRangeFt="3000" MaxRangeFt="5000"
+                            EnterDeg="25" MaxClosureFtps="250"/>
+          <Task_ControlZone BB="{BB}" HoldRangeFt="3000"/>
         </Sequence>
 
         <Sequence>

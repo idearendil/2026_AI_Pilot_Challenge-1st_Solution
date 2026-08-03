@@ -20,6 +20,8 @@
              distance ∈ [500, 15000): (15000-d) + (15000-d)*(90-A1)/90*2.5 - (15000-d)*(90-A2)/90*2.5 + 985000
              distance ∈ [15000, ∞):   1000000 - d
            (경계 500ft·15000ft 에서 연속. 값은 대략 ~1e6 근처.)
+           추가로 아군 고도(ft)가 1000~3000ft 구간이면 (alt-3000)*(3000-alt)/1000 을 더한다
+           (= -(alt-3000)^2/1000, 3000ft 0 / 1000ft -4000). 고도 하락 억제용.
 
 claude_code/train.py 는 기본적으로 이 모듈을 사용한다(끄려면 --reward-module "").
 
@@ -52,7 +54,7 @@ MY_REWARD_CONFIG = {
     "loss_reward": 0.0,     # 내 HP<=0 으로 종료(상대가 이김)
     "ownship_alt_reward": -20.0,   # 내 고도가 최소고도 이하로 떨어져 종료
     "target_alt_reward": 5.0,      # 상대 고도가 최소고도 이하로 떨어져 종료
-    "damage_scale": 5.0,   # (상대 HP감소 - 내 HP감소) * 이 값, 양측 생존 중 매 step
+    "damage_scale": 10.0,   # (상대 HP감소 - 내 HP감소) * 이 값, 양측 생존 중 매 step
     # 상황 포텐셜 shaping 계수. reward += (x_cur - x_prev) * 이 값.
     # x 는 _shaping_potential(거리[ft], A1[deg], A2[deg]) 로 대략 ~1e6 스케일이다.
     #   대표 궤적(원거리 20000ft·조준無 → 근거리 1000ft·내 조준0°·상대 90°)의
@@ -75,25 +77,35 @@ _prev_x: float | None = None       # 직전 step 의 포텐셜값 x (거리/조�
 _prev_sim_time: float | None = None
 
 
-def _shaping_potential(distance_ft: float, a1_deg: float, a2_deg: float) -> float:
-    """거리(ft)/조준(A1,A2 deg, 0~180)을 하나로 합친 상황 포텐셜.
+def _shaping_potential(distance_ft: float, a1_deg: float, a2_deg: float,
+                       own_alt_ft: float) -> float:
+    """거리(ft)/조준(A1,A2 deg, 0~180) + 아군 고도(ft) 를 합친 상황 포텐셜.
 
     A1 = 아군→상대 LOS(|ATA|), A2 = 상대→아군 LOS(|ATA|). 값이 클수록 유리.
     경계 500ft·15000ft 에서 연속. (90-A) 항은 A>90(등 뒤) 이면 음수가 되어 자연스럽게
     페널티로 작동하므로 clamp 하지 않는다.
+
+    고도 항: 1000ft(분계점)~3000ft 구간에서만 (alt-3000)*(3000-alt)/1000 을 더한다.
+    이는 -(alt-3000)^2/1000 로, 3000ft 에서 0, 1000ft 에서 -4000. 고도가 분계점에
+    가까워질수록 포텐셜이 낮아져(차분이 음수) 하강을 억제한다(고도 하락 패배 방지).
     """
     if distance_ft <= 500.0:
         base = distance_ft + 14000.0
-        return (base * (90.0 - a1_deg) / 90.0 * 2.5
-                - base * (90.0 - a2_deg) / 90.0 * 2.5
-                + 999500.0)
-    if distance_ft <= 15000.0:
+        x = (base * (90.0 - a1_deg) / 90.0 * 2.5
+             - base * (90.0 - a2_deg) / 90.0 * 2.5
+             + 999500.0)
+    elif distance_ft <= 15000.0:
         base = 15000.0 - distance_ft
-        return (base
-                + base * (90.0 - a1_deg) / 90.0 * 2.5
-                - base * (90.0 - a2_deg) / 90.0 * 2.5
-                + 985000.0)
-    return 1000000.0 - distance_ft
+        x = (base
+             + base * (90.0 - a1_deg) / 90.0 * 2.5
+             - base * (90.0 - a2_deg) / 90.0 * 2.5
+             + 985000.0)
+    else:
+        x = 1000000.0 - distance_ft
+
+    if 1000.0 <= own_alt_ft <= 3000.0:
+        x += (own_alt_ft - 3000.0) * (3000.0 - own_alt_ft) / 1000.0
+    return x
 
 
 def reset_distance_tracker() -> None:
@@ -141,7 +153,9 @@ def compute_reward(
             geo_info._get_antenna_train_angle(ownship_state, target_state, False)))
         a2 = abs(float(
             geo_info._get_antenna_train_angle(target_state, ownship_state, False)))
-        cur_x = _shaping_potential(dist_ft, a1, a2)
+        # StateIndex.ALT 는 meter → ft 로 환산(고도 안전 항 입력).
+        own_alt_ft = float(ownship_state[StateIndex.ALT]) / _FT_TO_M
+        cur_x = _shaping_potential(dist_ft, a1, a2, own_alt_ft)
         if not new_episode:
             r_shaping = (cur_x - _prev_x) * shaping_scale
         _prev_x = cur_x

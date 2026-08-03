@@ -31,7 +31,8 @@ BT_RULE_DEFAULTS = {
     "Lee_BT1.dll": "./Lee_BT1.xml",     # 기존 baseline(BaselineCore) 을 이름만 바꾼 것
     "Jeon_BT1.dll": "./Jeon_BT1.xml",   # 추가 BT #1 (WEZ 추적 + 지면 회피)
     "Jeon_BT2.dll": "./Jeon_BT2.xml",   # 추가 BT #2 (FarNeutral + PurePursuit)
-    "Shin_BT1.dll": "./Shin_BT1.xml",   # 추가 BT #3
+    "Shin_BT_def.dll": "./Shin_BT_def.xml",   # 추가 BT #3 (Shin, default)
+    "Shin_BT_best.dll": "./Shin_BT_best.xml",  # 추가 BT #4 (Shin, best)
 }
 DEFAULT_BT_DLL = "Lee_BT1.dll"
 
@@ -39,8 +40,8 @@ DEFAULT_BT_DLL = "Lee_BT1.dll"
 # 한 프로세스 = 1 rule 제약 때문에, 학습에서는 이 목록을 **워커별로 round-robin 배정**한다.
 BT_OPPONENTS = [
     ("Lee_BT1.dll", "./Lee_BT1.xml"),
-    ("Jeon_BT1.dll", "./Jeon_BT1.xml"),
-    ("Shin_BT1.dll", "./Shin_BT1.xml"),
+    ("Shin_BT_def.dll", "./Shin_BT_def.xml"),
+    ("Shin_BT_best.dll", "./Shin_BT_best.xml"),
 ]
 
 
