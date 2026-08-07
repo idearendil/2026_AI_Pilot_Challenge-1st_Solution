@@ -129,6 +129,14 @@ class PPOConfig:
     reconstruct_state: bool = False     # claude_code.my_observation HP 재구성 갱신
     seed: int = 0
     device: str = "cpu"
+    # ── iteration 스케줄 (sched_period iter 마다 단계 k 증가) ────────────────────
+    # k = (it-1)//sched_period. rollout_steps = base + sched_rollout_increment·k,
+    # lr = base_lr·sched_lr_decay^k, ent_coef = base_ent·sched_ent_decay^k.
+    # sched_period<=0 이면 스케줄 비활성(값 고정). total_iterations<=0 이면 무한 학습.
+    sched_period: int = 1000
+    sched_rollout_increment: int = 20000
+    sched_lr_decay: float = 1.0 / 3.0
+    sched_ent_decay: float = 1.0 / 3.0
 
 
 @dataclass
@@ -576,10 +584,42 @@ class PPOTrainer:
         return evaluation.summarize(results)
 
     # ── 메인 루프 ────────────────────────────────────────────────────────────
+    def _apply_iteration_schedule(self, it: int) -> None:
+        """sched_period iter 마다 단계 k↑: rollout_steps += increment, lr·ent_coef ×= decay.
+
+        k=(it-1)//period. 기준값(base)은 첫 호출 시점(=학습/재개 시작)의 값으로 고정하고
+        매 iteration 그 기준에서 k 단계만큼 적용한다(iteration 번호만으로 결정 → 재개 안전).
+        """
+        period = int(getattr(self.cfg, "sched_period", 0) or 0)
+        if period <= 0:
+            return
+        if not hasattr(self, "_sched_base"):
+            self._sched_base = {"rollout": int(self.cfg.rollout_steps),
+                                "ent": float(self.cfg.ent_coef),
+                                "actor_lr": float(self.actor_lr0),
+                                "critic_lr": float(self.critic_lr0)}
+            self._sched_phase = -1
+        b = self._sched_base
+        k = (int(it) - 1) // period
+        self.cfg.rollout_steps = b["rollout"] + int(self.cfg.sched_rollout_increment) * k
+        lr_factor = float(self.cfg.sched_lr_decay) ** k
+        self.cfg.ent_coef = b["ent"] * (float(self.cfg.sched_ent_decay) ** k)
+        for g in self.actor_opt.param_groups:
+            g["lr"] = b["actor_lr"] * lr_factor
+        for g in self.critic_opt.param_groups:
+            g["lr"] = b["critic_lr"] * lr_factor
+        if k != self._sched_phase:
+            self._sched_phase = k
+            print(f"[claude_code/PPO] 스케줄 단계 k={k} (iter {it}): "
+                  f"rollout_steps={self.cfg.rollout_steps}, lr={b['actor_lr']*lr_factor:.3e}, "
+                  f"ent_coef={self.cfg.ent_coef:.3e}", flush=True)
+
     def train(self, on_iteration: Optional[Callable[[IterationStats], None]] = None,
               start_iteration: int = 1):
         history: list[IterationStats] = []
-        for it in range(int(start_iteration), self.cfg.total_iterations + 1):
+        it = int(start_iteration)
+        while self.cfg.total_iterations <= 0 or it <= self.cfg.total_iterations:
+            self._apply_iteration_schedule(it)
             t0 = time.time()
             (batch, ep_returns, ep_lengths, ep_components,
              ep_outcomes, ep_opp_indices, ep_end_conditions) = self.collect_rollout()
@@ -615,6 +655,7 @@ class PPOTrainer:
             history.append(stats)
             if on_iteration is not None:
                 on_iteration(stats)
+            it += 1
         return history
 
 

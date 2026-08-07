@@ -70,6 +70,13 @@ STANDARD_ENV_CONFIG = {
     "start_center_e_m": 0.0,
     "ownship_heading_deg": 90.0,
     "target_heading_deg": 270.0,
+    # ── 초기 배치 시나리오 혼합(A:B = 4:1) ─────────────────────────────────────
+    # A(위 스펙): 남-북 직선 위, heading 90°/270°(직선에 수직·반대). 거리 3택.
+    # B(head-on): 두 기체가 10000ft 떨어져 서로 마주봄(북 자리→heading 180°, 남 자리→0°).
+    #             고도·속력은 A 와 동일 범위에서 뽑아 두 기체가 공유, roll/pitch=0(지면 평행).
+    # 매 episode scenario_b_prob 확률로 B, 나머지는 A → 기대 빈도 4:1(b_prob=0.2).
+    "scenario_b_prob": 0.2,
+    "start_headon_distance_ft": 10000.0,
     "reward": {
         "mode": "default",
         "step_penalty": -0.01,
@@ -106,22 +113,29 @@ class TierGatedDogFightEnv(DogFightWrapper):
     def reset(self, *, seed=None, options=None):
         if getattr(self, "_side_rng", None) is None or seed is not None:
             self._side_rng = np.random.default_rng(seed)
-        # 매 episode: 대회 초기 배치(거리 3택1 + 고도/속도 범위 랜덤 + 북남·방향 독립 배정)로 놓는다.
+        # 매 episode: 시나리오 A(수직·반대) 또는 B(마주봄)를 4:1 로 뽑고, 고도/속도는
+        # 두 상황 공통 범위에서 랜덤(두 기체 동일), 북남·방향은 독립 배정한다.
         rng = self._side_rng
         cfg = self.config
-        choices = cfg.get("start_distance_ft_choices", [2000.0, 2500.0, 3000.0])
-        dist_ft = float(rng.choice(np.asarray(choices, dtype=np.float64)))
         alt_lo, alt_hi = cfg.get("start_altitude_ft_range", [2000.0, 30000.0])
         alt_ft = float(rng.uniform(float(alt_lo), float(alt_hi)))
         spd_lo, spd_hi = cfg.get("start_speed_mps_range", [200.0, 300.0])
         speed = float(rng.uniform(float(spd_lo), float(spd_hi)))
         if cfg.get("randomize_start_side", True):
             side_swap = bool(rng.integers(0, 2))   # ownship 북/남 랜덤
-            head_swap = bool(rng.integers(0, 2))   # ownship 90°/270° 랜덤(위치와 독립)
+            head_swap = bool(rng.integers(0, 2))   # ownship 90°/270° 랜덤(위치와 독립, A 전용)
         else:
             side_swap = bool(getattr(self, "_forced_swap", False))
             head_swap = bool(getattr(self, "_forced_head_swap", False))
-        own, tgt = self._competition_positions(dist_ft, alt_ft, speed, side_swap, head_swap)
+        b_prob = float(cfg.get("scenario_b_prob", 0.2))
+        if bool(rng.random() < b_prob):
+            own, tgt = self._headon_positions(alt_ft, speed, side_swap)
+            self._initial_scenario_kind = "B"
+        else:
+            choices = cfg.get("start_distance_ft_choices", [2000.0, 2500.0, 3000.0])
+            dist_ft = float(rng.choice(np.asarray(choices, dtype=np.float64)))
+            own, tgt = self._competition_positions(dist_ft, alt_ft, speed, side_swap, head_swap)
+            self._initial_scenario_kind = "A"
         self.change_init_position("ownship", *own)
         self.change_init_position("target", *tgt)
         return super().reset(seed=seed, options=options)
@@ -147,6 +161,28 @@ class TierGatedDogFightEnv(DogFightWrapper):
         tgt_n = center_n + (half if side_swap else -half)
         own_hdg = hdg_b if head_swap else hdg_a                # head_swap 이면 ownship 이 270°
         tgt_hdg = hdg_a if head_swap else hdg_b                # target 은 항상 ownship 반대
+        own = [own_n, center_e, alt_d, 0.0, 0.0, own_hdg, float(speed)]
+        tgt = [tgt_n, center_e, alt_d, 0.0, 0.0, tgt_hdg, float(speed)]
+        return own, tgt
+
+    def _headon_positions(self, alt_ft, speed, side_swap):
+        """B 상황: 두 기체가 start_headon_distance_ft(기본 10000ft) 떨어져 서로 마주보는 head-on.
+
+        남-북 직선(start_center_n/e) 위에 놓고, 위(북) 기체는 남(heading 180°), 아래(남) 기체는
+        북(heading 0°)을 향해 정면으로 마주본다. side_swap 으로 ownship 의 북/남 자리를 랜덤
+        배정하며(마주보므로 heading 은 자리에 의해 결정), roll/pitch=0(지면과 평행), 고도(alt_ft)·
+        속도(speed)는 A 와 동일 범위에서 뽑은 값을 두 기체가 공유한다.
+        """
+        cfg = self.config
+        center_n = float(cfg.get("start_center_n_m", 3500.0))
+        center_e = float(cfg.get("start_center_e_m", 0.0))
+        dist_ft = float(cfg.get("start_headon_distance_ft", 10000.0))
+        alt_d = -float(alt_ft) * self.FEET_TO_METER            # NED down: 음수 = 고도(위)
+        half = 0.5 * dist_ft * self.FEET_TO_METER
+        own_n = center_n + (-half if side_swap else half)      # side_swap 이면 ownship 을 남(아래)으로
+        tgt_n = center_n + (half if side_swap else -half)
+        own_hdg = 0.0 if side_swap else 180.0                  # 북 자리→180°(남향), 남 자리→0°(북향)
+        tgt_hdg = 180.0 if side_swap else 0.0                  # target 은 항상 ownship 반대 자리
         own = [own_n, center_e, alt_d, 0.0, 0.0, own_hdg, float(speed)]
         tgt = [tgt_n, center_e, alt_d, 0.0, 0.0, tgt_hdg, float(speed)]
         return own, tgt

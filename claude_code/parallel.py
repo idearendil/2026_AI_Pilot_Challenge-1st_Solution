@@ -197,20 +197,23 @@ def _make_worker_cls():
 
         def pool_init(self, state_dict, mean, var, count, weights, pool_max, seed,
                       bt_dll="", bt_rule="", bt_index=0, n_bt=0,
-                      mpc_root="", mpc_config="", n_mpc=0):
+                      mpc_root="", mpc_config="", n_mpc=0,
+                      exp_states=(), exp_means=(), exp_vars=(), exp_counts=(), n_exp=0):
             """opponent pool 초기화. target provider 를 pool 로 교체.
 
             이 워커의 **로컬** pool = [배정된 BT 1개(있으면)] + [MPC(있으면, 모든 워커 공통)]
-            + [snapshot...]. bt_index = 이 BT 의 **글로벌** 슬롯(0..n_bt-1),
-            n_bt = 전체 BT 수, n_mpc = MPC 수(0/1, 글로벌 슬롯 n_bt).
-            로컬 슬롯을 글로벌 슬롯으로 매핑해(collect 참고) driver 가 상대별 EMA 를 분리
-            집계한다. BT·MPC 슬롯은 고정(절대 evict 안 됨).
+            + [exploiter n_exp개(모든 워커 공통, 고정)] + [snapshot...]. bt_index = 이 BT 의
+            **글로벌** 슬롯(0..n_bt-1), n_bt = 전체 BT 수, n_mpc = MPC 수(0/1, 글로벌 슬롯 n_bt),
+            n_exp = exploiter 수(글로벌 슬롯 n_bt+n_mpc..). 로컬 슬롯을 글로벌 슬롯으로 매핑해
+            (collect 참고) driver 가 상대별 EMA 를 분리 집계한다. BT·MPC·exploiter 슬롯은
+            고정(절대 evict 안 됨).
             """
             from claude_code.self_play import PoolSelfPlayProvider
             self._pool_max = max(1, int(pool_max))
             self._bt_index = int(bt_index)
             self._n_bt = int(n_bt)
             self._n_mpc = int(n_mpc)
+            self._n_exp = int(n_exp)
             provs = []
             self._bt_slots = 0
             if bt_dll:
@@ -220,6 +223,10 @@ def _make_worker_cls():
             if mpc_root and n_mpc:
                 provs.append(self._get_mpc_provider(mpc_root, mpc_config))
                 self._mpc_slots = 1
+            self._exp_slots = 0
+            for st, mn, vr, ct in zip(exp_states, exp_means, exp_vars, exp_counts):
+                provs.append(self._build_opp_provider(st, mn, vr, ct))
+                self._exp_slots += 1
             provs.append(self._build_opp_provider(state_dict, mean, var, count))
             self._pool_provider = PoolSelfPlayProvider(provs, weights, seed=int(seed))
             self.env._target_action_provider = self._pool_provider
@@ -227,15 +234,42 @@ def _make_worker_cls():
         def pool_add(self, state_dict, mean, var, count):
             """현재 정책 frozen copy 를 pool 에 추가(초과 시 oldest **snapshot** 제거) + env 리셋.
 
-            고정 슬롯(BT _bt_slots + MPC _mpc_slots) 다음 index 부터 제거하므로 BT·MPC 는 유지된다.
+            고정 슬롯(BT _bt_slots + MPC _mpc_slots + exploiter _exp_slots) 다음 index 부터
+            제거하므로 BT·MPC·exploiter 는 유지된다.
             """
             prov = self._build_opp_provider(state_dict, mean, var, count)
             providers = list(self._pool_provider.providers)
             providers.append(prov)
-            fixed_slots = int(getattr(self, "_bt_slots", 0)) + int(getattr(self, "_mpc_slots", 0))
+            fixed_slots = (int(getattr(self, "_bt_slots", 0)) + int(getattr(self, "_mpc_slots", 0))
+                           + int(getattr(self, "_exp_slots", 0)))
             if len(providers) > self._pool_max:
                 providers.pop(fixed_slots)
             self._pool_provider.set_pool(providers)
+            if self._reset_recon is not None:
+                self._reset_recon()
+            obs, _ = self.env.reset()
+            if self._reset_recon is not None:
+                self._reset_recon()
+            self._next_obs = np.asarray(obs, dtype=np.float32)
+            self._next_done = False
+            self._ep_return = 0.0
+            self._ep_len = 0
+
+        def pool_add_exploiter(self, state_dict, mean, var, count):
+            """exploiter frozen copy 를 pool 의 **고정 exploiter 영역**(MPC 다음·snapshot 앞)에
+            추가한다(절대 evict 안 됨). _exp_slots·_n_exp·_pool_max 를 1씩 늘리고, exploiter
+            학습 중 frozen 상대로 바뀌었던 target provider 를 pool provider 로 되돌린다 + env 리셋.
+            """
+            prov = self._build_opp_provider(state_dict, mean, var, count)
+            providers = list(self._pool_provider.providers)
+            insert_at = int(getattr(self, "_bt_slots", 0)) + int(getattr(self, "_mpc_slots", 0)) \
+                + int(getattr(self, "_exp_slots", 0))
+            providers.insert(insert_at, prov)   # 기존 exploiter 뒤·snapshot 앞
+            self._pool_provider.set_pool(providers)
+            self._exp_slots = int(getattr(self, "_exp_slots", 0)) + 1
+            self._n_exp = int(getattr(self, "_n_exp", 0)) + 1
+            self._pool_max = int(self._pool_max) + 1   # snapshot 정원 유지(고정 슬롯 1↑)
+            self.env._target_action_provider = self._pool_provider   # frozen → pool 복귀
             if self._reset_recon is not None:
                 self._reset_recon()
             obs, _ = self.env.reset()
@@ -253,18 +287,21 @@ def _make_worker_cls():
 
         def pool_set_all(self, state_dicts, means, vars_, counts, weights, pool_max, seed,
                          bt_dll="", bt_rule="", bt_index=0, n_bt=0,
-                         mpc_root="", mpc_config="", n_mpc=0):
+                         mpc_root="", mpc_config="", n_mpc=0,
+                         exp_states=(), exp_means=(), exp_vars=(), exp_counts=(), n_exp=0):
             """checkpoint 의 opponent pool 을 이 워커의 로컬 pool 로 복원.
 
             state_dicts 는 **snapshot 후보만** 오래된→최신. bt_dll 이 있으면 배정된 BT 1개를,
-            mpc_root/n_mpc 가 있으면 MPC 1개를 고정 슬롯으로 넣는다(BT 다음, snapshot 앞).
-            bt_index/n_bt/n_mpc 는 글로벌 매핑용.
+            mpc_root/n_mpc 가 있으면 MPC 1개를, exp_states(n_exp개)가 있으면 exploiter 를 고정
+            슬롯으로 넣는다(순서: BT → MPC → exploiter → snapshot). bt_index/n_bt/n_mpc/n_exp 는
+            글로벌 매핑용.
             """
             from claude_code.self_play import PoolSelfPlayProvider
             self._pool_max = max(1, int(pool_max))
             self._bt_index = int(bt_index)
             self._n_bt = int(n_bt)
             self._n_mpc = int(n_mpc)
+            self._n_exp = int(n_exp)
             provs = []
             self._bt_slots = 0
             if bt_dll:
@@ -274,6 +311,10 @@ def _make_worker_cls():
             if mpc_root and n_mpc:
                 provs.append(self._get_mpc_provider(mpc_root, mpc_config))
                 self._mpc_slots = 1
+            self._exp_slots = 0
+            for st, mn, vr, ct in zip(exp_states, exp_means, exp_vars, exp_counts):
+                provs.append(self._build_opp_provider(st, mn, vr, ct))
+                self._exp_slots += 1
             provs += [self._build_opp_provider(st, mn, vr, ct)
                       for st, mn, vr, ct in zip(state_dicts, means, vars_, counts)]
             self._pool_provider = PoolSelfPlayProvider(provs, weights, seed=int(seed))
@@ -336,20 +377,26 @@ def _make_worker_cls():
                         ep_outcomes.append(oc)
                         prov = getattr(self.env, "_target_action_provider", None)
                         local = int(getattr(prov, "last_index", 0))
-                        # 로컬 슬롯([BT?][MPC?][snapshot...]) → 글로벌 슬롯([BT n_bt][MPC n_mpc][snap]).
+                        # 로컬 슬롯([BT?][MPC?][exploiter...][snapshot...]) → 글로벌 슬롯
+                        # ([BT n_bt][MPC n_mpc][exploiter n_exp][snap]).
                         #   BT   : 글로벌 bt_index (0..n_bt-1)
                         #   MPC  : 글로벌 n_bt (모든 워커 공통 단일 슬롯)
-                        #   snap : n_bt + n_mpc + (로컬 snapshot 순번)
+                        #   exp  : n_bt + n_mpc + (로컬 exploiter 순번) — 모든 워커 공통
+                        #   snap : n_bt + n_mpc + n_exp + (로컬 snapshot 순번)
                         bt_slots = int(getattr(self, "_bt_slots", 0))
                         mpc_slots = int(getattr(self, "_mpc_slots", 0))
+                        exp_slots = int(getattr(self, "_exp_slots", 0))
                         n_bt = int(getattr(self, "_n_bt", 0))
                         n_mpc = int(getattr(self, "_n_mpc", 0))
+                        n_exp = int(getattr(self, "_n_exp", 0))
                         if bt_slots and local < bt_slots:
                             gidx = int(getattr(self, "_bt_index", 0))
                         elif mpc_slots and local < bt_slots + mpc_slots:
                             gidx = n_bt                       # MPC 글로벌 슬롯
+                        elif exp_slots and local < bt_slots + mpc_slots + exp_slots:
+                            gidx = n_bt + n_mpc + (local - bt_slots - mpc_slots)   # exploiter
                         else:
-                            gidx = n_bt + n_mpc + (local - bt_slots - mpc_slots)
+                            gidx = n_bt + n_mpc + n_exp + (local - bt_slots - mpc_slots - exp_slots)
                         ep_opp_indices.append(gidx)
                     self._ep_return = 0.0
                     self._ep_len = 0
@@ -462,6 +509,7 @@ class ParallelPPOTrainer:
                             activation=config.activation, num_bins=config.num_bins,
                             critic_hidden=(tuple(config.critic_hidden) if config.critic_hidden else None),
                             critic_activation=config.critic_activation)
+        self._model_kwargs = model_kwargs   # scratch exploiter 재생성용
         cfg_dict = dict(gamma=config.gamma, gae_lambda=config.gae_lambda,
                         normalize_obs=config.normalize_obs,
                         reconstruct_state=config.reconstruct_state)
@@ -578,23 +626,49 @@ class ParallelPPOTrainer:
         count = self.obs_rms.count if self.obs_rms is not None else 0.0
         return state, mean, var, count
 
-    def install_opponent_pool(self, pool_max, per_worker_weights) -> None:
+    @staticmethod
+    def _split_entries(entries):
+        """pool 후보 entry 리스트 → (states, means, vars, counts) 로 분해(worker 전달용)."""
+        entries = list(entries or [])
+        states = [e["state"] for e in entries]
+        means = [(e["rms"]["mean"] if e.get("rms") else None) for e in entries]
+        vars_ = [(e["rms"]["var"] if e.get("rms") else None) for e in entries]
+        counts = [(e["rms"]["count"] if e.get("rms") else 0.0) for e in entries]
+        return states, means, vars_, counts
+
+    def install_opponent_pool(self, pool_max, per_worker_weights, exploiter_entries=None) -> None:
         """모든 worker 의 opponent pool 초기화. broadcast.
 
-        각 워커는 자기에 배정된 BT 1개(self._bt_assign) + 현재 정책 snapshot 1개로 시작한다.
-        per_worker_weights[i] = 워커 i 의 로컬 pool([그 워커 BT, snapshot...]) 샘플 가중치.
+        각 워커는 자기에 배정된 BT 1개(self._bt_assign) + MPC + exploiter(있으면) +
+        현재 정책 snapshot 1개로 시작한다. per_worker_weights[i] = 워커 i 의 로컬 pool
+        ([그 워커 BT, MPC?, exploiter..., snapshot...]) 샘플 가중치.
         """
         import ray
         self._pool_max = max(1, int(pool_max))
         state, mean, var, count = self._current_state_rms()
         ref = ray.put(state)
+        es, em, ev, ec = self._split_entries(exploiter_entries)
+        n_exp = len(es)
+        eref = ray.put(es)
         ray.get([
             w.pool_init.remote(ref, mean, var, count, list(per_worker_weights[i]),
                                self._pool_max, self.cfg.seed + 101 + i,
                                dll, rule, bti, self._n_bt,
-                               self._mpc_root, self._mpc_config, self._n_mpc)
+                               self._mpc_root, self._mpc_config, self._n_mpc,
+                               eref, em, ev, ec, n_exp)
             for i, (w, (dll, rule, bti)) in enumerate(zip(self.workers, self._bt_assign))
         ])
+
+    def pool_add_exploiter(self, snapshot) -> None:
+        """학습한 exploiter snapshot({state, rms})을 모든 worker 의 pool 고정 exploiter
+        영역에 추가(never-evict) + exploiter 학습 중 frozen 상대로 바뀌었던 provider 를
+        pool 로 복귀시킨다. run_exploiter 로 main 학습 상태를 이미 복원한 뒤 호출한다.
+        """
+        import ray
+        rms = snapshot.get("rms") or {}
+        mean = rms.get("mean"); var = rms.get("var"); count = rms.get("count", 0.0)
+        ref = ray.put(snapshot["state"])
+        ray.get([w.pool_add_exploiter.remote(ref, mean, var, count) for w in self.workers])
 
     def pool_add_current(self) -> None:
         """현재 정책 frozen copy 를 모든 worker 의 pool 에 추가(초과 시 oldest 제거)."""
@@ -619,31 +693,122 @@ class ParallelPPOTrainer:
         }
         return {"state": state, "rms": rms}
 
-    def set_opponent_pool(self, entries, per_worker_weights, pool_max) -> None:
-        """checkpoint 의 opponent pool(snapshot 후보들)을 모든 worker 에 복원(broadcast).
+    def set_opponent_pool(self, entries, per_worker_weights, pool_max,
+                          exploiter_entries=None) -> None:
+        """checkpoint 의 opponent pool 을 모든 worker 에 복원(broadcast).
 
-        entries 는 **snapshot 후보만**(오래된→최신). 각 워커는 자기 BT(self._bt_assign) +
-        이 snapshot 들로 로컬 pool 을 만든다. per_worker_weights[i] = 워커 i 로컬 가중치.
+        entries 는 **snapshot 후보만**(오래된→최신). exploiter_entries 는 고정 exploiter
+        후보들(BT·MPC 다음, snapshot 앞). 각 워커는 자기 BT(self._bt_assign) + MPC +
+        exploiter + snapshot 으로 로컬 pool 을 만든다. per_worker_weights[i] = 워커 i 로컬 가중치.
         """
         import ray
         self._pool_max = max(1, int(pool_max))
-        states = [e["state"] for e in entries]
-        means = [(e["rms"]["mean"] if e.get("rms") else None) for e in entries]
-        vars_ = [(e["rms"]["var"] if e.get("rms") else None) for e in entries]
-        counts = [(e["rms"]["count"] if e.get("rms") else 0.0) for e in entries]
+        states, means, vars_, counts = self._split_entries(entries)
+        es, em, ev, ec = self._split_entries(exploiter_entries)
+        n_exp = len(es)
         sref = ray.put(states)
+        eref = ray.put(es)
         ray.get([
             w.pool_set_all.remote(sref, means, vars_, counts, list(per_worker_weights[i]),
                                   self._pool_max, self.cfg.seed + 101 + i,
                                   dll, rule, bti, self._n_bt,
-                                  self._mpc_root, self._mpc_config, self._n_mpc)
+                                  self._mpc_root, self._mpc_config, self._n_mpc,
+                                  eref, em, ev, ec, n_exp)
             for i, (w, (dll, rule, bti)) in enumerate(zip(self.workers, self._bt_assign))
         ])
+
+    def run_exploiter(self, main_snapshot, *, max_iters, win_target, rollout_steps,
+                      lr, ent_coef, clip_coef, critic_lr=None, seed=0):
+        """main agent 를 잠깐 멈추고, main_snapshot 을 유일 상대로 삼아 **새 exploiter**(scratch
+        random init)를 학습한다. 승률≥win_target 또는 max_iters 도달 시 종료.
+
+        학습 대상(self.model)·optimizer·obs_rms·global_step·관련 cfg 를 저장했다가, 종료 후
+        원래 main 학습 상태로 완전히 복원한다(exploiter step 은 main global_step 에 반영 안 됨).
+        반환: (exploiter_snapshot, final_win_rate, iters_run).
+        """
+        import time
+        # 1) main 학습 상태 저장(복원용).
+        saved_model = {k: v.detach().cpu().clone() for k, v in self.model.state_dict().items()}
+        saved_actor_opt = self.actor_opt.state_dict()
+        saved_critic_opt = self.critic_opt.state_dict()
+        saved_rms = None
+        if self.obs_rms is not None:
+            saved_rms = (self.obs_rms.mean.copy(), self.obs_rms.var.copy(), float(self.obs_rms.count))
+        saved_step = int(self.global_step)
+        saved_cfg = {k: getattr(self.cfg, k) for k in ("rollout_steps", "ent_coef", "clip_coef")}
+        saved_sched = (getattr(self, "_sched_base", None), getattr(self, "_sched_phase", None))
+
+        # 2) 모든 worker 의 상대를 frozen main 으로 교체.
+        mrms = main_snapshot.get("rms") or {}
+        self.set_frozen_opponent(main_snapshot["state"], mrms.get("mean"),
+                                 mrms.get("var"), mrms.get("count", 0.0))
+
+        # 3) scratch exploiter 로 재초기화(새 random weights + fresh optimizer + fresh obs_rms).
+        torch.manual_seed(int(seed))
+        np.random.seed(int(seed))
+        fresh = make_actor_critic(**self._model_kwargs).to(self.cfg.device)
+        self.model.load_state_dict(fresh.state_dict())
+        clr = lr if critic_lr is None else critic_lr
+        self.actor_opt = torch.optim.Adam(self.model.actor_parameters(), lr=lr, eps=1e-5)
+        self.critic_opt = torch.optim.Adam(self.model.critic_parameters(), lr=clr, eps=1e-5)
+        if self.obs_rms is not None:
+            self.obs_rms = RunningMeanStd(shape=(self.obs_dim,))
+        self.cfg.rollout_steps = int(rollout_steps)
+        self.cfg.ent_coef = float(ent_coef)
+        self.cfg.clip_coef = float(clip_coef)
+
+        # 4) exploiter 학습 루프(승률은 exploiter=ownship 관점 outcome 으로 계산).
+        wr = 0.0; ran = 0
+        print(f"[claude_code/PPO] === exploiter 학습 시작(vs main): max_iters={max_iters}, "
+              f"target_wr={win_target:.2f}, rollout={rollout_steps}, lr={lr:.1e}, "
+              f"ent={ent_coef:.1e}, clip={clip_coef} ===", flush=True)
+        for i in range(1, int(max_iters) + 1):
+            t0 = time.time()
+            batch, ep_returns, ep_lengths, _, ep_outcomes, _, _ = self.collect_rollout()
+            self.update(batch)
+            ran = i
+            oc = _outcome_counts(ep_outcomes)
+            w, l, d = int(oc.get("win", 0)), int(oc.get("loss", 0)), int(oc.get("draw", 0))
+            dec = w + l + d
+            wr = (w / dec) if dec else 0.0
+            mret = float(np.mean(ep_returns)) if ep_returns else float("nan")
+            print(f"[claude_code/PPO]   exploiter iter {i:3d} | vs-main W/L/D {w}/{l}/{d} "
+                  f"wr {wr:.3f} | ret {mret:8.3f} | {time.time()-t0:.1f}s", flush=True)
+            if dec > 0 and wr >= win_target:
+                print(f"[claude_code/PPO]   exploiter 승률 목표 달성(wr {wr:.3f} ≥ {win_target:.2f}) "
+                      f"@ iter {i}", flush=True)
+                break
+        else:
+            print(f"[claude_code/PPO]   exploiter max_iters({max_iters}) 도달, 최종 wr {wr:.3f}",
+                  flush=True)
+
+        # 5) exploiter snapshot 확보(복원 전).
+        exploiter_snapshot = self.snapshot_current()
+
+        # 6) main 학습 상태 완전 복원.
+        self.model.load_state_dict(saved_model)
+        self.actor_opt = torch.optim.Adam(self.model.actor_parameters(), lr=self.actor_lr0, eps=1e-5)
+        self.critic_opt = torch.optim.Adam(self.model.critic_parameters(), lr=self.critic_lr0, eps=1e-5)
+        self.actor_opt.load_state_dict(saved_actor_opt)     # lr·momentum 포함 복원
+        self.critic_opt.load_state_dict(saved_critic_opt)
+        if self.obs_rms is not None and saved_rms is not None:
+            self.obs_rms.mean, self.obs_rms.var, self.obs_rms.count = (
+                saved_rms[0], saved_rms[1], saved_rms[2])
+        self.global_step = saved_step
+        for k, v in saved_cfg.items():
+            setattr(self.cfg, k, v)
+        if saved_sched[0] is not None:
+            self._sched_base = saved_sched[0]
+        if saved_sched[1] is not None:
+            self._sched_phase = saved_sched[1]
+        return exploiter_snapshot, wr, ran
 
     def train(self, on_iteration=None, start_iteration: int = 1):
         import time
         history = []
-        for it in range(int(start_iteration), self.cfg.total_iterations + 1):
+        it = int(start_iteration)
+        while self.cfg.total_iterations <= 0 or it <= self.cfg.total_iterations:
+            PPOTrainer._apply_iteration_schedule(self, it)
             t0 = time.time()
             (batch, ep_returns, ep_lengths, ep_components,
              ep_outcomes, ep_opp_indices, ep_end_conditions) = self.collect_rollout()
@@ -669,6 +834,7 @@ class ParallelPPOTrainer:
             history.append(stats)
             if on_iteration is not None:
                 on_iteration(stats)
+            it += 1
         return history
 
     def close(self):

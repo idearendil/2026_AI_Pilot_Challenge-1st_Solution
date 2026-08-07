@@ -18,7 +18,7 @@ python claude_code/train.py --output-name ppo --output-tag ppo_phase1
 (아직 phase2 학습을 하고 나서도 서로 damage를 잘 주진 못함...)
 python claude_code/train.py --output-name team01 --output-tag ppo_phase2 --resume-from claude_code/models/team01/ppo_phase1/iter_0150.pt --distance-reward-scale 0
 # (1)-3 last 모델이 아닌 특정 iteration의 모델을 번들로 저장하고 싶으면
-python claude_code/snapshot_to_bundle.py --snapshot claude_code/models/latest/iter_0754.pt --output-dir artifacts/models/team01/basic
+python claude_code/snapshot_to_bundle.py --snapshot claude_code/models/latest/iter_0881.pt --output-dir artifacts/models/team01/basic
 
 # (2) 두 모델 대결 + 리플레이 로그 저장
 (rl 모델과 bt 모델을 사용하는 경우)

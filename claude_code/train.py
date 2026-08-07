@@ -105,7 +105,17 @@ def load_train_state(path):
 
 def parse_args():
     p = argparse.ArgumentParser(description="claude_code standalone PPO trainer for DogFight 1v1")
-    p.add_argument("--iterations", type=int, default=1000)
+    p.add_argument("--iterations", type=int, default=0,
+                   help="총 iteration 수. 0 이하면 **무한 학습**(Ctrl-C 로 중단, 매 iter 체크포인트 저장).")
+    # sched_period iter 마다: rollout_steps += sched-rollout-increment, lr·ent_coef ×= 각 decay.
+    p.add_argument("--sched-period", type=int, default=1000,
+                   help="스케줄 주기(iter). 0 이하면 스케줄 비활성(rollout/lr/ent 고정).")
+    p.add_argument("--sched-rollout-increment", type=int, default=20000,
+                   help="스케줄 단계마다 rollout_steps 에 더할 값.")
+    p.add_argument("--sched-lr-decay", type=float, default=1.0 / 3.0,
+                   help="스케줄 단계마다 lr 에 곱할 계수.")
+    p.add_argument("--sched-ent-decay", type=float, default=1.0 / 3.0,
+                   help="스케줄 단계마다 ent_coef 에 곱할 계수.")
     p.add_argument("--rollout-steps", type=int, default=80000)
     p.add_argument("--lr", type=float, default=1e-4)
     p.add_argument("--gamma", type=float, default=0.98)
@@ -113,7 +123,7 @@ def parse_args():
     p.add_argument("--clip-coef", type=float, default=0.2)
     p.add_argument("--update-epochs", type=int, default=5)
     p.add_argument("--minibatch-size", type=int, default=512)
-    p.add_argument("--ent-coef", type=float, default=0.00005)
+    p.add_argument("--ent-coef", type=float, default=0.0001)
     p.add_argument("--target-kl", type=float, default=0.05)
     p.add_argument("--hidden", default="512,512,512", help="actor hidden 크기, 예: 256,256")
     p.add_argument("--activation", default="tanh", choices=["tanh", "relu", "elu"])
@@ -181,13 +191,32 @@ def parse_args():
                         "따라 분배한다. 초반에 강한 BT 만 뽑혀 과난이도가 되는 걸 막는 바닥(기본 0.5).")
     # MPC(team-share) 고정 상대. BT 와 달리 프로세스 제약이 없어 **모든 워커**에 동일하게
     # 들어간다(글로벌 단일 슬롯). native predictor DLL 이 무거워 num_workers>1(Ray) 에서만 지원.
-    p.add_argument("--mpc-opponent", action="store_true",
+    p.add_argument("--mpc-opponent", action=argparse.BooleanOptionalAction, default=True,
                    help="opponent pool 에 팀 공유 MPC agent 를 고정 상대로 추가(never-evict, 모든 워커 공통). "
-                        "글로벌 슬롯이 BT 다음·snapshot 앞에 1칸 늘어난다(--pool-size 에 포함).")
+                        "글로벌 슬롯이 BT 다음·snapshot 앞에 1칸 늘어난다(--pool-size 에 포함). "
+                        "**기본 켜짐**; 끄려면 --no-mpc-opponent. self-play + num_workers>1 에서만 실제 "
+                        "활성화되고, 조건 미충족·번들 없음이면 (크래시 없이) 자동 비활성된다.")
     p.add_argument("--mpc-root", default="Release_MPC_team_share",
                    help="MPC 번들 루트(=native DLL·config·F16 XML 자산 위치). 프로젝트 루트 기준 상대경로 허용.")
     p.add_argument("--mpc-config", default="",
                    help="MPC config yaml 경로(비우면 <mpc-root>/configs/mpc.yaml).")
+    # ── exploiter: main N iter 마다 main 을 잠깐 멈추고 그때의 main 만 상대로 새 exploiter 를
+    #    scratch 학습 → 승률≥target 또는 max_iters 에서 중단 → opponent pool 에 never-evict 추가. ──
+    p.add_argument("--exploiter-period", type=int, default=500,
+                   help="main 학습 몇 iter 마다 exploiter 를 학습·추가할지(0 이하면 exploiter 비활성).")
+    p.add_argument("--exploiter-max-iters", type=int, default=500,
+                   help="exploiter 1회 학습의 최대 iteration 수(승률 목표 못 채우면 여기서 중단).")
+    p.add_argument("--exploiter-win-target", type=float, default=0.7,
+                   help="exploiter 가 main 상대로 이 승률 이상이면 조기 중단하고 pool 에 추가.")
+    p.add_argument("--exploiter-rollout-steps", type=int, default=80000,
+                   help="exploiter 학습의 iteration 당 rollout step 수.")
+    p.add_argument("--exploiter-lr", type=float, default=1e-4, help="exploiter 학습 lr.")
+    p.add_argument("--exploiter-ent-coef", type=float, default=0.00005, help="exploiter 학습 ent coef.")
+    p.add_argument("--exploiter-clip-coef", type=float, default=0.4,
+                   help="exploiter 학습 clip coef(빠른 수렴 위해 main 보다 크게).")
+    p.add_argument("--max-self-snapshots", type=int, default=3,
+                   help="opponent pool 의 self-play snapshot 최대 수(초과 시 oldest FIFO 제거). "
+                        "BT·MPC·exploiter 고정 슬롯과는 별개. 기본 3.")
     p.add_argument("--seed", type=int, default=0)
     # loiter: 표적이 선회하며 고도를 유지(자기파괴 없음) → episode 가 timeout(terminal=0)
     # 으로 끝나므로 return 이 ownship 의 추격/사격 성과로만 결정돼 학습 신호가 깨끗하다.
@@ -337,6 +366,10 @@ def main():
         reconstruct_state=(args.observation_module == "claude_code.my_observation"),
         seed=args.seed,
         device=args.device,
+        sched_period=args.sched_period,
+        sched_rollout_increment=args.sched_rollout_increment,
+        sched_lr_decay=args.sched_lr_decay,
+        sched_ent_decay=args.sched_ent_decay,
     )
 
     # opponent pool 에 넣을 BT 목록 [(dll, rule), ...]. 워커에 round-robin 배정한다.
@@ -347,23 +380,28 @@ def main():
 
     # MPC 고정 상대(옵션). BT 와 달리 프로세스 제약이 없어 모든 워커에 동일하게 넣는다.
     # native predictor 가 무거워 병렬(Ray) 경로에서만 지원한다.
+    # 기본 켜짐(default=True). 조건(self-play + num_workers>1 + 번들 존재) 미충족 시 크래시 대신
+    # 자동 비활성한다(기본값이 다른 실행 모드를 깨지 않도록). 강제로 끄려면 --no-mpc-opponent.
     mpc_opponent = None
     if args.mpc_opponent:
+        skip = None
         if not args.self_play:
-            raise SystemExit("--mpc-opponent 는 self-play opponent pool 경로에서만 씁니다(--self-play 필요).")
-        if args.num_workers <= 1:
-            raise SystemExit("--mpc-opponent 는 num_workers>1(Ray 병렬)에서만 지원합니다.")
-        mpc_root = Path(args.mpc_root)
-        if not mpc_root.is_absolute():
-            mpc_root = ROOT / mpc_root
-        mpc_root = mpc_root.resolve()
-        mpc_cfg = args.mpc_config
-        if not mpc_cfg:
-            mpc_cfg = str(mpc_root / "configs" / "mpc.yaml")
-        if not Path(mpc_cfg).exists():
-            raise SystemExit(f"--mpc-opponent: MPC config 를 찾을 수 없습니다: {mpc_cfg}")
-        mpc_opponent = (str(mpc_root), str(mpc_cfg))
-        print(f"[claude_code/PPO] MPC 고정 상대 활성: root={mpc_root} config={mpc_cfg}")
+            skip = "--self-play 아님"
+        elif args.num_workers <= 1:
+            skip = "num_workers<=1(Ray 병렬 필요)"
+        if skip is not None:
+            print(f"[claude_code/PPO] MPC 고정 상대 자동 비활성({skip}). 끄려면 --no-mpc-opponent.")
+        else:
+            mpc_root = Path(args.mpc_root)
+            if not mpc_root.is_absolute():
+                mpc_root = ROOT / mpc_root
+            mpc_root = mpc_root.resolve()
+            mpc_cfg = args.mpc_config or str(mpc_root / "configs" / "mpc.yaml")
+            if not Path(mpc_cfg).exists():
+                print(f"[claude_code/PPO] MPC 고정 상대 자동 비활성(config 없음: {mpc_cfg}).")
+            else:
+                mpc_opponent = (str(mpc_root), str(mpc_cfg))
+                print(f"[claude_code/PPO] MPC 고정 상대 활성: root={mpc_root} config={mpc_cfg}")
 
     # 데이터 수집: num_workers>1 이면 Ray 병렬, 아니면 단일 프로세스.
     if args.num_workers > 1:
@@ -521,12 +559,13 @@ def main():
     # MPC 는 모든 워커 공통(글로벌 단일 슬롯 n_bt). 둘 다 절대 evict 안 됨.
     n_bt = len(bt_list)
     n_mpc = 1 if mpc_opponent else 0
-    # --pool-size = 총 슬롯 수(BT·MPC 전부 포함). snapshot 정원 = pool_size - n_bt - n_mpc (최소 1).
-    # frozen 이면 snapshot 1개 고정.
-    snapshot_cap = 1 if args.frozen_opponent else max(1, int(args.pool_size) - n_bt - n_mpc)
-    pool_max = n_bt + n_mpc + snapshot_cap               # 글로벌 총 슬롯
-    # 워커 로컬 = [BT 1개(있으면)] + [MPC(모든 워커 공통)] + [snapshot cap].
-    local_pool_max = (1 if n_bt else 0) + n_mpc + snapshot_cap
+    # snapshot 정원 = --max-self-snapshots(기본 3). frozen 이면 snapshot 1개 고정.
+    # 고정 슬롯 = BT n_bt + MPC n_mpc + exploiter n_exp(학습 중 증가). exploiter 는 절대 evict 안 됨.
+    snapshot_cap = 1 if args.frozen_opponent else max(1, int(args.max_self_snapshots))
+    n_exp = 0                                            # exploiter 수(학습 중 pool_add_exploiter 로 증가)
+    pool_max = n_bt + n_mpc + n_exp + snapshot_cap       # 글로벌 총 슬롯(exploiter 추가 시 +1)
+    # 워커 로컬 = [BT 1개(있으면)] + [MPC(공통)] + [exploiter n_exp(공통)] + [snapshot cap].
+    local_pool_max = (1 if n_bt else 0) + n_mpc + n_exp + snapshot_cap
     if resume_ckpt is not None:
         pool_max = int(resume_ckpt["pool_max"])
 
@@ -541,9 +580,10 @@ def main():
         (다른 BT 는 이 워커 로컬 pool 에 없으므로 자연히 확률 0.)
         """
         snap_emas = [e["ema"] for e in pool if e["kind"] == "net"]
-        # MPC 는 글로벌 슬롯 n_bt(=BT 다음). 로컬 벡터 순서 = [BT?][MPC?][snapshots] 로,
-        # 워커의 로컬 provider 순서와 정확히 일치시켜야 한다.
+        # 로컬 벡터 순서 = [BT?][MPC?][exploiter...][snapshots] 로, 워커의 로컬 provider 순서와
+        # 정확히 일치시켜야 한다. MPC=글로벌 슬롯 n_bt, exploiter=글로벌 n_bt+n_mpc..n_bt+n_mpc+n_exp-1.
         mpc_emas = [pool[n_bt]["ema"]] if n_mpc else []
+        exp_emas = [pool[n_bt + n_mpc + j]["ema"] for j in range(n_exp)]
         temp = max(float(args.pool_sample_temp), 1e-6)
         floor = min(max(float(args.pool_uniform_floor), 0.0), 1.0)
 
@@ -561,15 +601,16 @@ def main():
             return (p / sm).tolist() if sm > 1e-12 else (np.ones(m) / m).tolist()
 
         if n_bt == 0:
-            v = _mix(mpc_emas + snap_emas)
+            v = _mix(mpc_emas + exp_emas + snap_emas)
             return [v for _ in range(trainer.num_workers)]
-        vecs = [_mix([pool[b]["ema"]] + mpc_emas + snap_emas) for b in range(n_bt)]
+        vecs = [_mix([pool[b]["ema"]] + mpc_emas + exp_emas + snap_emas) for b in range(n_bt)]
         return [vecs[i % n_bt] for i in range(trainer.num_workers)]
 
     # opponent pool 메타데이터(train.py 소유, checkpoint 저장 대상). 글로벌 슬롯 순서:
-    #   slots 0..n_bt-1        = BT(kind="bt", bt_index, dll, rule) — 워커 round-robin, evict 안 됨,
-    #   slot  n_bt (n_mpc=1)   = MPC(kind="mpc") — 모든 워커 공통, evict 안 됨,
-    #   slots n_bt+n_mpc..     = snapshot(kind="net", gen, ema, state, rms).
+    #   slots 0..n_bt-1              = BT(kind="bt", bt_index, dll, rule) — round-robin, evict 안 됨,
+    #   slot  n_bt (n_mpc=1)         = MPC(kind="mpc") — 모든 워커 공통, evict 안 됨,
+    #   slots n_bt+n_mpc..+n_exp-1   = exploiter(kind="exploiter", gen, ema, state, rms) — 공통, evict 안 됨,
+    #   slots n_bt+n_mpc+n_exp..     = snapshot(kind="net", gen, ema, state, rms) — 최대 snapshot_cap, FIFO.
     pool: list = []
     pool_state = {"next_gen": 1, "n_added": 0}
 
@@ -594,6 +635,7 @@ def main():
             # BT 만 (n_bt-1)칸 줄어든다 → local = pool_max - n_bt + 1(있으면) / pool_max(없으면).)
             n_bt = sum(1 for e in pool if e["kind"] == "bt")
             n_mpc = sum(1 for e in pool if e["kind"] == "mpc")
+            n_exp = sum(1 for e in pool if e["kind"] == "exploiter")
             # 복원된 pool 의 MPC 유무와 이번 실행의 --mpc-opponent 가 일치해야 한다. 불일치면
             # driver(글로벌 슬롯 n_bt=MPC 기대)와 워커(로컬 MPC 없음)가 어긋나 EMA 귀속이 깨진다.
             if n_mpc != (1 if mpc_opponent else 0):
@@ -601,14 +643,17 @@ def main():
                     f"resume-state pool 의 MPC 슬롯({n_mpc})과 현재 --mpc-opponent"
                     f"({'on' if mpc_opponent else 'off'})가 불일치합니다. 학습 시작 때와 동일하게 "
                     "--mpc-opponent 를 주거나 빼서 이어서 학습하세요.")
+            # BT·MPC·exploiter 는 로컬·글로벌 슬롯 수가 같고(exploiter/MPC 는 모든 워커 공통),
+            # BT 만 로컬 1칸(글로벌 n_bt) → local = pool_max - (n_bt-1) = pool_max - n_bt + 1.
             local_pool_max = pool_max - n_bt + 1 if n_bt else pool_max
             pool_state = {"next_gen": int(resume_ckpt["next_gen"]),
                           "n_added": int(resume_ckpt["n_added"])}
-            trainer.set_opponent_pool([e for e in pool if e["kind"] == "net"],
-                                      _per_worker_weights(), local_pool_max)
+            trainer.set_opponent_pool(
+                [e for e in pool if e["kind"] == "net"], _per_worker_weights(), local_pool_max,
+                exploiter_entries=[e for e in pool if e["kind"] == "exploiter"])
             print(f"[claude_code/PPO] opponent pool 복원: {len(pool)}개 "
-                  f"(BT {n_bt} + MPC {n_mpc} + snapshot {len(pool)-n_bt-n_mpc}, "
-                  f"ema {[round(e['ema'],3) for e in pool]})")
+                  f"(BT {n_bt} + MPC {n_mpc} + exploiter {n_exp} + "
+                  f"snapshot {len(pool)-n_bt-n_mpc-n_exp}, ema {[round(e['ema'],3) for e in pool]})")
         else:
             snap = trainer.snapshot_current()
             pool = _bt_entries() + _mpc_entries() + [{"kind": "net", "gen": 0, "ema": 0.5,
@@ -616,7 +661,8 @@ def main():
             pool_state = {"next_gen": 1, "n_added": 0}
             trainer.install_opponent_pool(local_pool_max, _per_worker_weights())
             print(f"[claude_code/PPO] opponent pool 초기화 = BT {n_bt}종 + MPC {n_mpc} + iter0 정책 "
-                  f"(글로벌 최대 {pool_max}칸 = BT {n_bt} + MPC {n_mpc} + snapshot {snapshot_cap}, "
+                  f"(글로벌 최대 {pool_max}칸 = BT {n_bt} + MPC {n_mpc} + exploiter {n_exp} + "
+                  f"snapshot {snapshot_cap}, "
                   f"샘플링=EMA 균등{args.pool_uniform_floor:.2f}+softmax(τ={args.pool_sample_temp}), "
                   f"추가 임계 min-EMA≥{args.selfplay_gate_threshold:.2f})")
         bt_names = [Path(e["dll"]).stem for e in pool if e["kind"] == "bt"]
@@ -679,6 +725,7 @@ def main():
     progress = {"last_iter": start_iter - 1, "last_step": trainer.global_step}
 
     def on_iteration(s: IterationStats):
+        nonlocal pool_max, n_exp     # exploiter 추가 시 갱신(체크포인트 저장·슬롯 계산에 반영)
         pursuit = s.extra.get("pursuit", float("nan"))
         damage = s.extra.get("damage", float("nan"))
         shaping = s.extra.get("shaping", float("nan"))
@@ -736,12 +783,43 @@ def main():
                              "state": snap["state"], "rms": snap["rms"]})
                 pool_state["next_gen"] += 1
                 if len(pool) > pool_max:
-                    pool.pop(n_bt + n_mpc)   # 가장 오래된 snapshot 제거 (BT·MPC 고정 슬롯 보존)
+                    # 가장 오래된 snapshot 제거 (BT·MPC·exploiter 고정 슬롯 보존).
+                    pool.pop(n_bt + n_mpc + n_exp)
                 pool_state["n_added"] += 1
                 _save_best(s, {"mean_return": s.mean_return, "win_rate": raw_wr})
                 added = True
             # 다음 iteration 을 위한 워커별 샘플링 가중치 갱신(EMA 균등+softmax).
             trainer.pool_set_weights(_per_worker_weights())
+
+            # ── exploiter: main N iter 마다 그때의 main 만 상대로 새 exploiter(scratch)를 학습해
+            #    pool 고정 슬롯(never-evict)으로 추가한다. main 학습은 이 블록 동안 잠깐 멈춘다. ──
+            if (args.exploiter_period > 0 and s.iteration > 0
+                    and s.iteration % args.exploiter_period == 0
+                    and hasattr(trainer, "run_exploiter")):
+                main_snap = trainer.snapshot_current()   # 지금의 main = exploiter 의 유일 상대(frozen)
+                exp_snap, exp_wr, exp_iters = trainer.run_exploiter(
+                    main_snap,
+                    max_iters=args.exploiter_max_iters,
+                    win_target=args.exploiter_win_target,
+                    rollout_steps=args.exploiter_rollout_steps,
+                    lr=args.exploiter_lr,
+                    ent_coef=args.exploiter_ent_coef,
+                    clip_coef=args.exploiter_clip_coef,
+                    critic_lr=args.critic_lr,
+                    seed=args.seed + 9000 + s.iteration)
+                trainer.pool_add_exploiter(exp_snap)     # 워커 pool 에 고정 추가 + frozen→pool 복귀
+                ins = n_bt + n_mpc + n_exp                # 기존 exploiter 뒤·snapshot 앞
+                pool.insert(ins, {"kind": "exploiter", "bt_index": 0,
+                                  "gen": -200 - n_exp, "ema": 0.5,
+                                  "state": exp_snap["state"], "rms": exp_snap["rms"],
+                                  "dll": "", "rule": ""})
+                n_exp += 1
+                pool_max += 1                             # 고정 슬롯 1↑ → snapshot 정원 유지
+                trainer.pool_set_weights(_per_worker_weights())
+                print(f"[claude_code/PPO] *** exploiter #{n_exp} pool 추가(고정·never-evict): "
+                      f"vs-main wr {exp_wr:.3f} ({exp_iters} iter). pool={len(pool)} "
+                      f"(BT {n_bt}+MPC {n_mpc}+exp {n_exp}+snap {len(pool)-n_bt-n_mpc-n_exp}), "
+                      f"글로벌 최대 {pool_max}칸 ***", flush=True)
 
         net_emas = [e["ema"] for e in pool if e["kind"] == "net"]
         ema_mean = float(np.mean(net_emas)) if net_emas else float("nan")

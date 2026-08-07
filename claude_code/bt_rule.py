@@ -40,7 +40,6 @@ DEFAULT_BT_DLL = "Lee_BT1.dll"
 # 한 프로세스 = 1 rule 제약 때문에, 학습에서는 이 목록을 **워커별로 round-robin 배정**한다.
 BT_OPPONENTS = [
     ("Lee_BT1.dll", "./Lee_BT1.xml"),
-    ("Shin_BT_def.dll", "./Shin_BT_def.xml"),
     ("Shin_BT_best.dll", "./Shin_BT_best.xml"),
 ]
 

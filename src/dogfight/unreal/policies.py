@@ -265,14 +265,21 @@ class ProviderCommandPolicy:
 
 
 def plane_info_to_state(plane_info) -> np.ndarray:
+    # Unreal PlaneInfo → 학습 state(NED) 규약 변환.
+    # 실측(대결 서버 패킷 + 위치 유한차분 검증)으로 확인한 규약:
+    #   position: x=North, y=East, z=**Up(고도, +)**. 학습 state 는 NED 라서 D=아래쪽(+) →
+    #             state[2] = -z 로 부호를 뒤집어야 한다. (뒤집지 않으면 altitude=-D 가 음수가
+    #             되어 모델이 자기를 지하로 인식 → 수직 판단이 깨져 추락.)
+    #   rotation: (roll,pitch,yaw) 도(deg), 표준 NED 자세. 변환 불필요.
+    #   velocity: body-frame (u,v,w). body→NED 변환이 위치 유한차분 속도와 일치함을 확인. 변환 불필요.
     state = np.zeros(51, dtype=np.float32)
-    state[0] = plane_info.position.x
-    state[1] = plane_info.position.y
-    state[2] = plane_info.position.z
+    state[0] = plane_info.position.x          # North
+    state[1] = plane_info.position.y          # East
+    state[2] = -plane_info.position.z         # Up(+) → NED Down(+)  ★ 부호 반전
     state[3] = plane_info.rotation.roll
     state[4] = plane_info.rotation.pitch
     state[5] = plane_info.rotation.yaw
-    state[6] = plane_info.velocity.x
-    state[7] = plane_info.velocity.y
-    state[8] = plane_info.velocity.z
+    state[6] = plane_info.velocity.x          # body u (forward)
+    state[7] = plane_info.velocity.y          # body v (right)
+    state[8] = plane_info.velocity.z          # body w (down)
     return state
