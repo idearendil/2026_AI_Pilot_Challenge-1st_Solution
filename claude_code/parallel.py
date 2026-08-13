@@ -718,12 +718,16 @@ class ParallelPPOTrainer:
         ])
 
     def run_exploiter(self, main_snapshot, *, max_iters, win_target, rollout_steps,
-                      lr, ent_coef, clip_coef, critic_lr=None, seed=0):
+                      lr, ent_coef, clip_coef, critic_lr=None, seed=0, log_cb=None):
         """main agent 를 잠깐 멈추고, main_snapshot 을 유일 상대로 삼아 **새 exploiter**(scratch
         random init)를 학습한다. 승률≥win_target 또는 max_iters 도달 시 종료.
 
         학습 대상(self.model)·optimizer·obs_rms·global_step·관련 cfg 를 저장했다가, 종료 후
         원래 main 학습 상태로 완전히 복원한다(exploiter step 은 main global_step 에 반영 안 됨).
+
+        log_cb: exploiter iter 마다 호출되는 콜백(선택). main 로깅과 완전히 분리된 별도 wandb
+                run 에 지표를 남기기 위한 훅. `log_cb(dict)` 형태로 iter 단위 지표를 넘긴다.
+                (parallel 은 wandb 를 직접 알지 못하고, train.py 가 콜백을 주입한다.)
         반환: (exploiter_snapshot, final_win_rate, iters_run).
         """
         import time
@@ -765,15 +769,31 @@ class ParallelPPOTrainer:
         for i in range(1, int(max_iters) + 1):
             t0 = time.time()
             batch, ep_returns, ep_lengths, _, ep_outcomes, _, _ = self.collect_rollout()
-            self.update(batch)
+            pl, vl, ent, kl, ev = self.update(batch)
             ran = i
             oc = _outcome_counts(ep_outcomes)
             w, l, d = int(oc.get("win", 0)), int(oc.get("loss", 0)), int(oc.get("draw", 0))
             dec = w + l + d
             wr = (w / dec) if dec else 0.0
             mret = float(np.mean(ep_returns)) if ep_returns else float("nan")
+            mlen = float(np.mean(ep_lengths)) if ep_lengths else float("nan")
+            elapsed = time.time() - t0
             print(f"[claude_code/PPO]   exploiter iter {i:3d} | vs-main W/L/D {w}/{l}/{d} "
-                  f"wr {wr:.3f} | ret {mret:8.3f} | {time.time()-t0:.1f}s", flush=True)
+                  f"wr {wr:.3f} | ret {mret:8.3f} | {elapsed:.1f}s", flush=True)
+            if log_cb is not None:
+                try:
+                    log_cb({
+                        "iter": i, "win_rate": wr, "wins": w, "losses": l, "draws": d,
+                        "decided": dec, "mean_return": mret, "mean_length": mlen,
+                        "completed_episodes": len(ep_returns),
+                        "policy_loss": pl, "value_loss": vl, "entropy": ent,
+                        "approx_kl": kl, "explained_variance": ev,
+                        "rollout_steps": int(rollout_steps), "lr": float(lr),
+                        "ent_coef": float(ent_coef), "clip_coef": float(clip_coef),
+                        "elapsed_sec": elapsed,
+                    })
+                except Exception as e:
+                    print(f"[claude_code/PPO]   exploiter log_cb 실패({e})", flush=True)
             if dec > 0 and wr >= win_target:
                 print(f"[claude_code/PPO]   exploiter 승률 목표 달성(wr {wr:.3f} ≥ {win_target:.2f}) "
                       f"@ iter {i}", flush=True)

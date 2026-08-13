@@ -443,7 +443,12 @@ def main():
     best = {"return": -float("inf"), "win_rate": -1.0, "iter": -1, "saved": False}
 
     # ── wandb 초기화 (실패해도 학습은 계속) ──────────────────────────────────
-    wb = None
+    # main run 과 exploiter run 을 **완전히 분리**한다: main 은 여기서 만든 run 하나에만
+    # 로깅하고, exploiter 학습은 세션마다 별도 run(같은 group 으로 묶임)에 로깅한다.
+    # 동시(concurrent) run 을 안전히 다루려고 전역 wandb.log 대신 run 객체.log 를 쓴다.
+    wb = None                 # main run 객체(.log/.finish 사용). None 이면 로깅 없음.
+    _wandb_mod = None         # exploiter run 을 나중에 만들기 위한 wandb 모듈 핸들.
+    _wb_exp_meta = None       # exploiter run 생성용 메타(project/group/base run 이름).
     if args.wandb:
         try:
             import wandb
@@ -452,8 +457,9 @@ def main():
             run_name = args.wandb_run_name or f"{args.output_name}/{args.output_tag}"
             # crash 재시작 시 같은 run 에 이어 붙도록 run id 고정 + resume 허용.
             run_id = f"ppo-{args.output_name}-{args.output_tag}".replace("/", "-")
-            wandb.init(
+            wb = wandb.init(
                 project=args.wandb_project, name=run_name, id=run_id, resume="allow",
+                group=run_id, job_type="main",
                 config={
                     "iterations": args.iterations, "rollout_steps": args.rollout_steps,
                     "lr": args.lr, "gamma": args.gamma, "gae_lambda": args.gae_lambda,
@@ -481,11 +487,15 @@ def main():
                     "obs_dim": obs_dim, "act_dim": act_dim, "damage_scale": dmg_scale,
                 },
             )
-            wb = wandb
+            _wandb_mod = wandb
+            _wb_exp_meta = {"project": args.wandb_project, "group": run_id,
+                            "run_name": run_name, "run_id": run_id}
             print(f"[claude_code/PPO] wandb 로깅 활성: project='{args.wandb_project}' run='{run_name}'")
         except Exception as e:  # 네트워크/키 문제 등 → 로깅 없이 진행
             print(f"[claude_code/PPO] wandb 초기화 실패({e}) → wandb 로깅 없이 진행")
             wb = None
+            _wandb_mod = None
+            _wb_exp_meta = None
 
     # 매 iter actor network snapshot 저장 디렉토리 (평가 상대 + 재현용).
     from claude_code import evaluation
@@ -797,6 +807,45 @@ def main():
                     and s.iteration % args.exploiter_period == 0
                     and hasattr(trainer, "run_exploiter")):
                 main_snap = trainer.snapshot_current()   # 지금의 main = exploiter 의 유일 상대(frozen)
+
+                # ── exploiter 전용 wandb run(main 과 완전히 분리) ─────────────────
+                # 세션마다 별도 run 을 만들어(같은 group 으로 묶음) main 그래프와 절대
+                # 섞이지 않게 하고, exploiter iter 를 독립 x축으로 갖게 한다.
+                exp_session = n_exp + 1
+                exp_run = None
+                exp_log_cb = None
+                if _wandb_mod is not None and _wb_exp_meta is not None:
+                    try:
+                        exp_run = _wandb_mod.init(
+                            project=_wb_exp_meta["project"],
+                            name=f"{_wb_exp_meta['run_name']}-exp{exp_session}@it{s.iteration}",
+                            group=_wb_exp_meta["group"], job_type="exploiter",
+                            reinit="create_new",      # main run 을 끝내지 않고 동시 run 생성
+                            config={
+                                "role": "exploiter", "session": exp_session,
+                                "main_iteration": s.iteration,
+                                "max_iters": args.exploiter_max_iters,
+                                "win_target": args.exploiter_win_target,
+                                "rollout_steps": args.exploiter_rollout_steps,
+                                "lr": args.exploiter_lr,
+                                "ent_coef": args.exploiter_ent_coef,
+                                "clip_coef": args.exploiter_clip_coef,
+                            },
+                        )
+
+                        def exp_log_cb(m, _run=exp_run, _sess=exp_session,
+                                       _main_it=s.iteration):
+                            # exploiter iter 를 x축(step)으로 사용 → main 과 독립 축.
+                            d = {f"exploiter/{k}": v for k, v in m.items()}
+                            d["exploiter/session"] = _sess
+                            d["exploiter/main_iteration"] = _main_it
+                            _run.log(d, step=int(m["iter"]))
+                    except Exception as e:
+                        print(f"[claude_code/PPO] exploiter wandb run 생성 실패({e}) "
+                              f"→ exploiter 로깅 없이 진행", flush=True)
+                        exp_run = None
+                        exp_log_cb = None
+
                 exp_snap, exp_wr, exp_iters = trainer.run_exploiter(
                     main_snap,
                     max_iters=args.exploiter_max_iters,
@@ -806,7 +855,16 @@ def main():
                     ent_coef=args.exploiter_ent_coef,
                     clip_coef=args.exploiter_clip_coef,
                     critic_lr=args.critic_lr,
-                    seed=args.seed + 9000 + s.iteration)
+                    seed=args.seed + 9000 + s.iteration,
+                    log_cb=exp_log_cb)
+
+                if exp_run is not None:
+                    try:
+                        exp_run.summary["final_win_rate"] = float(exp_wr)
+                        exp_run.summary["iters_run"] = int(exp_iters)
+                        exp_run.finish()
+                    except Exception as e:
+                        print(f"[claude_code/PPO] exploiter wandb run 종료 실패({e})", flush=True)
                 trainer.pool_add_exploiter(exp_snap)     # 워커 pool 에 고정 추가 + frozen→pool 복귀
                 ins = n_bt + n_mpc + n_exp                # 기존 exploiter 뒤·snapshot 앞
                 pool.insert(ins, {"kind": "exploiter", "bt_index": 0,
