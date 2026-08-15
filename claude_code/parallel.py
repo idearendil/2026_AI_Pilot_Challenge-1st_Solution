@@ -94,6 +94,14 @@ def _make_worker_cls():
 
             self.gamma = cfg_dict["gamma"]
             self.gae_lambda = cfg_dict["gae_lambda"]
+            # reward 단계 스케줄용 shaping base(있으면). my_reward 만 이 키를 가진다.
+            self._base_shaping = None
+            try:
+                _rc = self.env.config.get("reward") if hasattr(self.env, "config") else None
+                if isinstance(_rc, dict) and "shaping_reward_scale" in _rc:
+                    self._base_shaping = float(_rc["shaping_reward_scale"])
+            except Exception:
+                self._base_shaping = None
             self.normalize_obs = cfg_dict["normalize_obs"]
             self.reconstruct = cfg_dict["reconstruct_state"]
             self.obs_dim = model_kwargs["obs_dim"]
@@ -135,6 +143,24 @@ def _make_worker_cls():
                 self.obs_rms.mean = np.asarray(mean, dtype=np.float64)
                 self.obs_rms.var = np.asarray(var, dtype=np.float64)
                 self.obs_rms.count = float(count)
+
+        def set_schedule(self, gamma, own_damage_weight, shaping_mult):
+            """드라이버가 매 iteration 브로드캐스트하는 단계 스케줄을 적용한다.
+
+            gamma 는 이 워커의 GAE 계산(self.gamma)에 즉시 반영된다. reward 파라미터는
+            my_reward(=shaping_reward_scale 키 보유) env 에만 in-place 적용한다.
+            shaping_reward_scale = base_shaping × shaping_mult, own_damage_weight 는 절대값.
+            """
+            self.gamma = float(gamma)
+            try:
+                rc = self.env.config.get("reward") if hasattr(self.env, "config") else None
+            except Exception:
+                rc = None
+            if isinstance(rc, dict) and "shaping_reward_scale" in rc:
+                if self._base_shaping is None:
+                    self._base_shaping = float(rc["shaping_reward_scale"])
+                rc["shaping_reward_scale"] = self._base_shaping * float(shaping_mult)
+                rc["own_damage_weight"] = float(own_damage_weight)
 
         def set_frozen_opponent(self, state_dict, rms_mean, rms_var, rms_count):
             """self-play 상대를 '초기 actor net 고정'(별도 frozen 모델)으로 교체한다.
@@ -551,6 +577,11 @@ class ParallelPPOTrainer:
         if self.obs_rms is not None:
             calls += [w.set_obs_rms.remote(self.obs_rms.mean, self.obs_rms.var, self.obs_rms.count)
                       for w in self.workers]
+        # 단계 스케줄(gamma·damage 가중치·shaping 배율)을 매 iteration 워커에 반영.
+        sr = getattr(self, "_sched_reward", None)
+        if sr is not None:
+            calls += [w.set_schedule.remote(sr["gamma"], sr["own_damage_weight"], sr["shaping_mult"])
+                      for w in self.workers]
         ray.get(calls)
 
     def collect_rollout(self):
@@ -717,21 +748,77 @@ class ParallelPPOTrainer:
             for i, (w, (dll, rule, bti)) in enumerate(zip(self.workers, self._bt_assign))
         ])
 
+    _EXP_CKPT_FORMAT = "claude_code_exploiter_ckpt"
+    _EXP_CKPT_VERSION = 1
+
+    def _exploiter_ckpt_save(self, path, *, main_iteration, next_i, wr, ran,
+                             frozen_main, cfg_params) -> None:
+        """exploiter 진행 상태를 원자적으로 저장(매 exploiter-iter). 재개용.
+
+        저장: exploiter model/optimizer/obs_rms/global_step + 다음에 실행할 exploiter-iter
+        (next_i) + 얼려둔 상대(frozen_main = main snapshot) + 재현용 cfg 파라미터.
+        frozen_main 을 함께 저장해, main iteration 을 재실행해 얻은(살짝 다른) 정책이 아니라
+        **원래 얼렸던 그 상대**로 exploiter 를 일관되게 이어서 학습한다.
+        """
+        p = Path(path)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        rms = None
+        if self.obs_rms is not None:
+            rms = {"mean": np.asarray(self.obs_rms.mean, dtype=np.float64),
+                   "var": np.asarray(self.obs_rms.var, dtype=np.float64),
+                   "count": float(self.obs_rms.count)}
+        ckpt = {
+            "format": self._EXP_CKPT_FORMAT, "version": self._EXP_CKPT_VERSION,
+            "main_iteration": (int(main_iteration) if main_iteration is not None else None),
+            "next_i": int(next_i), "wr": float(wr), "ran": int(ran),
+            "model_state": {k: v.detach().cpu() for k, v in self.model.state_dict().items()},
+            "actor_opt": self.actor_opt.state_dict(),
+            "critic_opt": self.critic_opt.state_dict(),
+            "obs_rms": rms, "global_step": int(self.global_step),
+            "frozen_main": frozen_main, "cfg_params": dict(cfg_params),
+        }
+        tmp = p.with_suffix(p.suffix + ".tmp")
+        torch.save(ckpt, str(tmp))
+        os.replace(str(tmp), str(p))   # 원자적 교체 → 저장 도중 중단돼도 직전 ckpt 보존
+
+    def _exploiter_ckpt_load(self, path, *, main_iteration):
+        """exploiter 서브 체크포인트를 로드(없거나 불일치/손상이면 None → 새로 시작)."""
+        p = Path(path)
+        if not p.exists():
+            return None
+        try:
+            ckpt = torch.load(str(p), map_location="cpu", weights_only=False)
+        except Exception as e:
+            print(f"[claude_code/PPO] exploiter ckpt 로드 실패({e}) → 새로 시작", flush=True)
+            return None
+        if ckpt.get("format") != self._EXP_CKPT_FORMAT:
+            return None
+        ci = ckpt.get("main_iteration")
+        if main_iteration is not None and ci is not None and int(ci) != int(main_iteration):
+            print(f"[claude_code/PPO] exploiter ckpt main_iteration 불일치"
+                  f"({ci}!={main_iteration}) → 무시하고 새로 시작", flush=True)
+            return None
+        return ckpt
+
     def run_exploiter(self, main_snapshot, *, max_iters, win_target, rollout_steps,
-                      lr, ent_coef, clip_coef, critic_lr=None, seed=0, log_cb=None):
-        """main agent 를 잠깐 멈추고, main_snapshot 을 유일 상대로 삼아 **새 exploiter**(scratch
-        random init)를 학습한다. 승률≥win_target 또는 max_iters 도달 시 종료.
+                      lr, ent_coef, clip_coef, critic_lr=None, seed=0, log_cb=None,
+                      ckpt_path=None, save_every=1, main_iteration=None):
+        """main agent 를 잠깐 멈추고, main_snapshot 을 유일 상대로 삼아 exploiter 를 학습한다.
+        승률≥win_target 또는 max_iters 도달 시 종료.
 
         학습 대상(self.model)·optimizer·obs_rms·global_step·관련 cfg 를 저장했다가, 종료 후
         원래 main 학습 상태로 완전히 복원한다(exploiter step 은 main global_step 에 반영 안 됨).
 
+        ckpt_path 가 주어지면 **매 exploiter-iter(save_every 주기)마다** 진행 상태를 저장하고,
+        시작 시 그 파일이 있으면(=학습 도중 중단됐던 경우) 중단 지점 exploiter-iter 부터 이어서
+        학습한다. 정상 종료하면 그 파일을 삭제한다. 파일이 없으면 scratch(random init) 로 시작.
+
         log_cb: exploiter iter 마다 호출되는 콜백(선택). main 로깅과 완전히 분리된 별도 wandb
                 run 에 지표를 남기기 위한 훅. `log_cb(dict)` 형태로 iter 단위 지표를 넘긴다.
-                (parallel 은 wandb 를 직접 알지 못하고, train.py 가 콜백을 주입한다.)
         반환: (exploiter_snapshot, final_win_rate, iters_run).
         """
         import time
-        # 1) main 학습 상태 저장(복원용).
+        # 1) main 학습 상태 저장(복원용). (재개 시엔 재실행된 main iter 의 현재 정책 = 복원 대상)
         saved_model = {k: v.detach().cpu().clone() for k, v in self.model.state_dict().items()}
         saved_actor_opt = self.actor_opt.state_dict()
         saved_critic_opt = self.critic_opt.state_dict()
@@ -742,31 +829,63 @@ class ParallelPPOTrainer:
         saved_cfg = {k: getattr(self.cfg, k) for k in ("rollout_steps", "ent_coef", "clip_coef")}
         saved_sched = (getattr(self, "_sched_base", None), getattr(self, "_sched_phase", None))
 
-        # 2) 모든 worker 의 상대를 frozen main 으로 교체.
-        mrms = main_snapshot.get("rms") or {}
-        self.set_frozen_opponent(main_snapshot["state"], mrms.get("mean"),
-                                 mrms.get("var"), mrms.get("count", 0.0))
-
-        # 3) scratch exploiter 로 재초기화(새 random weights + fresh optimizer + fresh obs_rms).
-        torch.manual_seed(int(seed))
-        np.random.seed(int(seed))
-        fresh = make_actor_critic(**self._model_kwargs).to(self.cfg.device)
-        self.model.load_state_dict(fresh.state_dict())
+        # 재개 여부 판단(있으면 exploiter 서브 체크포인트에서 상태 복원).
+        resume = self._exploiter_ckpt_load(ckpt_path, main_iteration=main_iteration) \
+            if ckpt_path is not None else None
+        cfg_params = {"rollout_steps": rollout_steps, "lr": lr, "ent_coef": ent_coef,
+                      "clip_coef": clip_coef, "critic_lr": critic_lr, "seed": seed,
+                      "max_iters": max_iters, "win_target": win_target}
         clr = lr if critic_lr is None else critic_lr
-        self.actor_opt = torch.optim.Adam(self.model.actor_parameters(), lr=lr, eps=1e-5)
-        self.critic_opt = torch.optim.Adam(self.model.critic_parameters(), lr=clr, eps=1e-5)
-        if self.obs_rms is not None:
-            self.obs_rms = RunningMeanStd(shape=(self.obs_dim,))
+
+        # 2) 모든 worker 의 상대를 frozen main 으로 교체. 재개면 원래 얼렸던 상대를 그대로 사용.
+        if resume is not None:
+            frozen_main = resume["frozen_main"]
+        else:
+            frozen_main = main_snapshot
+        fmr = frozen_main.get("rms") or {}
+        self.set_frozen_opponent(frozen_main["state"], fmr.get("mean"),
+                                 fmr.get("var"), fmr.get("count", 0.0))
+
+        # 3) exploiter 초기화. 재개면 저장된 model/optimizer/obs_rms/step 복원, 아니면 scratch.
         self.cfg.rollout_steps = int(rollout_steps)
         self.cfg.ent_coef = float(ent_coef)
         self.cfg.clip_coef = float(clip_coef)
+        if resume is not None:
+            self.model.load_state_dict({k: torch.as_tensor(v)
+                                        for k, v in resume["model_state"].items()})
+            self.model.to(self.cfg.device)
+            self.actor_opt = torch.optim.Adam(self.model.actor_parameters(), lr=lr, eps=1e-5)
+            self.critic_opt = torch.optim.Adam(self.model.critic_parameters(), lr=clr, eps=1e-5)
+            self.actor_opt.load_state_dict(resume["actor_opt"])
+            self.critic_opt.load_state_dict(resume["critic_opt"])
+            if self.obs_rms is not None and resume.get("obs_rms"):
+                r = resume["obs_rms"]
+                self.obs_rms = RunningMeanStd(shape=(self.obs_dim,))
+                self.obs_rms.mean = np.asarray(r["mean"], dtype=np.float64)
+                self.obs_rms.var = np.asarray(r["var"], dtype=np.float64)
+                self.obs_rms.count = float(r["count"])
+            self.global_step = int(resume.get("global_step", self.global_step))
+            start_i = int(resume["next_i"]); wr = float(resume.get("wr", 0.0))
+            ran = int(resume.get("ran", start_i - 1))
+            print(f"[claude_code/PPO] === exploiter 재개(vs main): iter {start_i}부터 "
+                  f"(직전 wr {wr:.3f}, max_iters={max_iters}, target_wr={win_target:.2f}) ===",
+                  flush=True)
+        else:
+            torch.manual_seed(int(seed))
+            np.random.seed(int(seed))
+            fresh = make_actor_critic(**self._model_kwargs).to(self.cfg.device)
+            self.model.load_state_dict(fresh.state_dict())
+            self.actor_opt = torch.optim.Adam(self.model.actor_parameters(), lr=lr, eps=1e-5)
+            self.critic_opt = torch.optim.Adam(self.model.critic_parameters(), lr=clr, eps=1e-5)
+            if self.obs_rms is not None:
+                self.obs_rms = RunningMeanStd(shape=(self.obs_dim,))
+            start_i = 1; wr = 0.0; ran = 0
+            print(f"[claude_code/PPO] === exploiter 학습 시작(vs main): max_iters={max_iters}, "
+                  f"target_wr={win_target:.2f}, rollout={rollout_steps}, lr={lr:.1e}, "
+                  f"ent={ent_coef:.1e}, clip={clip_coef} ===", flush=True)
 
         # 4) exploiter 학습 루프(승률은 exploiter=ownship 관점 outcome 으로 계산).
-        wr = 0.0; ran = 0
-        print(f"[claude_code/PPO] === exploiter 학습 시작(vs main): max_iters={max_iters}, "
-              f"target_wr={win_target:.2f}, rollout={rollout_steps}, lr={lr:.1e}, "
-              f"ent={ent_coef:.1e}, clip={clip_coef} ===", flush=True)
-        for i in range(1, int(max_iters) + 1):
+        for i in range(int(start_i), int(max_iters) + 1):
             t0 = time.time()
             batch, ep_returns, ep_lengths, _, ep_outcomes, _, _ = self.collect_rollout()
             pl, vl, ent, kl, ev = self.update(batch)
@@ -794,6 +913,14 @@ class ParallelPPOTrainer:
                     })
                 except Exception as e:
                     print(f"[claude_code/PPO]   exploiter log_cb 실패({e})", flush=True)
+            # 진행 상태 저장(매 exploiter-iter). next_i=i+1 → 중단 시 다음 iter 부터 재개.
+            if ckpt_path is not None and (int(save_every) <= 1 or i % int(save_every) == 0):
+                try:
+                    self._exploiter_ckpt_save(ckpt_path, main_iteration=main_iteration,
+                                              next_i=i + 1, wr=wr, ran=ran,
+                                              frozen_main=frozen_main, cfg_params=cfg_params)
+                except Exception as e:
+                    print(f"[claude_code/PPO]   exploiter ckpt 저장 실패({e})", flush=True)
             if dec > 0 and wr >= win_target:
                 print(f"[claude_code/PPO]   exploiter 승률 목표 달성(wr {wr:.3f} ≥ {win_target:.2f}) "
                       f"@ iter {i}", flush=True)
@@ -804,6 +931,13 @@ class ParallelPPOTrainer:
 
         # 5) exploiter snapshot 확보(복원 전).
         exploiter_snapshot = self.snapshot_current()
+        # exploiter 정상 종료 → 서브 체크포인트 삭제(다음 exploiter 는 새로 시작).
+        if ckpt_path is not None:
+            try:
+                if Path(ckpt_path).exists():
+                    os.remove(str(ckpt_path))
+            except Exception as e:
+                print(f"[claude_code/PPO] exploiter ckpt 삭제 실패({e})", flush=True)
 
         # 6) main 학습 상태 완전 복원.
         self.model.load_state_dict(saved_model)

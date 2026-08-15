@@ -7,8 +7,9 @@
   - [종료·고도] 내 고도가 최소고도(=300m≈1000ft) 이하로 종료  →  ownship_alt_reward(-20)
                 상대 고도가 최소고도 이하로 종료             →  target_alt_reward(+5)
   - [보조] 양측이 살아있는(HP>0) 매 step:
-           reward += (상대 HP 감소량 - 본인 HP 감소량) * damage_scale(10)
+           reward += (상대 HP 감소량 - 본인 HP 감소량*own_damage_weight) * damage_scale(10)
            (HP 감소량 = 이번 step 에 입은 damage = 함수 인자 target_damage / ownship_damage)
+           own_damage_weight 기본 0.5, 학습 단계 k>=2(2000 iter~)에서 1.0 으로 상향(스케줄).
   - [보조] 상황 포텐셜 shaping: 거리/조준을 하나의 포텐셜 함수 x 로 합친 뒤 그 step 차분에
            계수를 곱해 준다.  reward += (x_cur - x_prev) * shaping_reward_scale.
            x = _shaping_potential(distance[ft], A1[deg], A2[deg]) 이고
@@ -54,7 +55,10 @@ MY_REWARD_CONFIG = {
     "loss_reward": 0.0,     # 내 HP<=0 으로 종료(상대가 이김)
     "ownship_alt_reward": -20.0,   # 내 고도가 최소고도 이하로 떨어져 종료
     "target_alt_reward": 5.0,      # 상대 고도가 최소고도 이하로 떨어져 종료
-    "damage_scale": 10.0,   # (상대 HP감소 - 내 HP감소) * 이 값, 양측 생존 중 매 step
+    "damage_scale": 10.0,   # (상대 HP감소 - 내 HP감소*own_damage_weight) * 이 값, 양측 생존 중 매 step
+    # 내 HP 감소량에 곱하는 가중치. 기본 0.5(상대 피해보다 절반만 반영). 학습 스케줄이
+    # 2000 iter(단계 k>=2) 도달 시 1.0(상대와 동일 취급)으로 올린다(ppo._apply_iteration_schedule).
+    "own_damage_weight": 0.5,
     # 상황 포텐셜 shaping 계수. reward += (x_cur - x_prev) * 이 값.
     # x 는 _shaping_potential(거리[ft], A1[deg], A2[deg]) 로 대략 ~1e6 스케일이다.
     #   대표 궤적(원거리 20000ft·조준無 → 근거리 1000ft·내 조준0°·상대 90°)의
@@ -136,7 +140,8 @@ def compute_reward(
     # target_damage / ownship_damage = 이번 step 에 각 기체가 입은 damage(=HP 감소량).
     r_damage = 0.0
     if own_hp > 0.0 and tgt_hp > 0.0:
-        r_damage = (float(target_damage) * 1.0 - float(ownship_damage) * 0.5) * float(
+        own_w = float(reward_config.get("own_damage_weight", 0.5))   # 스케줄로 0.5→1.0
+        r_damage = (float(target_damage) * 1.0 - float(ownship_damage) * own_w) * float(
             reward_config["damage_scale"]
         )
 

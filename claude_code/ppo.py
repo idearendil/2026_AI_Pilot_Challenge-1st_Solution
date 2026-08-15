@@ -137,6 +137,14 @@ class PPOConfig:
     sched_rollout_increment: int = 20000
     sched_lr_decay: float = 1.0 / 3.0
     sched_ent_decay: float = 1.0 / 3.0
+    # 단계 k 별 gamma 사다리 (k>=1 부터 적용; k=0 은 시작값 유지). 마지막 값이 그 이후 단계
+    # 전체에 계속 쓰인다. 기본: k1=0.99, k2=0.995, k3+=0.999.
+    sched_gamma_ladder: tuple = (0.99, 0.995, 0.999)
+    # k 가 이 값 이상이면 내 기체 damage 가중치를 0.5→1.0 으로 바꾼다(상대와 동일 취급).
+    # 기본 2 = 2000 iter(2001~) 이후부터 적용(shaping 절반과 같은 경계).
+    sched_own_damage_full_phase: int = 2
+    # k 가 이 값 이상이면 shaping reward 전체 크기를 절반(×0.5)으로 줄인다.
+    sched_shaping_halve_phase: int = 2
 
 
 @dataclass
@@ -597,7 +605,9 @@ class PPOTrainer:
             self._sched_base = {"rollout": int(self.cfg.rollout_steps),
                                 "ent": float(self.cfg.ent_coef),
                                 "actor_lr": float(self.actor_lr0),
-                                "critic_lr": float(self.critic_lr0)}
+                                "critic_lr": float(self.critic_lr0),
+                                "gamma": float(self.cfg.gamma),
+                                "shaping": None}   # shaping base 는 첫 로컬 적용 때 캐싱
             self._sched_phase = -1
         b = self._sched_base
         k = (int(it) - 1) // period
@@ -608,11 +618,50 @@ class PPOTrainer:
             g["lr"] = b["actor_lr"] * lr_factor
         for g in self.critic_opt.param_groups:
             g["lr"] = b["critic_lr"] * lr_factor
+
+        # gamma 사다리: k=0 은 시작값(b["gamma"]), k>=1 은 ladder[k-1](범위 넘으면 마지막 값).
+        ladder = tuple(self.cfg.sched_gamma_ladder or ())
+        if k <= 0 or not ladder:
+            self.cfg.gamma = b["gamma"]
+        else:
+            self.cfg.gamma = float(ladder[min(k, len(ladder)) - 1])
+
+        # reward 단계 스케줄: 내 damage 가중치(0.5→1.0), shaping 배율(1.0→0.5).
+        own_dmg_w = 1.0 if k >= int(self.cfg.sched_own_damage_full_phase) else 0.5
+        shaping_mult = 0.5 if k >= int(self.cfg.sched_shaping_halve_phase) else 1.0
+        # 병렬 드라이버는 env 가 없으니 broadcast 로, 단일 프로세스는 로컬 env 에 직접 적용.
+        # ParallelPPOTrainer 는 PPOTrainer 를 상속하지 않고 메서드를 빌려 쓰므로(클래스 명시
+        # 호출), 여기서도 클래스로 명시 호출해야 병렬 드라이버에서 AttributeError 가 안 난다.
+        # (병렬 드라이버는 self.env 가 없어 아래 메서드가 즉시 반환 → no-op.)
+        self._sched_reward = {"gamma": float(self.cfg.gamma),
+                              "own_damage_weight": float(own_dmg_w),
+                              "shaping_mult": float(shaping_mult)}
+        PPOTrainer._apply_reward_schedule_local(self, own_dmg_w, shaping_mult)
+
         if k != self._sched_phase:
             self._sched_phase = k
             print(f"[claude_code/PPO] 스케줄 단계 k={k} (iter {it}): "
                   f"rollout_steps={self.cfg.rollout_steps}, lr={b['actor_lr']*lr_factor:.3e}, "
-                  f"ent_coef={self.cfg.ent_coef:.3e}", flush=True)
+                  f"ent_coef={self.cfg.ent_coef:.3e}, gamma={self.cfg.gamma:.4f}, "
+                  f"own_damage_w={own_dmg_w}, shaping_mult={shaping_mult}", flush=True)
+
+    def _apply_reward_schedule_local(self, own_damage_weight, shaping_mult) -> None:
+        """단일 프로세스 트레이너의 로컬 env reward_config 를 in-place 갱신한다.
+
+        병렬 드라이버(ParallelPPOTrainer)는 self.env 가 없어 아무 것도 안 하고, 대신
+        _broadcast() 가 워커에 set_schedule 로 전달한다. my_reward(=shaping_reward_scale
+        키 보유)일 때만 적용하고, 프레임워크 기본 보상에는 손대지 않는다.
+        """
+        env = getattr(self, "env", None)
+        if env is None or not hasattr(env, "config"):
+            return
+        rc = env.config.get("reward") if isinstance(getattr(env, "config", None), dict) else None
+        if not isinstance(rc, dict) or "shaping_reward_scale" not in rc:
+            return
+        if self._sched_base.get("shaping") is None:
+            self._sched_base["shaping"] = float(rc["shaping_reward_scale"])
+        rc["shaping_reward_scale"] = self._sched_base["shaping"] * float(shaping_mult)
+        rc["own_damage_weight"] = float(own_damage_weight)
 
     def train(self, on_iteration: Optional[Callable[[IterationStats], None]] = None,
               start_iteration: int = 1):

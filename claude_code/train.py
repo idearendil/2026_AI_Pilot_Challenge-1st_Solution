@@ -846,6 +846,8 @@ def main():
                         exp_run = None
                         exp_log_cb = None
 
+                # exploiter 서브 체크포인트: 매 exploiter-iter 저장 → 중단 시 그 지점부터 재개.
+                exp_ckpt_path = ckpt_path.parent / "exploiter_state.pt"
                 exp_snap, exp_wr, exp_iters = trainer.run_exploiter(
                     main_snap,
                     max_iters=args.exploiter_max_iters,
@@ -856,7 +858,10 @@ def main():
                     clip_coef=args.exploiter_clip_coef,
                     critic_lr=args.critic_lr,
                     seed=args.seed + 9000 + s.iteration,
-                    log_cb=exp_log_cb)
+                    log_cb=exp_log_cb,
+                    ckpt_path=str(exp_ckpt_path),
+                    save_every=1,
+                    main_iteration=s.iteration)
 
                 if exp_run is not None:
                     try:
