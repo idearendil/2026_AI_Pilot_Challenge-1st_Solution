@@ -369,17 +369,24 @@ class DogFightEnv(gym.Env):
         for _ in range(int(self._step_ratio)):
             self._step_controlled_aircraft(action)
             if np.isnan(self._sim.get_state()).any():
+                # Ownship FDM 발산(NaN) = 사실상 지면 충돌/기체 상실. 예전엔 reward 0 으로
+                # 즉시 종료해 고도패배 -20 패널티가 누락됐다(compute_reward 미호출). 이제
+                # "ownship altitude below min" 과 동일하게 ownship_alt_reward 를 부여한다.
+                reward = float(self._reward_config.get("ownship_alt_reward", 0.0))
                 info = {"end_condition": "Ownship FDM output Fall", "outcome": "crash"}
                 self._ep_step_count += 1
                 self._print_episode_termination(info["end_condition"])
-                return np.array(self.pre_obs, dtype=np.float32), 0.0, True, False, info
+                return np.array(self.pre_obs, dtype=np.float32), reward, True, False, info
 
             self._step_target_aircraft()
             if np.isnan(self._target_sim.get_state()).any():
+                # Target FDM 발산(NaN) = 상대 기체 상실. 대칭적으로 "target altitude below
+                # min" 과 동일하게 target_alt_reward(+5) 를 부여한다(예전엔 reward 0).
+                reward = float(self._reward_config.get("target_alt_reward", 0.0))
                 info = {"end_condition": "Target FDM output Fall", "outcome": "other"}
                 self._ep_step_count += 1
                 self._print_episode_termination(info["end_condition"])
-                return np.array(self.pre_obs, dtype=np.float32), 0.0, True, False, info
+                return np.array(self.pre_obs, dtype=np.float32), reward, True, False, info
 
             self.update_damage()
             ownship_damage_total += float(self.ownship_damage)
