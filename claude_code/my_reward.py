@@ -21,9 +21,9 @@
              distance ∈ [500, 15000): (15000-d) + (15000-d)*(90-A1)/90*2.5 - (15000-d)*(90-A2)/90*2.5 + 985000
              distance ∈ [15000, ∞):   1000000 - d
            (경계 500ft·15000ft 에서 연속. 값은 대략 ~1e6 근처.)
-           추가로 아군 고도(ft)가 1000~4000ft 구간이면 -(alt-4000)^2/250 을 더한다
-           (4000ft 0 / 1000ft -36000). 고도 하락 억제용(예전 1000~3000ft·/1000, 1000ft
-           -4000 대비 상한을 4000ft 로 넓히고 계수를 약 9배 강화).
+           추가로 아군 고도(ft)가 1000~10000ft 구간이면 -(alt-10000)^2/202.5 을 더한다
+           (10000ft 0 / 1000ft -400000). telescoping 이라 10000→1000ft 강하 시 고도항
+           총합 = -400000*shaping_scale(0.00005) = -20 (예전 상한 4000ft·총합 -1.8 강화).
 
 claude_code/train.py 는 기본적으로 이 모듈을 사용한다(끄려면 --reward-module "").
 
@@ -53,12 +53,15 @@ _FT_TO_M = 0.3048
 
 # 고도 안전 shaping 파라미터(_shaping_potential 고도항). 아군 고도가 TOP 이하로
 # 내려가면 포텐셜을 -(alt-TOP)^2/DIVISOR 만큼 떨어뜨려 하강을 억제한다.
-# min_altitude(≈1000ft, 그 아래로 내려가면 -20 패배) 부근에서 신호가 강해지도록
-# 예전값(상한 3000ft·/1000, 1000ft 에서 -4000) 대비 상한을 4000ft 로 넓히고
-# 계수를 약 9배 키웠다(/1000→/250, 1000ft 에서 -36000).
-_ALT_SHAPING_FLOOR_FT = 1000.0   # 이 아래는 사실상 패배 임박(min_altitude 근처)
-_ALT_SHAPING_TOP_FT = 4000.0     # 이 위는 안전 → 고도항 0 (zero point)
-_ALT_SHAPING_DIVISOR = 250.0     # 작을수록 패널티가 가파름(1000ft 에서 -36000)
+# telescoping 이라 episode 총합 = (alt_pot(끝고도)-alt_pot(시작고도))*shaping_scale.
+# 목표: TOP(10000ft, 항=0)에서 FLOOR(1000ft)까지 강하 시 고도항 총합 ≈ -20.
+#   필요 potential 차 = -20 / shaping_scale(0.00005) = -400000
+#   -(1000-10000)^2/DIVISOR = -81000000/DIVISOR = -400000  →  DIVISOR = 202.5
+# 예전값(상한 4000ft·/250, 1000ft potential -36000, 총합 -1.8) 대비 상한을 10000ft
+# 로 넓히고 계수를 강화(1000ft potential -400000, 강하 총합 -1.8→-20 으로 ~11배).
+_ALT_SHAPING_FLOOR_FT = 1000.0    # 이 아래는 사실상 패배 임박(min_altitude 근처)
+_ALT_SHAPING_TOP_FT = 10000.0     # 이 위는 안전 → 고도항 0 (zero point)
+_ALT_SHAPING_DIVISOR = 202.5      # 10000→1000ft 강하 시 고도항 총합 = -20
 
 MY_REWARD_CONFIG = {
     "win_reward": 0.0,       # 상대 HP<=0 으로 종료(내가 이김)
@@ -99,10 +102,10 @@ def _shaping_potential(distance_ft: float, a1_deg: float, a2_deg: float,
     경계 500ft·15000ft 에서 연속. (90-A) 항은 A>90(등 뒤) 이면 음수가 되어 자연스럽게
     페널티로 작동하므로 clamp 하지 않는다.
 
-    고도 항: FLOOR(1000ft)~TOP(4000ft) 구간에서만 -(alt-TOP)^2/DIVISOR 를 더한다.
-    (TOP=4000ft 에서 0, 1000ft 에서 -36000). 고도가 분계점(min_altitude≈1000ft)에
+    고도 항: FLOOR(1000ft)~TOP(10000ft) 구간에서만 -(alt-TOP)^2/DIVISOR 를 더한다.
+    (TOP=10000ft 에서 0, 1000ft 에서 -400000). 고도가 분계점(min_altitude≈1000ft)에
     가까워질수록 포텐셜이 낮아져(차분이 음수) 하강을 억제한다(고도 하락 패배 방지).
-    예전(1000~3000ft·/1000, 1000ft 에서 -4000) 대비 상한을 넓히고 약 9배 강화했다.
+    telescoping 이라 10000→1000ft 강하 시 고도항 episode 총합 = -20(예전 -1.8 강화).
     """
     if distance_ft <= 500.0:
         base = distance_ft + 14000.0
