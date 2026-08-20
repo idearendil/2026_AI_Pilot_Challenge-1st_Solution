@@ -74,11 +74,20 @@ def _make_worker_cls():
                                 observation_module=spec["obs_module"],
                                 runner_index=f"ptx{spec['wid']}")
 
-            # ownship: RL 번들(항상 stochastic) + action_repeat=step_ratio (power_test 와 동일)
-            from claude_code.action_provider import MLPActionProvider
+            # ownship: MLP 단일 정책 또는 neural-MPC(obs-WM lookahead). 둘 다
+            # action_repeat=step_ratio 로 감싸 RL-step(0.1s)마다 1회 호출(현재 state 재계획).
             from claude_code.evaluate import _ActionRepeatProvider
-            inner = MLPActionProvider(bundle_dir=spec["ownship_bundle_dir"],
-                                      stochastic=bool(spec["stochastic"]))
+            mpc = spec.get("mpc")
+            if mpc:
+                from claude_code.mpc_action_provider import MPCActionProvider
+                inner = MPCActionProvider(
+                    mpc["wm"], mpc["ac"], device=mpc["device"],
+                    K=mpc["K"], M=mpc["M"], H=mpc["H"], decide_every=mpc["decide_every"],
+                    use_fast=bool(mpc["use_fast"]))
+            else:
+                from claude_code.action_provider import MLPActionProvider
+                inner = MLPActionProvider(bundle_dir=spec["ownship_bundle_dir"],
+                                          stochastic=bool(spec["stochastic"]))
             self.own_provider = _ActionRepeatProvider(inner, self.step_ratio)
             self.env._ownship_action_provider = self.own_provider
 
@@ -174,7 +183,41 @@ def parse_args():
     p.add_argument("--min-altitude", type=float, default=None,
                    help="생략하면 env 기본값")
     p.add_argument("--csv", default="", help="판별 결과를 CSV 로 저장할 경로(선택)")
+    # ── neural-MPC ownship (obs-WM lookahead) 옵션 ──
+    p.add_argument("--ownship-mpc", action="store_true",
+                   help="ownship 을 단일 MLP 대신 neural-MPC(obs-WM lookahead)로 조종")
+    p.add_argument("--mpc-wm", default=str(ROOT / "claude_code/models/wm/wm_model_obs.pt"),
+                   help="추론호환 obs-WM 체크포인트")
+    p.add_argument("--mpc-ac", default="",
+                   help="actor/critic ac_ckpt(.pt). 생략하면 --ownship-bundle-dir 에서 자동 생성")
+    p.add_argument("--mpc-h", type=int, default=10, help="lookahead 스텝(기본 10=1초)")
+    p.add_argument("--mpc-k", type=int, default=12, help="후보 수 K(기본 12)")
+    p.add_argument("--mpc-m", type=int, default=8, help="상대샘플 수 M(기본 8)")
+    p.add_argument("--mpc-decide-every", type=int, default=1, help="actor 재결정 주기(기본 1)")
+    p.add_argument("--mpc-device", default="cuda", help="MPC 추론 디바이스(기본 cuda)")
+    p.add_argument("--mpc-eager", action="store_true",
+                   help="CUDA-graph plan_fast 대신 eager plan() 사용(느림; 디버그용)")
     return p.parse_args()
+
+
+def _bundle_to_ac_ckpt(bundle_dir: str, out_path: str) -> str:
+    """team01/basic 번들 → planner ac_ckpt(model_kwargs+state_dict+obs_rms) 변환·저장."""
+    import numpy as _np
+    import torch as _torch
+    from claude_code.model import load_bundle
+    model, meta = load_bundle(bundle_dir, device="cpu")
+    mm = meta["model"]
+    mk = dict(obs_dim=int(meta["observation_size"]), act_dim=int(meta.get("action_size", 4)),
+              hidden=tuple(mm["hidden"]), activation=mm.get("activation", "tanh"),
+              critic_hidden=tuple(mm["critic_hidden"]) if mm.get("critic_hidden") else None,
+              critic_activation=mm.get("critic_activation"), num_bins=int(mm["num_bins"]))
+    on = meta["obs_normalization"]
+    Path(out_path).parent.mkdir(parents=True, exist_ok=True)
+    _torch.save({"model_kwargs": mk,
+                 "state_dict": {k: v.cpu().numpy() for k, v in model.state_dict().items()},
+                 "obs_rms": {"mean": _np.asarray(on["mean"], _np.float64),
+                             "var": _np.asarray(on["var"], _np.float64)}}, out_path)
+    return out_path
 
 
 def main():
@@ -198,8 +241,27 @@ def main():
     if args.min_altitude is not None:
         overrides["min_altitude"] = args.min_altitude
 
+    # neural-MPC ownship 설정(선택). ac_ckpt 는 번들에서 자동 생성 가능.
+    mpc_cfg = None
+    if args.ownship_mpc:
+        ac_path = args.mpc_ac
+        if not ac_path:
+            ac_path = str(ROOT / "claude_code/models/wm/_ac_from_bundle.pt")
+            _bundle_to_ac_ckpt(args.ownship_bundle_dir, ac_path)
+            print(f"[power_test_unreal] ac_ckpt 자동생성: {ac_path} (from {args.ownship_bundle_dir})")
+        for pth in (args.mpc_wm, ac_path):
+            if not Path(pth).exists():
+                raise FileNotFoundError(f"MPC 체크포인트 없음: {pth}")
+        mpc_cfg = {"wm": args.mpc_wm, "ac": ac_path, "device": args.mpc_device,
+                   "K": int(args.mpc_k), "M": int(args.mpc_m), "H": int(args.mpc_h),
+                   "decide_every": int(args.mpc_decide_every), "use_fast": (not args.mpc_eager)}
+
     games = max(1, int(args.games))
-    n_workers = args.num_workers if args.num_workers > 0 else physical_cpu_count()
+    # MPC 는 GPU 를 쓰므로 기본 worker 1 (여러 워커가 한 GPU 경합 방지). 명시하면 그 값 사용.
+    if args.num_workers > 0:
+        n_workers = args.num_workers
+    else:
+        n_workers = 1 if mpc_cfg else physical_cpu_count()
     n_workers = max(1, min(int(n_workers), games))
 
     master_seed = args.seed if args.seed >= 0 else int.from_bytes(os.urandom(4), "little")
@@ -209,7 +271,11 @@ def main():
     head_swaps = [0] * games if args.fixed_side else [(i // 2) % 2 for i in range(games)]
 
     rl_mode = "deterministic(argmax)" if args.deterministic else "stochastic"
-    own_desc = f"rl({args.ownship_bundle_dir})"
+    if mpc_cfg:
+        own_desc = (f"neural-MPC(H={mpc_cfg['H']} K={mpc_cfg['K']} M={mpc_cfg['M']} "
+                    f"de={mpc_cfg['decide_every']} wm=obs, ac={args.ownship_bundle_dir})")
+    else:
+        own_desc = f"rl({args.ownship_bundle_dir})"
     tgt_desc = f"unreal_bt_client.exe({Path(args.exe_path).name})"
     print(f"[power_test_unreal] ownship = {own_desc}")
     print(f"[power_test_unreal] target  = {tgt_desc}")
@@ -224,8 +290,11 @@ def main():
     if not ray.is_initialized():
         pythonpath = os.pathsep.join(
             [str(ROOT), str(ROOT / "src"), os.environ.get("PYTHONPATH", "")])
-        ray.init(num_cpus=n_workers, include_dashboard=False, ignore_reinit_error=True,
-                 log_to_driver=False, runtime_env={"env_vars": {"PYTHONPATH": pythonpath}})
+        init_kw = dict(num_cpus=n_workers, include_dashboard=False, ignore_reinit_error=True,
+                       log_to_driver=False, runtime_env={"env_vars": {"PYTHONPATH": pythonpath}})
+        if mpc_cfg and mpc_cfg["device"].startswith("cuda"):
+            init_kw["num_gpus"] = 1          # MPC 는 GPU 필요 (Ray 가 CUDA 숨기지 않도록)
+        ray.init(**init_kw)
 
     spec = {
         "root": str(ROOT), "overrides": overrides, "obs_module": obs_module,
@@ -235,9 +304,15 @@ def main():
         "target_force_side": int(args.target_force_side),
         "step_timeout_sec": float(args.step_timeout_sec),
         "stochastic": (not args.deterministic),
+        "mpc": mpc_cfg,
     }
     WorkerCls = _make_worker_cls()
-    workers = [WorkerCls.remote({**spec, "wid": i}) for i in range(n_workers)]
+    if mpc_cfg and mpc_cfg["device"].startswith("cuda"):
+        gpu_frac = 1.0 / n_workers            # 워커들이 한 GPU 를 분할 점유
+        workers = [WorkerCls.options(num_gpus=gpu_frac).remote({**spec, "wid": i})
+                   for i in range(n_workers)]
+    else:
+        workers = [WorkerCls.remote({**spec, "wid": i}) for i in range(n_workers)]
 
     jobs = [[] for _ in range(n_workers)]
     for i, (s, w, h) in enumerate(zip(seeds, swaps, head_swaps)):

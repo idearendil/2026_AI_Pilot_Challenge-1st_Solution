@@ -611,6 +611,12 @@ class PPOTrainer:
             self._sched_phase = -1
         b = self._sched_base
         k = (int(it) - 1) // period
+        # [임시·이 학습 한정] 고도 penalty 대폭 강화(2026-08) 후 main actor 를 더 학습시키기 위해
+        # 3000~3500 구간은 직전 phase(2000~3000, 즉 k=(3000-1)//period)를 유지해 추가 annealing
+        # (lr×decay 등)을 보류한다. 3501 부터 정상 진행. period=1000 이면 이 구간 k=2 고정.
+        # (원상복구: 아래 두 줄 제거.)
+        if 3000 < int(it) <= 3500:
+            k = (3000 - 1) // period
         self.cfg.rollout_steps = b["rollout"] + int(self.cfg.sched_rollout_increment) * k
         lr_factor = float(self.cfg.sched_lr_decay) ** k
         self.cfg.ent_coef = b["ent"] * (float(self.cfg.sched_ent_decay) ** k)
