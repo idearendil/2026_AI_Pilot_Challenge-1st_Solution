@@ -806,6 +806,7 @@ def main():
             if (args.exploiter_period > 0 and s.iteration > 0
                     and s.iteration % args.exploiter_period == 0
                     and s.iteration != 3500  # [임시] 이번 학습 한정: 3500 exploiter 생략(원복: 이 줄 제거)
+                    and s.iteration != 4000  # [임시] 이번 학습 한정: 4000 exploiter 생략(원복: 이 줄 제거)
                     and hasattr(trainer, "run_exploiter")):
                 main_snap = trainer.snapshot_current()   # 지금의 main = exploiter 의 유일 상대(frozen)
 
