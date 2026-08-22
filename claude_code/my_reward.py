@@ -54,14 +54,14 @@ _FT_TO_M = 0.3048
 # 고도 안전 shaping 파라미터(_shaping_potential 고도항). 아군 고도가 TOP 이하로
 # 내려가면 포텐셜을 -(alt-TOP)^2/DIVISOR 만큼 떨어뜨려 하강을 억제한다.
 # telescoping 이라 episode 총합 = (alt_pot(끝고도)-alt_pot(시작고도))*shaping_scale.
-# 목표: TOP(10000ft, 항=0)에서 FLOOR(1000ft)까지 강하 시 고도항 총합 ≈ -40.
+# 목표: TOP(4000ft, 항=0)에서 FLOOR(1000ft)까지 강하 시 고도항 총합 ≈ -40.
 #   필요 potential 차 = -40 / shaping_scale(0.00005) = -800000
-#   -(1000-10000)^2/DIVISOR = -81000000/DIVISOR = -800000  →  DIVISOR = 101.25
-# 예전값(상한 4000ft·/250, 1000ft potential -36000, 총합 -1.8) 대비 상한을 10000ft
-# 로 넓히고 계수를 강화(1000ft potential -800000, 강하 총합 -1.8→-40 으로 ~22배).
+#   -(1000-4000)^2/DIVISOR = -9000000/DIVISOR = -800000  →  DIVISOR = 11.25
+# 범위는 원래대로 좁혀(1000~4000ft) 세기만 강화 유지: 좁은 구간에 -40 을 몰아넣어
+# 4000ft 아래에서 하강 억제 신호가 예전보다 훨씬 가파르다(1000ft potential -800000).
 _ALT_SHAPING_FLOOR_FT = 1000.0    # 이 아래는 사실상 패배 임박(min_altitude 근처)
-_ALT_SHAPING_TOP_FT = 10000.0     # 이 위는 안전 → 고도항 0 (zero point)
-_ALT_SHAPING_DIVISOR = 101.25     # 10000→1000ft 강하 시 고도항 총합 = -40
+_ALT_SHAPING_TOP_FT = 4000.0      # 이 위는 안전 → 고도항 0 (zero point)
+_ALT_SHAPING_DIVISOR = 11.25      # 4000→1000ft 강하 시 고도항 총합 = -40
 
 MY_REWARD_CONFIG = {
     "win_reward": 0.0,       # 상대 HP<=0 으로 종료(내가 이김)
@@ -102,10 +102,10 @@ def _shaping_potential(distance_ft: float, a1_deg: float, a2_deg: float,
     경계 500ft·15000ft 에서 연속. (90-A) 항은 A>90(등 뒤) 이면 음수가 되어 자연스럽게
     페널티로 작동하므로 clamp 하지 않는다.
 
-    고도 항: FLOOR(1000ft)~TOP(10000ft) 구간에서만 -(alt-TOP)^2/DIVISOR 를 더한다.
-    (TOP=10000ft 에서 0, 1000ft 에서 -800000). 고도가 분계점(min_altitude≈1000ft)에
+    고도 항: FLOOR(1000ft)~TOP(4000ft) 구간에서만 -(alt-TOP)^2/DIVISOR 를 더한다.
+    (TOP=4000ft 에서 0, 1000ft 에서 -800000). 고도가 분계점(min_altitude≈1000ft)에
     가까워질수록 포텐셜이 낮아져(차분이 음수) 하강을 억제한다(고도 하락 패배 방지).
-    telescoping 이라 10000→1000ft 강하 시 고도항 episode 총합 = -40(예전 -1.8 강화).
+    telescoping 이라 4000→1000ft 강하 시 고도항 episode 총합 = -40(예전 -1.8 강화).
     """
     if distance_ft <= 500.0:
         base = distance_ft + 14000.0
