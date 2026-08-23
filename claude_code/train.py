@@ -214,6 +214,11 @@ def parse_args():
     p.add_argument("--exploiter-ent-coef", type=float, default=0.00005, help="exploiter 학습 ent coef.")
     p.add_argument("--exploiter-clip-coef", type=float, default=0.4,
                    help="exploiter 학습 clip coef(빠른 수렴 위해 main 보다 크게).")
+    # ── 주기적 고정 self-play snapshot: exploiter 학습을 대체. main N iter 마다 그때의
+    #    main actor net 을 그대로 pool 에 never-evict opponent 로 추가(학습·중단 없음). ──
+    p.add_argument("--fixed-snapshot-period", type=int, default=500,
+                   help="main 학습 몇 iter 마다 그때의 main net 을 never-evict 고정 opponent 로 "
+                        "pool 에 추가할지(0 이하면 비활성). exploiter 학습을 대체한다.")
     p.add_argument("--max-self-snapshots", type=int, default=3,
                    help="opponent pool 의 self-play snapshot 최대 수(초과 시 oldest FIFO 제거). "
                         "BT·MPC·exploiter 고정 슬롯과는 별개. 기본 3.")
@@ -645,7 +650,8 @@ def main():
             # BT 만 (n_bt-1)칸 줄어든다 → local = pool_max - n_bt + 1(있으면) / pool_max(없으면).)
             n_bt = sum(1 for e in pool if e["kind"] == "bt")
             n_mpc = sum(1 for e in pool if e["kind"] == "mpc")
-            n_exp = sum(1 for e in pool if e["kind"] == "exploiter")
+            # 고정 net 슬롯 = exploiter(과거 학습분) + fixnet(주기적 main snapshot). 둘 다 never-evict.
+            n_exp = sum(1 for e in pool if e["kind"] in ("exploiter", "fixnet"))
             # 복원된 pool 의 MPC 유무와 이번 실행의 --mpc-opponent 가 일치해야 한다. 불일치면
             # driver(글로벌 슬롯 n_bt=MPC 기대)와 워커(로컬 MPC 없음)가 어긋나 EMA 귀속이 깨진다.
             if n_mpc != (1 if mpc_opponent else 0):
@@ -660,9 +666,9 @@ def main():
                           "n_added": int(resume_ckpt["n_added"])}
             trainer.set_opponent_pool(
                 [e for e in pool if e["kind"] == "net"], _per_worker_weights(), local_pool_max,
-                exploiter_entries=[e for e in pool if e["kind"] == "exploiter"])
+                exploiter_entries=[e for e in pool if e["kind"] in ("exploiter", "fixnet")])
             print(f"[claude_code/PPO] opponent pool 복원: {len(pool)}개 "
-                  f"(BT {n_bt} + MPC {n_mpc} + exploiter {n_exp} + "
+                  f"(BT {n_bt} + MPC {n_mpc} + 고정net {n_exp} + "
                   f"snapshot {len(pool)-n_bt-n_mpc-n_exp}, ema {[round(e['ema'],3) for e in pool]})")
         else:
             snap = trainer.snapshot_current()
@@ -801,89 +807,28 @@ def main():
             # 다음 iteration 을 위한 워커별 샘플링 가중치 갱신(EMA 균등+softmax).
             trainer.pool_set_weights(_per_worker_weights())
 
-            # ── exploiter: main N iter 마다 그때의 main 만 상대로 새 exploiter(scratch)를 학습해
-            #    pool 고정 슬롯(never-evict)으로 추가한다. main 학습은 이 블록 동안 잠깐 멈춘다. ──
-            if (args.exploiter_period > 0 and s.iteration > 0
-                    and s.iteration % args.exploiter_period == 0
-                    and s.iteration != 3500  # [임시] 이번 학습 한정: 3500 exploiter 생략(원복: 이 줄 제거)
-                    and s.iteration != 4000  # [임시] 이번 학습 한정: 4000 exploiter 생략(원복: 이 줄 제거)
-                    and hasattr(trainer, "run_exploiter")):
-                main_snap = trainer.snapshot_current()   # 지금의 main = exploiter 의 유일 상대(frozen)
-
-                # ── exploiter 전용 wandb run(main 과 완전히 분리) ─────────────────
-                # 세션마다 별도 run 을 만들어(같은 group 으로 묶음) main 그래프와 절대
-                # 섞이지 않게 하고, exploiter iter 를 독립 x축으로 갖게 한다.
-                exp_session = n_exp + 1
-                exp_run = None
-                exp_log_cb = None
-                if _wandb_mod is not None and _wb_exp_meta is not None:
-                    try:
-                        exp_run = _wandb_mod.init(
-                            project=_wb_exp_meta["project"],
-                            name=f"{_wb_exp_meta['run_name']}-exp{exp_session}@it{s.iteration}",
-                            group=_wb_exp_meta["group"], job_type="exploiter",
-                            reinit="create_new",      # main run 을 끝내지 않고 동시 run 생성
-                            config={
-                                "role": "exploiter", "session": exp_session,
-                                "main_iteration": s.iteration,
-                                "max_iters": args.exploiter_max_iters,
-                                "win_target": args.exploiter_win_target,
-                                "rollout_steps": args.exploiter_rollout_steps,
-                                "lr": args.exploiter_lr,
-                                "ent_coef": args.exploiter_ent_coef,
-                                "clip_coef": args.exploiter_clip_coef,
-                            },
-                        )
-
-                        def exp_log_cb(m, _run=exp_run, _sess=exp_session,
-                                       _main_it=s.iteration):
-                            # exploiter iter 를 x축(step)으로 사용 → main 과 독립 축.
-                            d = {f"exploiter/{k}": v for k, v in m.items()}
-                            d["exploiter/session"] = _sess
-                            d["exploiter/main_iteration"] = _main_it
-                            _run.log(d, step=int(m["iter"]))
-                    except Exception as e:
-                        print(f"[claude_code/PPO] exploiter wandb run 생성 실패({e}) "
-                              f"→ exploiter 로깅 없이 진행", flush=True)
-                        exp_run = None
-                        exp_log_cb = None
-
-                # exploiter 서브 체크포인트: 매 exploiter-iter 저장 → 중단 시 그 지점부터 재개.
-                exp_ckpt_path = ckpt_path.parent / "exploiter_state.pt"
-                exp_snap, exp_wr, exp_iters = trainer.run_exploiter(
-                    main_snap,
-                    max_iters=args.exploiter_max_iters,
-                    win_target=args.exploiter_win_target,
-                    rollout_steps=args.exploiter_rollout_steps,
-                    lr=args.exploiter_lr,
-                    ent_coef=args.exploiter_ent_coef,
-                    clip_coef=args.exploiter_clip_coef,
-                    critic_lr=args.critic_lr,
-                    seed=args.seed + 9000 + s.iteration,
-                    log_cb=exp_log_cb,
-                    ckpt_path=str(exp_ckpt_path),
-                    save_every=1,
-                    main_iteration=s.iteration)
-
-                if exp_run is not None:
-                    try:
-                        exp_run.summary["final_win_rate"] = float(exp_wr)
-                        exp_run.summary["iters_run"] = int(exp_iters)
-                        exp_run.finish()
-                    except Exception as e:
-                        print(f"[claude_code/PPO] exploiter wandb run 종료 실패({e})", flush=True)
-                trainer.pool_add_exploiter(exp_snap)     # 워커 pool 에 고정 추가 + frozen→pool 복귀
-                ins = n_bt + n_mpc + n_exp                # 기존 exploiter 뒤·snapshot 앞
-                pool.insert(ins, {"kind": "exploiter", "bt_index": 0,
-                                  "gen": -200 - n_exp, "ema": 0.5,
-                                  "state": exp_snap["state"], "rms": exp_snap["rms"],
+            # ── 주기적 고정 self-play snapshot(exploiter 학습 대체): main N iter 마다 그때의
+            #    main actor net 을 그대로(학습·중단 없이) pool 고정 슬롯(never-evict)으로 추가한다.
+            #    기존 exploiter 고정 슬롯 머신러리(pool_add_exploiter = 워커측 "고정 net 추가")를
+            #    그대로 재사용하되, driver pool 에는 kind="fixnet" 으로 기록한다. 슬롯 산술상
+            #    n_exp 는 "MPC 뒤 고정 net 개수"를 뜻하므로 fixnet 도 n_exp 에 포함시킨다
+            #    (풀에 이미 있던 exploiter 는 그대로 두고, 새로 exploiter 를 학습하지 않는다). ──
+            if (args.fixed_snapshot_period > 0 and s.iteration > 0
+                    and s.iteration % args.fixed_snapshot_period == 0
+                    and hasattr(trainer, "pool_add_exploiter")):
+                fix_snap = trainer.snapshot_current()    # 지금의 main net(+obs_rms) frozen copy
+                trainer.pool_add_exploiter(fix_snap)     # 워커 pool 고정 영역에 never-evict 추가
+                ins = n_bt + n_mpc + n_exp                # 기존 고정 net 뒤·snapshot 앞
+                pool.insert(ins, {"kind": "fixnet", "bt_index": 0,
+                                  "gen": -300 - n_exp, "ema": 0.5,
+                                  "state": fix_snap["state"], "rms": fix_snap["rms"],
                                   "dll": "", "rule": ""})
-                n_exp += 1
+                n_exp += 1                                # 고정 net 슬롯 수(exploiter+fixnet)
                 pool_max += 1                             # 고정 슬롯 1↑ → snapshot 정원 유지
                 trainer.pool_set_weights(_per_worker_weights())
-                print(f"[claude_code/PPO] *** exploiter #{n_exp} pool 추가(고정·never-evict): "
-                      f"vs-main wr {exp_wr:.3f} ({exp_iters} iter). pool={len(pool)} "
-                      f"(BT {n_bt}+MPC {n_mpc}+exp {n_exp}+snap {len(pool)-n_bt-n_mpc-n_exp}), "
+                print(f"[claude_code/PPO] *** 고정 self-play snapshot pool 추가"
+                      f"(never-evict, main@it{s.iteration}). pool={len(pool)} "
+                      f"(BT {n_bt}+MPC {n_mpc}+고정net {n_exp}+snap {len(pool)-n_bt-n_mpc-n_exp}), "
                       f"글로벌 최대 {pool_max}칸 ***", flush=True)
 
         net_emas = [e["ema"] for e in pool if e["kind"] == "net"]
