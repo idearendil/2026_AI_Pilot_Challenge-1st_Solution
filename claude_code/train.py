@@ -717,12 +717,28 @@ def main():
                     f"resume-state pool 의 MPC 슬롯({n_mpc})과 현재 --mpc-opponent"
                     f"({'on' if mpc_opponent else 'off'})가 불일치합니다. 학습 시작 때와 동일하게 "
                     "--mpc-opponent 를 주거나 빼서 이어서 학습하세요.")
-            # 컷오프 슬롯도 동일하게 학습 시작 때와 일치해야 슬롯 매핑이 어긋나지 않는다.
-            if n_cut != (1 if cutoff_opponent else 0):
-                raise SystemExit(
-                    f"resume-state pool 의 CUTOFF 슬롯({n_cut})과 현재 --cutoff-opponent"
-                    f"({'on' if cutoff_opponent else 'off'})가 불일치합니다. 학습 시작 때와 동일하게 "
-                    "--cutoff-opponent 를 주거나 빼서 이어서 학습하세요.")
+            # 컷오프 슬롯은 checkpoint 와 현재 --cutoff-opponent 가 다르면 (에러 대신) pool 을
+            # 자동으로 맞춘다. MPC 와 달리 컷오프는 state 없는 placeholder 라 슬롯을 끼우거나 빼는
+            # 것만으로 정합성이 맞는다(워커는 trainer._n_cut/_cutoff 로 exe 를 재구성).
+            #   - 없는데 켜져 있으면: CUTOFF 고정 슬롯(글로벌 n_bt+n_mpc)을 새로 삽입 + pool_max +1
+            #     (snapshot 정원 유지). 예: 컷오프 도입 전 checkpoint 를 이어받아 컷오프 추가.
+            #   - 있는데 꺼져 있으면: CUTOFF 슬롯 제거 + pool_max -1.
+            want_cut = 1 if cutoff_opponent else 0
+            if n_cut < want_cut:
+                pool.insert(n_bt + n_mpc,
+                            {"kind": "cutoff", "bt_index": 0, "gen": -200, "ema": 0.5,
+                             "state": None, "rms": None, "dll": "", "rule": ""})
+                n_cut = 1
+                pool_max += 1
+                print(f"[claude_code/PPO] resume: pool 에 CUTOFF 고정 슬롯 신규 추가"
+                      f"(never-evict, 글로벌 슬롯 {n_bt + n_mpc}, pool_max→{pool_max}).")
+            elif n_cut > want_cut:
+                idx = next(i for i, e in enumerate(pool) if e["kind"] == "cutoff")
+                pool.pop(idx)
+                n_cut = 0
+                pool_max -= 1
+                print(f"[claude_code/PPO] resume: --no-cutoff-opponent → pool 의 CUTOFF 슬롯 제거"
+                      f"(pool_max→{pool_max}).")
             # BT·MPC·exploiter 는 로컬·글로벌 슬롯 수가 같고(exploiter/MPC 는 모든 워커 공통),
             # BT 만 로컬 1칸(글로벌 n_bt) → local = pool_max - (n_bt-1) = pool_max - n_bt + 1.
             local_pool_max = pool_max - n_bt + 1 if n_bt else pool_max
