@@ -25,10 +25,45 @@ from dogfight.ai.action_provider import ActionContext, ActionProvider, ActionRes
 from claude_code.obs_mpc_planner import WMObs, ObsMPCPlanner
 
 
+def ac_ckpt_from_bundle(bundle_dir: str | Path) -> dict:
+    """submission_a/b 와 **동일한 PPO 번들**(metadata.json + policy_weights.pkl.gz)에서
+    ObsMPCPlanner 용 in-memory actor/critic ckpt dict 를 만든다(별도 export 파일 불필요).
+
+    반환 형식은 team01_basic_ac.pt 와 동일: {model_kwargs, state_dict, obs_rms}.
+    이렇게 하면 submission_c/d 가 a/b 와 같은 번들 경로만 가리키면 되고, MPC 용 .pt 를
+    따로 만들어 둘 필요가 없다.
+    """
+    from claude_code.model import load_bundle
+    m, meta = load_bundle(str(bundle_dir))
+    mm = meta.get("model", {})
+    crit_hidden = mm.get("critic_hidden")
+    mk = dict(
+        obs_dim=int(meta["observation_size"]),
+        act_dim=int(meta.get("action_size", 4)),
+        hidden=tuple(mm.get("hidden", (256, 256))),
+        activation=mm.get("activation", "tanh"),
+        critic_hidden=tuple(crit_hidden) if crit_hidden is not None else None,
+        critic_activation=mm.get("critic_activation"),
+        num_bins=int(mm.get("num_bins", 7)),
+    )
+    on = meta.get("obs_normalization")
+    if not on:
+        raise ValueError(
+            f"번들에 obs_normalization 이 없습니다: {bundle_dir}. neural-MPC 는 학습 시 관측 "
+            "정규화 통계가 필요합니다(정규화 없이 학습된 번들은 MPC 로 쓸 수 없음).")
+    return {
+        "model_kwargs": mk,
+        "state_dict": {k: v.cpu().numpy() for k, v in m.state_dict().items()},
+        "obs_rms": {"mean": np.asarray(on["mean"], np.float64),
+                    "var": np.asarray(on["var"], np.float64)},
+    }
+
+
 class MPCActionProvider(ActionProvider):
-    def __init__(self, wm_ckpt: str | Path, ac_ckpt: str | Path, device: str = "cuda",
-                 K: int = 12, M: int = 8, H: int = 20, decide_every: int = 1,
-                 gamma: float = 0.98, confidence: float = 0.9, use_fast: bool = True):
+    def __init__(self, wm_ckpt: str | Path, ac_ckpt: "str | Path | dict | None" = None,
+                 device: str = "cuda", K: int = 12, M: int = 8, H: int = 20,
+                 decide_every: int = 1, gamma: float = 0.98, confidence: float = 0.9,
+                 use_fast: bool = True, bundle_dir: "str | Path | None" = None):
         from claude_code.my_observation import (StateReconstructor, reset_reconstructor,
                                                 advance_reconstructor, push_action_reconstructor,
                                                 get_reconstructor)
@@ -39,8 +74,15 @@ class MPCActionProvider(ActionProvider):
         self.device = device
         self.confidence = confidence
         self.use_fast = bool(use_fast)
+        # bundle_dir 이 주어지면 submission_a/b 와 같은 번들에서 actor/critic 을 in-memory 로
+        # 만들어 쓴다(별도 ac ckpt 불필요). 아니면 ac_ckpt(경로 또는 dict)를 그대로 쓴다.
+        if bundle_dir is not None:
+            ac_ckpt = ac_ckpt_from_bundle(bundle_dir)
+        if ac_ckpt is None:
+            raise ValueError("ac_ckpt 또는 bundle_dir 중 하나는 반드시 주어야 합니다.")
         wm = WMObs(str(wm_ckpt), device)
-        self.planner = ObsMPCPlanner(wm, str(ac_ckpt), device=device, K=K, M=M, H=H,
+        ac_arg = ac_ckpt if isinstance(ac_ckpt, dict) else str(ac_ckpt)
+        self.planner = ObsMPCPlanner(wm, ac_arg, device=device, K=K, M=M, H=H,
                                      decide_every=decide_every, gamma=gamma)
         self.H = H
 
@@ -77,4 +119,4 @@ class MPCActionProvider(ActionProvider):
         return None
 
 
-__all__ = ["MPCActionProvider"]
+__all__ = ["MPCActionProvider", "ac_ckpt_from_bundle"]

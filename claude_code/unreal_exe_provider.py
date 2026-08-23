@@ -139,6 +139,7 @@ class UnrealExeProvider(ActionProvider):
         handshake_timeout_sec: float = 20.0,
         recv_chunk_sec: float = 0.1,
         max_resends: int = 3,
+        max_relaunches: int = 5,
         quiet: bool = True,
         confidence: float = 0.85,
     ):
@@ -154,6 +155,7 @@ class UnrealExeProvider(ActionProvider):
         self.handshake_timeout_sec = float(handshake_timeout_sec)
         self.recv_chunk_sec = float(recv_chunk_sec)
         self.max_resends = int(max_resends)
+        self.max_relaunches = int(max_relaunches)
         self.quiet = bool(quiet)
         self.confidence = float(confidence)
 
@@ -162,6 +164,8 @@ class UnrealExeProvider(ActionProvider):
         self._proc: subprocess.Popen | None = None
         self._idx = 0
         self._fail_count = 0
+        self._relaunch_count = 0     # 지금까지 exe 를 다시 띄운 횟수(상한 max_relaunches)
+        self._dead = False           # 재실행 상한 초과 → 영구 포기(이후 즉시 SAFE_ACTION, 스톨 없음)
         self._closed = False
 
         self._sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -223,6 +227,46 @@ class UnrealExeProvider(ActionProvider):
             f"unreal_bt_client.exe handshake 실패 (port={self.port}, "
             f"exe_addr={self._exe_addr}, proc_returncode={rc}). exe 경로/DLL/포트를 확인하세요.")
 
+    def _alive(self) -> bool:
+        """exe 프로세스가 살아 있는지."""
+        return self._proc is not None and self._proc.poll() is None
+
+    def _recover(self) -> bool:
+        """exe 가 죽었으면 재실행+handshake 로 복구한다.
+
+        성공하면 True(같은 port 소켓 재사용, 새 exe 가 접속·handshake). 재실행 상한
+        (max_relaunches) 초과·복구 실패 시 self._dead=True 로 두고 False 를 반환한다
+        (이후 compute_action 은 즉시 SAFE_ACTION → 2초 타임아웃 스톨/hang 방지).
+        """
+        if self._dead:
+            return False
+        if self._relaunch_count >= self.max_relaunches:
+            self._dead = True
+            if not self.quiet:
+                print(f"[UnrealExeProvider] exe 재실행 상한({self.max_relaunches}) 초과 "
+                      f"(port={self.port}) → 이후 SAFE_ACTION(직진) 상대로 대체", flush=True)
+            return False
+        self._relaunch_count += 1
+        # 죽은(또는 좀비) 프로세스 정리 후 재실행.
+        try:
+            if self._proc is not None and self._proc.poll() is None:
+                self._proc.terminate()
+        except Exception:
+            pass
+        self._proc = None
+        self._exe_addr = None
+        try:
+            self._launch_exe()
+            self._handshake()          # 새 exe 주소 재취득 + SetPlaneID 인지
+            if not self.quiet:
+                print(f"[UnrealExeProvider] exe 재실행 성공 "
+                      f"(port={self.port}, {self._relaunch_count}/{self.max_relaunches})", flush=True)
+            return True
+        except Exception as e:
+            if not self.quiet:
+                print(f"[UnrealExeProvider] exe 재실행 실패({e}, port={self.port})", flush=True)
+            return False
+
     # ── ActionProvider 인터페이스 ─────────────────────────────────────────────
     def reset(self, context: ActionContext | None = None) -> None:
         # exe 내장 BT 는 SetPlaneID 처리 시 command_policy.reset 을 부르지만 BTActionProvider.reset
@@ -240,6 +284,15 @@ class UnrealExeProvider(ActionProvider):
         if own_state is None or opp_state is None:
             return ActionResult(action=_SAFE_ACTION.copy(), source="unreal_exe",
                                 confidence=0.0, info={"reason": "missing_state"})
+
+        # exe 가 죽었으면 재실행 시도. 복구 실패(상한 초과)면 즉시 SAFE_ACTION 으로 빠르게 빠져
+        # 나온다 — 매 substep ~2초 타임아웃 누적으로 워커(→학습 전체)가 hang 되는 것을 막는다.
+        if not self._alive():
+            if not self._recover():
+                self._fail_count += 1
+                return ActionResult(action=_SAFE_ACTION.copy(), source="unreal_exe",
+                                    confidence=0.0, info={"reason": "exe_dead",
+                                                          "fail_count": self._fail_count})
 
         own_pos, own_rot, own_vel = _state_to_plane_fields(own_state)
         opp_pos, opp_rot, opp_vel = _state_to_plane_fields(opp_state)
@@ -269,6 +322,10 @@ class UnrealExeProvider(ActionProvider):
 
             deadline = time.time() + self.step_timeout_sec
             while time.time() < deadline:
+                # exe 가 대기 중 죽으면 남은 타임아웃을 다 기다리지 말고 즉시 빠져나온다
+                # (compute_action 이 다음 호출에서 _recover 로 재실행을 시도).
+                if self._proc is not None and self._proc.poll() is not None:
+                    return None
                 try:
                     buf, _addr = self._sock.recvfrom(2048)
                 except socket.timeout:

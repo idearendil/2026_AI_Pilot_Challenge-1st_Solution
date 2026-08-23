@@ -18,6 +18,13 @@
   python claude_code/power_test.py \
     --ownship-backend rl --ownship-bundle-dir artifacts/models/team01/basic \
     --target-backend rl --target-bundle-dir artifacts/models/team01/basic_old --games 100
+
+예시 (내 rl 모델 vs 팀원 model2_gylee agent, 100판):
+  python claude_code/power_test.py \
+    --ownship-backend rl --ownship-bundle-dir artifacts/models/team01/basic \
+    --target-backend gylee --games 100
+  (다른 snapshot 을 붙이려면 --target-gylee-snapshot <경로>, stochastic 상대면
+   --target-gylee-explore. 내 모델(ownship)은 항상 stochastic.)
 """
 from __future__ import annotations
 
@@ -33,6 +40,14 @@ for _p in (ROOT, ROOT / "src"):
     if str(_p) not in sys.path:
         sys.path.insert(0, str(_p))
 
+# 콘솔 인코딩(cp949 등)에 없는 문자(em-dash, 화살표 등)를 print 해도 UnicodeEncodeError 로
+# 죽지 않게 한다(train_redq.py 와 동일 관례). 인코딩은 유지하고 불가 문자만 안전 대체.
+try:
+    sys.stdout.reconfigure(errors="backslashreplace")
+    sys.stderr.reconfigure(errors="backslashreplace")
+except Exception:
+    pass
+
 # ── BT rule XML: 반드시 claude_code 의 다른 import 보다 먼저 ────────────────────
 # AIP_RULE_XML 은 JSBSimAIPLib.dll 로드 시점(= claude_code.env_utils import 체인)에 한 번만
 # 캐싱된다. 늦게 세팅하면 DLL 이 Rule_forTraining.xml(Task_Empty)로 폴백해 BT 가 조종을
@@ -41,6 +56,10 @@ from claude_code.bt_rule import BT_RULE_DEFAULTS, ENV_KEY  # noqa: E402  (leaf �
 
 _DEF_OWNSHIP_BT = "AIP_DCS_ownship.dll"
 _DEF_TARGET_BT = "Lee_BT1.dll"   # 기존 baseline. Jeon_BT1 / Jeon_BT2 / Shin_BT1.dll 로도 지정 가능
+# 팀원(gyLee) 패키지의 기본 opponent snapshot = 문서 계보의 iter_1415(동봉 SHA 일치·검증됨).
+# 다른 snapshot(예: iter_2350)을 --target-gylee-snapshot 으로 지정하면 SHA 가 달라
+# checksum 이 안 맞으므로 provider 생성 시 verify_checksum=False 로 로드한다.
+_DEF_GYLEE_SNAPSHOT = str(ROOT / "model2_gylee" / "model" / "iter_1415.pt")
 
 
 def _resolve_bt_rule(ns) -> str | None:
@@ -163,7 +182,7 @@ def _make_worker_cls():
                                 observation_module=spec["obs_module"],
                                 runner_index=f"pt{spec['wid']}")
 
-            # ownship rl: MLPActionProvider(항상 stochastic) + action_repeat=step_ratio
+            # ownship rl: MLPActionProvider(항상 stochastic) + action_repeat=step_ratio (10Hz).
             self.own_provider = None
             if spec["ownship_backend"] == "rl":
                 from claude_code.action_provider import MLPActionProvider
@@ -171,6 +190,16 @@ def _make_worker_cls():
                 inner = MLPActionProvider(bundle_dir=spec["ownship_bundle_dir"],
                                           stochastic=True)
                 self.own_provider = _ActionRepeatProvider(inner, self.step_ratio)
+                self.env._ownship_action_provider = self.own_provider
+            elif spec["ownship_backend"] == "altguard":
+                # 복합 에이전트는 매 substep 호출을 받아 내부에서 제어 주기를 맞추므로
+                # _ActionRepeatProvider 로 감싸지 않고 직접 주입한다(basic 10Hz / MPC 60Hz).
+                from claude_code.altguard_provider import AltGuardMPCProvider
+                self.own_provider = AltGuardMPCProvider(
+                    spec["ownship_bundle_dir"], mpc_root=spec["altguard_mpc_root"],
+                    mpc_config_path=(spec["altguard_mpc_config"] or None),
+                    step_ratio=self.step_ratio, device="cpu", stochastic=True,
+                    guard_altitude_ft=spec["altguard_alt_ft"])
                 self.env._ownship_action_provider = self.own_provider
 
             # target rl: SelfPlayProvider(자체 reconstructor). MLPActionProvider 는 전역
@@ -184,15 +213,36 @@ def _make_worker_cls():
                 self.tgt_provider = make_bt_provider(spec["target_bt_dll"], spec["bt_rule"])
                 self.env._target_action_provider = self.tgt_provider
             elif spec["target_backend"] == "rl":
-                from claude_code.model import load_bundle
-                from claude_code.normalizers import RunningMeanStd
-                from claude_code.self_play import SelfPlayProvider
-                m, meta = load_bundle(spec["target_bundle_dir"], device="cpu")
-                rms = (RunningMeanStd.from_state_dict(meta["obs_normalization"])
-                       if meta.get("obs_normalization") else None)
-                self.tgt_provider = SelfPlayProvider(
-                    m, rms, self.env._observation_fn, self.env._observation_mode,
-                    self.step_ratio, "cpu", explore=True)     # 상대 rl 도 stochastic
+                # 기본은 stochastic(pool 다양성·기존 동작). --target-rl-deterministic 면 argmax
+                # (결정론 상대. 예: BT 를 복제한 clone 을 원본 BT 처럼 결정론으로 평가할 때).
+                tgt_explore = bool(spec.get("target_rl_explore", True))
+                # --target-rl-high-rate 면 target rl(예: exe 를 복제한 clone)만 60Hz(매 substep)로
+                # 굴린다. 60Hz exe 를 대신하는 clone 을 원본처럼 60Hz 반응성으로 쓰기 위함.
+                if spec.get("target_rl_high_rate"):
+                    from claude_code.high_rate import high_rate_from_bundle
+                    self.tgt_provider = high_rate_from_bundle(
+                        spec["target_bundle_dir"], step_ratio=self.step_ratio,
+                        device="cpu", explore=tgt_explore)
+                else:
+                    from claude_code.model import load_bundle
+                    from claude_code.normalizers import RunningMeanStd
+                    from claude_code.self_play import SelfPlayProvider
+                    m, meta = load_bundle(spec["target_bundle_dir"], device="cpu")
+                    rms = (RunningMeanStd.from_state_dict(meta["obs_normalization"])
+                           if meta.get("obs_normalization") else None)
+                    self.tgt_provider = SelfPlayProvider(
+                        m, rms, self.env._observation_fn, self.env._observation_mode,
+                        self.step_ratio, "cpu", explore=tgt_explore)
+                self.env._target_action_provider = self.tgt_provider
+            elif spec["target_backend"] == "gylee":
+                # 팀원 model2_gylee 패키지의 self-contained opponent(10Hz). 자체 47D 관측·RMS·
+                # reconstructor 를 가지므로 env 관측 모듈과 무관하게 동작한다(제공 계약대로
+                # context.ownship_state=상대 자신, target_state=본 기체를 받는다).
+                from model2_gylee import make_opponent_provider
+                self.tgt_provider = make_opponent_provider(
+                    snapshot_path=spec["gylee_snapshot"], step_ratio=self.step_ratio,
+                    device="cpu", explore=bool(spec["gylee_explore"]),
+                    verify_checksum=False)
                 self.env._target_action_provider = self.tgt_provider
 
         def play(self, jobs):
@@ -244,13 +294,36 @@ def _make_worker_cls():
 def parse_args():
     p = argparse.ArgumentParser(
         description="두 모델을 N판 붙여 어느 쪽이 강한지 통계로 판정(리플레이 없음)")
-    p.add_argument("--ownship-backend", choices=["rl", "bt"], default="rl")
-    p.add_argument("--target-backend", choices=["rl", "bt", "loiter", "fixed", "autopilot"],
-                   default="bt")
+    p.add_argument("--ownship-backend", choices=["rl", "bt", "altguard"], default="rl",
+                   help="ownship 종류. altguard = 평상시 basic 번들(10Hz stochastic) + 고도 "
+                        "임계값 이하에서 team-share MPC(60Hz) 로 자동 전환하는 복합 에이전트")
+    p.add_argument("--target-backend",
+                   choices=["rl", "bt", "gylee", "loiter", "fixed", "autopilot"],
+                   default="bt",
+                   help="상대 종류. gylee = 팀원 model2_gylee 패키지의 고정 opponent(47D·19bin)")
     p.add_argument("--ownship-bundle-dir", help="ownship rl 일 때 claude 번들 경로")
     p.add_argument("--target-bundle-dir", help="target rl 일 때 claude 번들 경로")
+    p.add_argument("--target-rl-deterministic", action="store_true",
+                   help="target rl 을 argmax(결정론)로 굴린다. 기본은 stochastic(샘플링). "
+                        "BT 를 복제한 clone 을 원본처럼 결정론으로 평가할 때 사용.")
+    p.add_argument("--target-rl-high-rate", action="store_true",
+                   help="target rl(예: 60Hz exe 를 복제한 exe_clone)만 **매 substep(60Hz)** 로 "
+                        "결정시킨다. action-history 는 학습대로 0.1s 간격 유지(60Hz 큐 subsample). "
+                        "ownship/기타 신경망 모델은 10Hz 그대로. clone 을 원본 exe(60Hz)처럼 쓸 때.")
+    p.add_argument("--target-gylee-snapshot", default=_DEF_GYLEE_SNAPSHOT,
+                   help=f"gylee opponent snapshot .pt (기본 {Path(_DEF_GYLEE_SNAPSHOT).name})")
+    p.add_argument("--target-gylee-explore", action="store_true",
+                   help="gylee opponent 를 stochastic(sample)으로. 기본은 deterministic(argmax) "
+                        "— 고정 비교 상대로는 결정론이 해석하기 쉬움(model card §6).")
     p.add_argument("--ownship-bt-dll", default=_DEF_OWNSHIP_BT)
     p.add_argument("--target-bt-dll", default=_DEF_TARGET_BT)
+    # ── altguard(고도 안전망) ownship 옵션 ──
+    p.add_argument("--ownship-guard-altitude-ft", type=float, default=3000.0,
+                   help="altguard: 이 고도(ft) 이하로 내려가면 MPC 가 대신 조종(기본 3000)")
+    p.add_argument("--ownship-mpc-root", default=str(ROOT / "Release_MPC_team_share"),
+                   help="altguard 이 쓸 team-share MPC 폴더(기본 Release_MPC_team_share)")
+    p.add_argument("--ownship-mpc-config", default="",
+                   help="altguard MPC config yaml(생략 시 <mpc-root>/configs/mpc.yaml)")
     p.add_argument("--bt-rule-xml", default="",
                    help="BT rule XML(기본: DLL 별 자동 선택. Lee_BT1.dll/Jeon_BT1.dll/"
                         "Jeon_BT2.dll/Shin_BT1.dll → 각 동명 .xml)")
@@ -292,16 +365,23 @@ def main():
             f"BT rule XML 불일치: 최종={bt_rule!r} / import 시점={os.environ.get(ENV_KEY)!r}. "
             "DLL 은 import 시점 값을 캐싱하므로 --bt-rule-xml 을 명시해 주세요.")
 
-    if args.ownship_backend == "rl" and not args.ownship_bundle_dir:
-        raise ValueError("--ownship-backend rl 이면 --ownship-bundle-dir 이 필요합니다.")
+    if args.ownship_backend in ("rl", "altguard") and not args.ownship_bundle_dir:
+        raise ValueError(f"--ownship-backend {args.ownship_backend} 이면 "
+                         "--ownship-bundle-dir(basic 번들) 이 필요합니다.")
+    if args.ownship_backend == "altguard" and not Path(args.ownship_mpc_root).is_dir():
+        raise ValueError(f"altguard MPC 폴더를 찾을 수 없습니다: {args.ownship_mpc_root}")
     if args.target_backend == "rl" and not args.target_bundle_dir:
         raise ValueError("--target-backend rl 이면 --target-bundle-dir 이 필요합니다.")
+    if args.target_backend == "gylee" and not Path(args.target_gylee_snapshot).is_file():
+        raise ValueError(
+            f"--target-backend gylee 의 snapshot 을 찾을 수 없습니다: {args.target_gylee_snapshot}")
 
     # 관측 모듈: env 는 하나뿐이라 양쪽 rl 번들이 같은 모듈을 써야 한다.
     from claude_code.model import load_bundle
 
     obs_modules = {}
-    for side, d in (("ownship", args.ownship_bundle_dir if args.ownship_backend == "rl" else None),
+    for side, d in (("ownship", args.ownship_bundle_dir
+                     if args.ownship_backend in ("rl", "altguard") else None),
                     ("target", args.target_bundle_dir if args.target_backend == "rl" else None)):
         if d:
             _, meta = load_bundle(d, device="cpu")
@@ -312,7 +392,7 @@ def main():
     obs_module = next(iter(obs_modules.values()), "")
 
     # provider 로 조종하는 상대(rl / bt-provider)는 env 가 자체 AI 를 만들지 않도록 fixed.
-    provider_target = (args.target_backend == "rl"
+    provider_target = (args.target_backend in ("rl", "gylee")
                        or (args.target_backend == "bt"
                            and args.target_bt_mode == "provider"))
     overrides = {
@@ -342,11 +422,22 @@ def main():
     swaps = [0] * games if args.fixed_side else [i % 2 for i in range(games)]
     head_swaps = [0] * games if args.fixed_side else [(i // 2) % 2 for i in range(games)]
 
-    own_desc = (f"rl({args.ownship_bundle_dir})" if args.ownship_backend == "rl"
-                else f"bt({args.ownship_bt_dll})")
-    tgt_desc = (f"rl({args.target_bundle_dir})" if args.target_backend == "rl"
-                else f"bt({args.target_bt_dll}, {args.target_bt_mode})"
-                if args.target_backend == "bt" else args.target_backend)
+    if args.ownship_backend == "rl":
+        own_desc = f"rl({args.ownship_bundle_dir})"
+    elif args.ownship_backend == "altguard":
+        own_desc = (f"altguard(basic={args.ownship_bundle_dir} 10Hz / "
+                    f"MPC<{args.ownship_guard_altitude_ft:.0f}ft 60Hz)")
+    else:
+        own_desc = f"bt({args.ownship_bt_dll})"
+    if args.target_backend == "rl":
+        tgt_desc = f"rl({args.target_bundle_dir})"
+    elif args.target_backend == "bt":
+        tgt_desc = f"bt({args.target_bt_dll}, {args.target_bt_mode})"
+    elif args.target_backend == "gylee":
+        tgt_desc = (f"gylee({Path(args.target_gylee_snapshot).name}, "
+                    f"{'stochastic' if args.target_gylee_explore else 'deterministic'})")
+    else:
+        tgt_desc = args.target_backend
     print(f"[power_test] ownship = {own_desc}")
     print(f"[power_test] target  = {tgt_desc}")
     print(f"[power_test] games={games} workers={n_workers} master_seed={master_seed} "
@@ -374,6 +465,13 @@ def main():
         "target_bundle_dir": args.target_bundle_dir,
         "target_bt_mode": args.target_bt_mode, "target_bt_dll": args.target_bt_dll,
         "bt_rule": args.bt_rule_xml,
+        "gylee_snapshot": args.target_gylee_snapshot,
+        "gylee_explore": args.target_gylee_explore,
+        "target_rl_explore": (not args.target_rl_deterministic),
+        "target_rl_high_rate": bool(args.target_rl_high_rate),
+        "altguard_mpc_root": str(args.ownship_mpc_root),
+        "altguard_mpc_config": str(args.ownship_mpc_config),
+        "altguard_alt_ft": float(args.ownship_guard_altitude_ft),
     }
     WorkerCls = _make_worker_cls()
     workers = [WorkerCls.remote({**spec, "wid": i}) for i in range(n_workers)]

@@ -107,7 +107,10 @@ class ObsMPCPlanner:
         self._r_tgt_alt = torch.tensor(float(_RC["target_alt_reward"]), device=dv, dtype=dtype)
         self._zero = torch.tensor(0.0, device=dv, dtype=dtype)
         self.kw = self.wm.k * self.wm.adim          # command window 폭(=20)
-        ck = torch.load(ac_ckpt, map_location=device, weights_only=False)
+        # ac_ckpt 는 경로(str/Path) 또는 이미 로드된 dict({model_kwargs,state_dict,obs_rms}).
+        # 후자는 submission_c/d 처럼 번들에서 in-memory 로 만든 actor/critic 을 넘길 때 쓴다.
+        ck = ac_ckpt if isinstance(ac_ckpt, dict) \
+            else torch.load(ac_ckpt, map_location=device, weights_only=False)
         mk = ck["model_kwargs"]; self.num_bins = int(mk["num_bins"])
         self.model = make_actor_critic(**mk).to(device).eval()
         self.model.load_state_dict({k: torch.as_tensor(v) for k, v in ck["state_dict"].items()})

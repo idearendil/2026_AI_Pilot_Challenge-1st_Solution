@@ -200,6 +200,25 @@ def parse_args():
                    help="MPC 번들 루트(=native DLL·config·F16 XML 자산 위치). 프로젝트 루트 기준 상대경로 허용.")
     p.add_argument("--mpc-config", default="",
                    help="MPC config yaml 경로(비우면 <mpc-root>/configs/mpc.yaml).")
+    # ── 컷오프(unreal_bt_client.exe) 고정 상대(옵션). MPC 와 같은 never-evict 글로벌 슬롯 방식이나,
+    #    상대를 내(=UnrealExeProvider)가 쓰던 provider 로 구동한다(팀원 CutoffUDPProvider 아님).
+    #    워커마다 exe 1개(포트 base+worker_id)를 상주시켜 60Hz 로 응답받는다. ──
+    p.add_argument("--cutoff-opponent", action=argparse.BooleanOptionalAction, default=True,
+                   help="opponent pool 에 컷오프 모델(unreal_bt_client.exe)을 고정 상대로 추가"
+                        "(never-evict, 모든 워커 공통, 글로벌 슬롯 MPC 다음·snapshot 앞에 1칸). "
+                        "**기본 켜짐**; 끄려면 --no-cutoff-opponent. self-play + num_workers>1 + exe "
+                        "존재에서만 활성화되고, 미충족이면 (크래시 없이) 자동 비활성된다. 워커마다 "
+                        "exe 1개(포트 --cutoff-base-port+worker_id)를 상주 실행한다.")
+    p.add_argument("--cutoff-exe-path", default=str(ROOT / "unreal_bt_client.exe"),
+                   help="컷오프 exe 경로(기본: 프로젝트 루트 unreal_bt_client.exe).")
+    p.add_argument("--cutoff-base-port", type=int, default=9700,
+                   help="컷오프 exe UDP 베이스 포트. 워커 i 는 base+i 를 쓴다(기본 9700).")
+    p.add_argument("--cutoff-force-own", type=int, default=1,
+                   help="exe 관점 자기(상대기) force side (기본 1).")
+    p.add_argument("--cutoff-force-tgt", type=int, default=2,
+                   help="exe 관점 적(본기체=학습기) force side (기본 2).")
+    p.add_argument("--cutoff-step-timeout-sec", type=float, default=0.5,
+                   help="한 substep 에서 exe CMD 를 기다리는 최대 시간(기본 0.5s).")
     # ── exploiter: main N iter 마다 main 을 잠깐 멈추고 그때의 main 만 상대로 새 exploiter 를
     #    scratch 학습 → 승률≥target 또는 max_iters 에서 중단 → opponent pool 에 never-evict 추가. ──
     p.add_argument("--exploiter-period", type=int, default=500,
@@ -408,13 +427,38 @@ def main():
                 mpc_opponent = (str(mpc_root), str(mpc_cfg))
                 print(f"[claude_code/PPO] MPC 고정 상대 활성: root={mpc_root} config={mpc_cfg}")
 
+    # 컷오프 exe 고정 상대(옵션). MPC 와 동일하게 self-play + num_workers>1 에서만, exe 파일이
+    # 있어야 활성. 워커마다 exe 1개를 상주 실행하므로 병렬 경로 전용. 미충족 시 자동 비활성.
+    cutoff_opponent = None
+    if args.cutoff_opponent:
+        skip = None
+        if not args.self_play:
+            skip = "--self-play 아님"
+        elif args.num_workers <= 1:
+            skip = "num_workers<=1(Ray 병렬 필요)"
+        elif not Path(args.cutoff_exe_path).exists():
+            skip = f"exe 없음: {args.cutoff_exe_path}"
+        if skip is not None:
+            print(f"[claude_code/PPO] 컷오프 고정 상대 자동 비활성({skip}). 끄려면 --no-cutoff-opponent.")
+        else:
+            cutoff_opponent = {
+                "exe_path": str(Path(args.cutoff_exe_path).resolve()),
+                "base_port": int(args.cutoff_base_port),
+                "force_own": int(args.cutoff_force_own),
+                "force_tgt": int(args.cutoff_force_tgt),
+                "step_timeout_sec": float(args.cutoff_step_timeout_sec),
+            }
+            print(f"[claude_code/PPO] 컷오프 고정 상대 활성: exe={cutoff_opponent['exe_path']} "
+                  f"base_port={cutoff_opponent['base_port']} (워커마다 exe 1개, UnrealExeProvider)")
+
     # 데이터 수집: num_workers>1 이면 Ray 병렬, 아니면 단일 프로세스.
     if args.num_workers > 1:
         from claude_code.parallel import ParallelPPOTrainer
         env.close()   # driver 는 rollout env 를 step 하지 않음 (worker 가 가짐)
         trainer = ParallelPPOTrainer(env_kwargs, cfg, args.num_workers,
                                      args.self_play, obs_dim, act_dim,
-                                     bt_opponents=bt_list, mpc_opponent=mpc_opponent)
+                                     bt_opponents=bt_list, mpc_opponent=mpc_opponent,
+                                     cutoff_opponent=cutoff_opponent)
     else:
         trainer = PPOTrainer(env, cfg, bt_opponents=bt_list)
     # gated self-play 상대는 resume(weights 확정) 후에 '현재 정책의 frozen copy' 로 설치한다.
@@ -480,10 +524,13 @@ def main():
                                                 else args.selfplay_gate_threshold),
                     "selfplay_ema_alpha": args.selfplay_ema_alpha,
                     "pool_size": (len(bt_list) + (1 if mpc_opponent else 0)
+                                  + (1 if cutoff_opponent else 0)
                                   + (1 if args.frozen_opponent
                                      else max(1, int(args.pool_size) - len(bt_list)
-                                              - (1 if mpc_opponent else 0)))),
+                                              - (1 if mpc_opponent else 0)
+                                              - (1 if cutoff_opponent else 0)))),
                     "mpc_opponent": bool(mpc_opponent),
+                    "cutoff_opponent": bool(cutoff_opponent),
                     "pool_sample_temp": args.pool_sample_temp,
                     "bt_opponents": ([d for d, _ in bt_list] if bt_enabled else None),
                     "reward_module": args.reward_module,
@@ -574,13 +621,14 @@ def main():
     # MPC 는 모든 워커 공통(글로벌 단일 슬롯 n_bt). 둘 다 절대 evict 안 됨.
     n_bt = len(bt_list)
     n_mpc = 1 if mpc_opponent else 0
+    n_cut = 1 if cutoff_opponent else 0                  # 컷오프 exe 고정 슬롯(0/1, MPC 다음)
     # snapshot 정원 = --max-self-snapshots(기본 3). frozen 이면 snapshot 1개 고정.
-    # 고정 슬롯 = BT n_bt + MPC n_mpc + exploiter n_exp(학습 중 증가). exploiter 는 절대 evict 안 됨.
+    # 고정 슬롯 = BT n_bt + MPC n_mpc + CUTOFF n_cut + exploiter n_exp(학습 중 증가). 모두 never-evict.
     snapshot_cap = 1 if args.frozen_opponent else max(1, int(args.max_self_snapshots))
     n_exp = 0                                            # exploiter 수(학습 중 pool_add_exploiter 로 증가)
-    pool_max = n_bt + n_mpc + n_exp + snapshot_cap       # 글로벌 총 슬롯(exploiter 추가 시 +1)
-    # 워커 로컬 = [BT 1개(있으면)] + [MPC(공통)] + [exploiter n_exp(공통)] + [snapshot cap].
-    local_pool_max = (1 if n_bt else 0) + n_mpc + n_exp + snapshot_cap
+    pool_max = n_bt + n_mpc + n_cut + n_exp + snapshot_cap   # 글로벌 총 슬롯(exploiter 추가 시 +1)
+    # 워커 로컬 = [BT 1개(있으면)] + [MPC(공통)] + [CUTOFF(공통)] + [exploiter n_exp(공통)] + [snapshot cap].
+    local_pool_max = (1 if n_bt else 0) + n_mpc + n_cut + n_exp + snapshot_cap
     if resume_ckpt is not None:
         pool_max = int(resume_ckpt["pool_max"])
 
@@ -595,10 +643,12 @@ def main():
         (다른 BT 는 이 워커 로컬 pool 에 없으므로 자연히 확률 0.)
         """
         snap_emas = [e["ema"] for e in pool if e["kind"] == "net"]
-        # 로컬 벡터 순서 = [BT?][MPC?][exploiter...][snapshots] 로, 워커의 로컬 provider 순서와
-        # 정확히 일치시켜야 한다. MPC=글로벌 슬롯 n_bt, exploiter=글로벌 n_bt+n_mpc..n_bt+n_mpc+n_exp-1.
+        # 로컬 벡터 순서 = [BT?][MPC?][CUTOFF?][exploiter...][snapshots] 로, 워커의 로컬 provider
+        # 순서와 정확히 일치시켜야 한다. MPC=글로벌 슬롯 n_bt, CUTOFF=글로벌 n_bt+n_mpc,
+        # exploiter=글로벌 n_bt+n_mpc+n_cut..+n_exp-1.
         mpc_emas = [pool[n_bt]["ema"]] if n_mpc else []
-        exp_emas = [pool[n_bt + n_mpc + j]["ema"] for j in range(n_exp)]
+        cut_emas = [pool[n_bt + n_mpc]["ema"]] if n_cut else []
+        exp_emas = [pool[n_bt + n_mpc + n_cut + j]["ema"] for j in range(n_exp)]
         temp = max(float(args.pool_sample_temp), 1e-6)
         floor = min(max(float(args.pool_uniform_floor), 0.0), 1.0)
 
@@ -616,16 +666,18 @@ def main():
             return (p / sm).tolist() if sm > 1e-12 else (np.ones(m) / m).tolist()
 
         if n_bt == 0:
-            v = _mix(mpc_emas + exp_emas + snap_emas)
+            v = _mix(mpc_emas + cut_emas + exp_emas + snap_emas)
             return [v for _ in range(trainer.num_workers)]
-        vecs = [_mix([pool[b]["ema"]] + mpc_emas + exp_emas + snap_emas) for b in range(n_bt)]
+        vecs = [_mix([pool[b]["ema"]] + mpc_emas + cut_emas + exp_emas + snap_emas)
+                for b in range(n_bt)]
         return [vecs[i % n_bt] for i in range(trainer.num_workers)]
 
     # opponent pool 메타데이터(train.py 소유, checkpoint 저장 대상). 글로벌 슬롯 순서:
-    #   slots 0..n_bt-1              = BT(kind="bt", bt_index, dll, rule) — round-robin, evict 안 됨,
-    #   slot  n_bt (n_mpc=1)         = MPC(kind="mpc") — 모든 워커 공통, evict 안 됨,
-    #   slots n_bt+n_mpc..+n_exp-1   = exploiter(kind="exploiter", gen, ema, state, rms) — 공통, evict 안 됨,
-    #   slots n_bt+n_mpc+n_exp..     = snapshot(kind="net", gen, ema, state, rms) — 최대 snapshot_cap, FIFO.
+    #   slots 0..n_bt-1                    = BT(kind="bt", bt_index, dll, rule) — round-robin, evict 안 됨,
+    #   slot  n_bt (n_mpc=1)              = MPC(kind="mpc") — 모든 워커 공통, evict 안 됨,
+    #   slot  n_bt+n_mpc (n_cut=1)        = CUTOFF(kind="cutoff") — 컷오프 exe, 공통, evict 안 됨,
+    #   slots n_bt+n_mpc+n_cut..+n_exp-1  = exploiter/fixnet(gen, ema, state, rms) — 공통, evict 안 됨,
+    #   slots n_bt+n_mpc+n_cut+n_exp..    = snapshot(kind="net", gen, ema, state, rms) — 최대 snapshot_cap, FIFO.
     pool: list = []
     pool_state = {"next_gen": 1, "n_added": 0}
 
@@ -639,6 +691,11 @@ def main():
         return ([{"kind": "mpc", "bt_index": 0, "gen": -100, "ema": 0.5,
                   "state": None, "rms": None, "dll": "", "rule": ""}] if n_mpc else [])
 
+    def _cutoff_entries() -> list:
+        # 컷오프 exe 도 net 아님 → state/rms 없음. 정체성은 CLI(--cutoff-*)에서 워커가 exe 를 띄운다.
+        return ([{"kind": "cutoff", "bt_index": 0, "gen": -200, "ema": 0.5,
+                  "state": None, "rms": None, "dll": "", "rule": ""}] if n_cut else [])
+
     if args.self_play:
         if resume_ckpt is not None:
             pool = [{"kind": e.get("kind", "net"), "bt_index": e.get("bt_index", 0),
@@ -650,6 +707,7 @@ def main():
             # BT 만 (n_bt-1)칸 줄어든다 → local = pool_max - n_bt + 1(있으면) / pool_max(없으면).)
             n_bt = sum(1 for e in pool if e["kind"] == "bt")
             n_mpc = sum(1 for e in pool if e["kind"] == "mpc")
+            n_cut = sum(1 for e in pool if e["kind"] == "cutoff")
             # 고정 net 슬롯 = exploiter(과거 학습분) + fixnet(주기적 main snapshot). 둘 다 never-evict.
             n_exp = sum(1 for e in pool if e["kind"] in ("exploiter", "fixnet"))
             # 복원된 pool 의 MPC 유무와 이번 실행의 --mpc-opponent 가 일치해야 한다. 불일치면
@@ -659,6 +717,12 @@ def main():
                     f"resume-state pool 의 MPC 슬롯({n_mpc})과 현재 --mpc-opponent"
                     f"({'on' if mpc_opponent else 'off'})가 불일치합니다. 학습 시작 때와 동일하게 "
                     "--mpc-opponent 를 주거나 빼서 이어서 학습하세요.")
+            # 컷오프 슬롯도 동일하게 학습 시작 때와 일치해야 슬롯 매핑이 어긋나지 않는다.
+            if n_cut != (1 if cutoff_opponent else 0):
+                raise SystemExit(
+                    f"resume-state pool 의 CUTOFF 슬롯({n_cut})과 현재 --cutoff-opponent"
+                    f"({'on' if cutoff_opponent else 'off'})가 불일치합니다. 학습 시작 때와 동일하게 "
+                    "--cutoff-opponent 를 주거나 빼서 이어서 학습하세요.")
             # BT·MPC·exploiter 는 로컬·글로벌 슬롯 수가 같고(exploiter/MPC 는 모든 워커 공통),
             # BT 만 로컬 1칸(글로벌 n_bt) → local = pool_max - (n_bt-1) = pool_max - n_bt + 1.
             local_pool_max = pool_max - n_bt + 1 if n_bt else pool_max
@@ -668,17 +732,18 @@ def main():
                 [e for e in pool if e["kind"] == "net"], _per_worker_weights(), local_pool_max,
                 exploiter_entries=[e for e in pool if e["kind"] in ("exploiter", "fixnet")])
             print(f"[claude_code/PPO] opponent pool 복원: {len(pool)}개 "
-                  f"(BT {n_bt} + MPC {n_mpc} + 고정net {n_exp} + "
-                  f"snapshot {len(pool)-n_bt-n_mpc-n_exp}, ema {[round(e['ema'],3) for e in pool]})")
+                  f"(BT {n_bt} + MPC {n_mpc} + CUTOFF {n_cut} + 고정net {n_exp} + "
+                  f"snapshot {len(pool)-n_bt-n_mpc-n_cut-n_exp}, ema {[round(e['ema'],3) for e in pool]})")
         else:
             snap = trainer.snapshot_current()
-            pool = _bt_entries() + _mpc_entries() + [{"kind": "net", "gen": 0, "ema": 0.5,
-                                     "state": snap["state"], "rms": snap["rms"]}]
+            pool = (_bt_entries() + _mpc_entries() + _cutoff_entries()
+                    + [{"kind": "net", "gen": 0, "ema": 0.5,
+                        "state": snap["state"], "rms": snap["rms"]}])
             pool_state = {"next_gen": 1, "n_added": 0}
             trainer.install_opponent_pool(local_pool_max, _per_worker_weights())
-            print(f"[claude_code/PPO] opponent pool 초기화 = BT {n_bt}종 + MPC {n_mpc} + iter0 정책 "
-                  f"(글로벌 최대 {pool_max}칸 = BT {n_bt} + MPC {n_mpc} + exploiter {n_exp} + "
-                  f"snapshot {snapshot_cap}, "
+            print(f"[claude_code/PPO] opponent pool 초기화 = BT {n_bt}종 + MPC {n_mpc} + CUTOFF {n_cut} "
+                  f"+ iter0 정책 (글로벌 최대 {pool_max}칸 = BT {n_bt} + MPC {n_mpc} + CUTOFF {n_cut} "
+                  f"+ exploiter {n_exp} + snapshot {snapshot_cap}, "
                   f"샘플링=EMA 균등{args.pool_uniform_floor:.2f}+softmax(τ={args.pool_sample_temp}), "
                   f"추가 임계 min-EMA≥{args.selfplay_gate_threshold:.2f})")
         bt_names = [Path(e["dll"]).stem for e in pool if e["kind"] == "bt"]
@@ -780,6 +845,11 @@ def main():
         mpc_games = int(mpc_stat.get("decided", 0)) if mpc_stat else 0
         mpc_wr = (float(mpc_stat["raw_win_rate"]) if (mpc_stat and mpc_games > 0)
                   else float("nan"))
+        # 컷오프 고정 슬롯(글로벌 index n_bt+n_mpc)의 이번 iter 성적. 로깅용.
+        cut_stat = per_opp.get(n_bt + n_mpc) if n_cut else None
+        cut_games = int(cut_stat.get("decided", 0)) if cut_stat else 0
+        cut_wr = (float(cut_stat["raw_win_rate"]) if (cut_stat and cut_games > 0)
+                  else float("nan"))
         if args.self_play:
             alpha = args.selfplay_ema_alpha
             # 이번 iter 에 실제로 게임이 있었던 후보만 EMA 갱신(안 뽑힌 후보는 유지).
@@ -799,8 +869,8 @@ def main():
                              "state": snap["state"], "rms": snap["rms"]})
                 pool_state["next_gen"] += 1
                 if len(pool) > pool_max:
-                    # 가장 오래된 snapshot 제거 (BT·MPC·exploiter 고정 슬롯 보존).
-                    pool.pop(n_bt + n_mpc + n_exp)
+                    # 가장 오래된 snapshot 제거 (BT·MPC·CUTOFF·exploiter 고정 슬롯 보존).
+                    pool.pop(n_bt + n_mpc + n_cut + n_exp)
                 pool_state["n_added"] += 1
                 _save_best(s, {"mean_return": s.mean_return, "win_rate": raw_wr})
                 added = True
@@ -818,7 +888,7 @@ def main():
                     and hasattr(trainer, "pool_add_exploiter")):
                 fix_snap = trainer.snapshot_current()    # 지금의 main net(+obs_rms) frozen copy
                 trainer.pool_add_exploiter(fix_snap)     # 워커 pool 고정 영역에 never-evict 추가
-                ins = n_bt + n_mpc + n_exp                # 기존 고정 net 뒤·snapshot 앞
+                ins = n_bt + n_mpc + n_cut + n_exp        # 기존 고정 net 뒤·snapshot 앞
                 pool.insert(ins, {"kind": "fixnet", "bt_index": 0,
                                   "gen": -300 - n_exp, "ema": 0.5,
                                   "state": fix_snap["state"], "rms": fix_snap["rms"],
@@ -828,7 +898,8 @@ def main():
                 trainer.pool_set_weights(_per_worker_weights())
                 print(f"[claude_code/PPO] *** 고정 self-play snapshot pool 추가"
                       f"(never-evict, main@it{s.iteration}). pool={len(pool)} "
-                      f"(BT {n_bt}+MPC {n_mpc}+고정net {n_exp}+snap {len(pool)-n_bt-n_mpc-n_exp}), "
+                      f"(BT {n_bt}+MPC {n_mpc}+CUTOFF {n_cut}+고정net {n_exp}"
+                      f"+snap {len(pool)-n_bt-n_mpc-n_cut-n_exp}), "
                       f"글로벌 최대 {pool_max}칸 ***", flush=True)
 
         net_emas = [e["ema"] for e in pool if e["kind"] == "net"]
@@ -923,6 +994,11 @@ def main():
                     log_dict["selfplay/mpc_ema"] = pool[n_bt]["ema"]
                     log_dict["selfplay/mpc_win_rate"] = mpc_wr
                     log_dict["selfplay/mpc_games"] = mpc_games
+                if n_cut:
+                    # 컷오프 exe 고정 상대(글로벌 슬롯 n_bt+n_mpc)의 EMA/승률/게임수.
+                    log_dict["selfplay/cutoff_ema"] = pool[n_bt + n_mpc]["ema"]
+                    log_dict["selfplay/cutoff_win_rate"] = cut_wr
+                    log_dict["selfplay/cutoff_games"] = cut_games
                 # 후보별 EMA (슬롯 0..n_bt-1=BT, n_bt=MPC, 그 뒤 snapshot). 빈 슬롯은 로깅 생략.
                 for i in range(pool_max):
                     if i < len(pool):
@@ -936,9 +1012,11 @@ def main():
             bt_msg = (f" bt[ema {ema_bt:.3f} wr {bt_wr:.2f} n{bt_games}]" if n_bt else "")
             mpc_msg = (f" mpc[ema {pool[n_bt]['ema']:.3f} wr {mpc_wr:.2f} n{mpc_games}]"
                        if n_mpc else "")
+            cut_msg = (f" cutoff[ema {pool[n_bt + n_mpc]['ema']:.3f} wr {cut_wr:.2f} n{cut_games}]"
+                       if n_cut else "")
             sp_msg = (f" | pool{len(pool)} W/L/D {wins}/{losses}/{draws} "
                       f"raw_wr {raw_wr:.2f} ema[min {ema_min:.3f} mean {ema_mean:.3f}]"
-                      f"{bt_msg}{mpc_msg}"
+                      f"{bt_msg}{mpc_msg}{cut_msg}"
                       f"{' *POOL+ (added current, best saved)*' if added else ''}")
 
         print(

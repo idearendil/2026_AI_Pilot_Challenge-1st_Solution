@@ -1,0 +1,20 @@
+{
+  "name": "model2_gylee",
+  "lineage": "ver09_branch_ver08_i0815_outcome100_safelead_atapotential",
+  "snapshot_kind": "latest durable training snapshot; not a selected best checkpoint",
+  "iteration": 1415,
+  "global_step": 141500000,
+  "checkpoint_sha256": "6A12ECD587A51627C0A67504579092382CC3FFE00C7F554345D825035C0E16CF",
+  "source_lineage": "ver01_phase1_i0075 -> ver06_i0380 -> ver08_i0815 -> ver09_i1415",
+  "observation": "claude47r",
+  "observation_size": 47,
+  "policy": "MLP 512x512x512 tanh, 4 independent categorical axes, 19 bins per axis",
+  "policy_rate_hz": 10,
+  "sim_rate_hz": 60,
+  "step_ratio": 6,
+  "packaged_while_training_continued": true,
+  "reward_source": "training_reward/gyLee_reward.py",
+  "reward_source_sha256": "BF99FAA904B0ABBC2634E837C3A9BDFEA00722A6E2B528220A5B5C4763D8A603",
+  "active_reward_profile": "phase3",
+  "active_reward_config": "training_reward/reward_config_ver09_iter1415.json"
+}

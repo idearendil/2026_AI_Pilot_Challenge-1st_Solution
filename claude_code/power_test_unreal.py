@@ -16,6 +16,10 @@ UnrealExeProvider)를 띄우고 exe 프로세스를 붙인다(worker 마다 다�
   python claude_code/power_test_unreal.py \
     --ownship-bundle-dir artifacts/models/team01/basic \
     --exe-path unreal_bt_client.exe --base-port 9000 --num-workers 4 --games 200
+
+예시 (팀원 model2_gylee 에이전트 vs unreal exe(컷오프 모델), 100판):
+  python claude_code/power_test_unreal.py --ownship-gylee --games 100
+    (다른 snapshot 은 --ownship-gylee-snapshot <경로>, stochastic 이면 --ownship-gylee-explore)
 """
 from __future__ import annotations
 
@@ -30,6 +34,14 @@ ROOT = Path(__file__).resolve().parents[1]
 for _p in (ROOT, ROOT / "src"):
     if str(_p) not in sys.path:
         sys.path.insert(0, str(_p))
+
+# 콘솔 인코딩(cp949 등)에 없는 문자(em-dash, 화살표 등)를 print 해도 UnicodeEncodeError 로
+# 죽지 않게 한다(train_redq.py·power_test.py 와 동일 관례).
+try:
+    sys.stdout.reconfigure(errors="backslashreplace")
+    sys.stderr.reconfigure(errors="backslashreplace")
+except Exception:
+    pass
 
 # power_test 의 순수 통계/판정/리포트 함수를 재사용한다. 단, power_test 는 import 시점에
 # _apply_bt_rule_env() 를 돌려 (기본값 기준) BT rule 환경변수를 세팅하는 side effect 가 있다.
@@ -50,6 +62,11 @@ import numpy as np  # noqa: E402
 
 from claude_code.env_utils import STANDARD_ENV_CONFIG  # noqa: E402
 from claude_code.parallel import physical_cpu_count  # noqa: E402
+
+# 팀원(gyLee) 패키지 기본 opponent snapshot = 문서 계보의 iter_1415(동봉 SHA 일치·검증됨).
+# 다른 snapshot(예: iter_2350)을 --ownship-gylee-snapshot 으로 지정하면 SHA 가 달라 checksum 이
+# 안 맞으므로 provider 생성 시 verify_checksum=False 로 로드한다(power_test.py 와 동일).
+_DEF_GYLEE_SNAPSHOT = str(ROOT / "model2_gylee" / "model" / "iter_1415.pt")
 
 
 def _make_worker_cls():
@@ -74,35 +91,65 @@ def _make_worker_cls():
                                 observation_module=spec["obs_module"],
                                 runner_index=f"ptx{spec['wid']}")
 
-            # ownship: MLP 단일 정책 또는 neural-MPC(obs-WM lookahead). 둘 다
-            # action_repeat=step_ratio 로 감싸 RL-step(0.1s)마다 1회 호출(현재 state 재계획).
-            from claude_code.evaluate import _ActionRepeatProvider
-            mpc = spec.get("mpc")
-            if mpc:
-                from claude_code.mpc_action_provider import MPCActionProvider
-                inner = MPCActionProvider(
-                    mpc["wm"], mpc["ac"], device=mpc["device"],
-                    K=mpc["K"], M=mpc["M"], H=mpc["H"], decide_every=mpc["decide_every"],
-                    use_fast=bool(mpc["use_fast"]))
+            # ownship: 팀원 gylee 에이전트 / MLP 단일 정책 / neural-MPC(obs-WM lookahead). 모두 10Hz.
+            gylee = spec.get("gylee")
+            if gylee:
+                # gylee provider 는 자체 47D 관측·RMS·reconstructor 와 자체 action_repeat 를
+                # 가지므로(_ActionRepeatProvider 불필요) ownship provider 로 직접 주입한다.
+                # context.ownship_state=본 기체(ownship), target_state=적(exe)로 들어와
+                # gylee 가 본 기체를 자기 관점으로 조종한다.
+                from model2_gylee import make_opponent_provider
+                self.own_provider = make_opponent_provider(
+                    snapshot_path=gylee["snapshot"], step_ratio=self.step_ratio,
+                    device="cpu", explore=bool(gylee["explore"]), verify_checksum=False)
+                self.env._ownship_action_provider = self.own_provider
+            elif spec.get("altguard"):
+                # 고도 안전망 복합 에이전트: 평상시 basic 번들(10Hz) / 저고도 team-share
+                # MPC(60Hz). 매 substep 호출을 받아 내부에서 주기를 맞추므로 직접 주입.
+                from claude_code.altguard_provider import AltGuardMPCProvider
+                ag = spec["altguard"]
+                self.own_provider = AltGuardMPCProvider(
+                    spec["ownship_bundle_dir"], mpc_root=ag["mpc_root"],
+                    mpc_config_path=(ag["config"] or None), step_ratio=self.step_ratio,
+                    device="cpu", stochastic=bool(spec["stochastic"]),
+                    guard_altitude_ft=ag["alt_ft"])
+                self.env._ownship_action_provider = self.own_provider
             else:
-                from claude_code.action_provider import MLPActionProvider
-                inner = MLPActionProvider(bundle_dir=spec["ownship_bundle_dir"],
-                                          stochastic=bool(spec["stochastic"]))
-            self.own_provider = _ActionRepeatProvider(inner, self.step_ratio)
-            self.env._ownship_action_provider = self.own_provider
+                # MLP/MPC 는 action_repeat=step_ratio 로 감싸 RL-step(0.1s)마다 1회 호출.
+                from claude_code.evaluate import _ActionRepeatProvider
+                mpc = spec.get("mpc")
+                if mpc:
+                    from claude_code.mpc_action_provider import MPCActionProvider
+                    inner = MPCActionProvider(
+                        mpc["wm"], mpc["ac"], device=mpc["device"],
+                        K=mpc["K"], M=mpc["M"], H=mpc["H"], decide_every=mpc["decide_every"],
+                        use_fast=bool(mpc["use_fast"]))
+                else:
+                    from claude_code.action_provider import MLPActionProvider
+                    inner = MLPActionProvider(bundle_dir=spec["ownship_bundle_dir"],
+                                              stochastic=bool(spec["stochastic"]))
+                self.own_provider = _ActionRepeatProvider(inner, self.step_ratio)
+                self.env._ownship_action_provider = self.own_provider
 
-            # target: unreal_bt_client.exe 브리지(worker 마다 다른 port 로 exe 실행)
-            from claude_code.unreal_exe_provider import UnrealExeProvider
-            self.tgt_provider = UnrealExeProvider(
-                exe_path=spec["exe_path"],
-                port=int(spec["base_port"]) + int(spec["wid"]),
-                own_plane_id=1, enemy_plane_id=0,
-                ownship_force_side=int(spec["ownship_force_side"]),
-                target_force_side=int(spec["target_force_side"]),
-                cwd=spec["root"],
-                step_timeout_sec=float(spec["step_timeout_sec"]),
-                quiet=True,
-            )
+            # target: exe 브리지. --cutoff-provider 면 팀원 정본 CutoffUDPActionProvider
+            # (action_repeat=6=10Hz, organizer 프로토콜)를, 아니면 기존 UnrealExeProvider 사용.
+            if spec.get("cutoff_provider"):
+                from cutoff_udp_provider import CutoffUDPActionProvider
+                self.tgt_provider = CutoffUDPActionProvider(
+                    spec["exe_path"], spec["cutoff_log_dir"], spec["wid"],
+                    action_repeat=int(spec["cutoff_action_repeat"]))
+            else:
+                from claude_code.unreal_exe_provider import UnrealExeProvider
+                self.tgt_provider = UnrealExeProvider(
+                    exe_path=spec["exe_path"],
+                    port=int(spec["base_port"]) + int(spec["wid"]),
+                    own_plane_id=1, enemy_plane_id=0,
+                    ownship_force_side=int(spec["ownship_force_side"]),
+                    target_force_side=int(spec["target_force_side"]),
+                    cwd=spec["root"],
+                    step_timeout_sec=float(spec["step_timeout_sec"]),
+                    quiet=True,
+                )
             self.env._target_action_provider = self.tgt_provider
 
         def play(self, jobs):
@@ -155,12 +202,37 @@ def _make_worker_cls():
 def parse_args():
     p = argparse.ArgumentParser(
         description="RL 번들 vs unreal_bt_client.exe 파워 테스트(리플레이 없음)")
-    p.add_argument("--ownship-bundle-dir", required=True, help="RL(ownship) claude 번들 경로")
+    p.add_argument("--ownship-bundle-dir", default="",
+                   help="RL(ownship) claude 번들 경로 (--ownship-gylee 면 생략 가능)")
     p.add_argument("--deterministic", action="store_true",
                    help="RL action 을 정책 분포 샘플링 대신 argmax(deterministic)로 결정. "
                         "기본은 학습과 동일한 stochastic 샘플링")
+    # ── ownship 을 팀원 model2_gylee 에이전트로 (RL 번들 대신) ──
+    p.add_argument("--ownship-gylee", action="store_true",
+                   help="ownship 을 내 RL 번들 대신 팀원 model2_gylee 에이전트로 조종해 "
+                        "unreal exe(컷오프 모델)와 붙인다. --ownship-bundle-dir 불필요.")
+    p.add_argument("--ownship-gylee-snapshot", default=_DEF_GYLEE_SNAPSHOT,
+                   help=f"gylee ownship snapshot .pt (기본 {Path(_DEF_GYLEE_SNAPSHOT).name})")
+    p.add_argument("--ownship-gylee-explore", action="store_true",
+                   help="gylee ownship 을 stochastic(sample)으로. 기본은 deterministic(argmax).")
+    # ── ownship = 고도 안전망 복합 에이전트(basic 10Hz + 저고도 team-share MPC 60Hz) ──
+    p.add_argument("--ownship-altguard", action="store_true",
+                   help="ownship 을 altguard 복합 에이전트로: 평상시 --ownship-bundle-dir(basic) "
+                        "10Hz stochastic, 고도 임계값 이하에서 team-share MPC 60Hz 로 자동 전환.")
+    p.add_argument("--ownship-guard-altitude-ft", type=float, default=3000.0,
+                   help="altguard: 이 고도(ft) 이하에서 MPC 가 조종(기본 3000)")
+    p.add_argument("--altguard-mpc-root", default=str(ROOT / "Release_MPC_team_share"),
+                   help="altguard team-share MPC 폴더(기본 Release_MPC_team_share)")
+    p.add_argument("--altguard-mpc-config", default="",
+                   help="altguard MPC config yaml(생략 시 <mpc-root>/configs/mpc.yaml)")
     p.add_argument("--exe-path", default=str(ROOT / "unreal_bt_client.exe"),
-                   help="unreal_bt_client.exe 경로(기본: 프로젝트 루트)")
+                   help="cutoff/unreal_bt_client.exe 경로(기본: 프로젝트 루트)")
+    p.add_argument("--cutoff-provider", action="store_true",
+                   help="팀원 정본 CutoffUDPActionProvider(organizer 프로토콜, action-repeat=6=10Hz)"
+                        "로 exe 를 구동한다. 기본(꺼짐)은 UnrealExeProvider(60Hz). 컷오프 모델을 "
+                        "팀원 벤치마크와 동일 규약으로 붙일 때 사용.")
+    p.add_argument("--cutoff-action-repeat", type=int, default=6,
+                   help="--cutoff-provider 의 exe action-repeat(기본 6=10Hz, 학습·검증 주기).")
     p.add_argument("--base-port", type=int, default=9000,
                    help="worker0 이 쓸 UDP 포트. worker i 는 base_port+i 사용(기본 9000)")
     p.add_argument("--ownship-force-side", type=int, default=1,
@@ -226,10 +298,21 @@ def main():
     if not Path(args.exe_path).exists():
         raise FileNotFoundError(f"exe 를 찾을 수 없습니다: {args.exe_path}")
 
-    from claude_code.model import load_bundle
-
-    _, meta = load_bundle(args.ownship_bundle_dir, device="cpu")
-    obs_module = meta.get("observation_module", "") or ""
+    # ownship = gylee 에이전트인지 결정. gylee 면 번들 불필요(자체 관측·정책).
+    gylee_cfg = None
+    if args.ownship_gylee:
+        if not Path(args.ownship_gylee_snapshot).is_file():
+            raise FileNotFoundError(
+                f"--ownship-gylee snapshot 을 찾을 수 없습니다: {args.ownship_gylee_snapshot}")
+        gylee_cfg = {"snapshot": str(args.ownship_gylee_snapshot),
+                     "explore": bool(args.ownship_gylee_explore)}
+        obs_module = ""     # gylee 는 자체 47D 관측을 만들어 env obs_module 과 무관
+    else:
+        if not args.ownship_bundle_dir:
+            raise ValueError("--ownship-bundle-dir 이 필요합니다(또는 --ownship-gylee 사용).")
+        from claude_code.model import load_bundle
+        _, meta = load_bundle(args.ownship_bundle_dir, device="cpu")
+        obs_module = meta.get("observation_module", "") or ""
 
     # target 은 브리지 provider 가 조종하므로 env 자체 AI 를 만들지 않도록 fixed.
     overrides = {
@@ -241,9 +324,22 @@ def main():
     if args.min_altitude is not None:
         overrides["min_altitude"] = args.min_altitude
 
-    # neural-MPC ownship 설정(선택). ac_ckpt 는 번들에서 자동 생성 가능.
+    # 고도 안전망 복합 에이전트(선택). basic 번들 필요(위 else 에서 obs_module 확보).
+    altguard_cfg = None
+    if args.ownship_altguard:
+        if gylee_cfg:
+            raise ValueError("--ownship-altguard 와 --ownship-gylee 는 함께 쓸 수 없습니다.")
+        if args.ownship_mpc:
+            raise ValueError("--ownship-altguard 와 --ownship-mpc(neural) 는 함께 쓸 수 없습니다.")
+        if not Path(args.altguard_mpc_root).is_dir():
+            raise FileNotFoundError(f"altguard MPC 폴더 없음: {args.altguard_mpc_root}")
+        altguard_cfg = {"mpc_root": str(args.altguard_mpc_root),
+                        "config": str(args.altguard_mpc_config),
+                        "alt_ft": float(args.ownship_guard_altitude_ft)}
+
+    # neural-MPC ownship 설정(선택). ac_ckpt 는 번들에서 자동 생성 가능. (gylee/altguard 면 무시)
     mpc_cfg = None
-    if args.ownship_mpc:
+    if args.ownship_mpc and not gylee_cfg and not altguard_cfg:
         ac_path = args.mpc_ac
         if not ac_path:
             ac_path = str(ROOT / "claude_code/models/wm/_ac_from_bundle.pt")
@@ -271,12 +367,20 @@ def main():
     head_swaps = [0] * games if args.fixed_side else [(i // 2) % 2 for i in range(games)]
 
     rl_mode = "deterministic(argmax)" if args.deterministic else "stochastic"
-    if mpc_cfg:
+    if gylee_cfg:
+        own_desc = (f"gylee({Path(gylee_cfg['snapshot']).name}, "
+                    f"{'stochastic' if gylee_cfg['explore'] else 'deterministic'})")
+    elif altguard_cfg:
+        own_desc = (f"altguard(basic={args.ownship_bundle_dir} 10Hz / "
+                    f"team-share MPC<{altguard_cfg['alt_ft']:.0f}ft 60Hz)")
+    elif mpc_cfg:
         own_desc = (f"neural-MPC(H={mpc_cfg['H']} K={mpc_cfg['K']} M={mpc_cfg['M']} "
                     f"de={mpc_cfg['decide_every']} wm=obs, ac={args.ownship_bundle_dir})")
     else:
         own_desc = f"rl({args.ownship_bundle_dir})"
-    tgt_desc = f"unreal_bt_client.exe({Path(args.exe_path).name})"
+    tgt_desc = (f"cutoff-exe({Path(args.exe_path).name}, CutoffUDPProvider, "
+                f"action-repeat={args.cutoff_action_repeat})" if args.cutoff_provider
+                else f"unreal_bt_client.exe({Path(args.exe_path).name}, 60Hz)")
     print(f"[power_test_unreal] ownship = {own_desc}")
     print(f"[power_test_unreal] target  = {tgt_desc}")
     print(f"[power_test_unreal] games={games} workers={n_workers} master_seed={master_seed} "
@@ -305,6 +409,11 @@ def main():
         "step_timeout_sec": float(args.step_timeout_sec),
         "stochastic": (not args.deterministic),
         "mpc": mpc_cfg,
+        "altguard": altguard_cfg,
+        "gylee": gylee_cfg,
+        "cutoff_provider": bool(args.cutoff_provider),
+        "cutoff_action_repeat": int(args.cutoff_action_repeat),
+        "cutoff_log_dir": str(ROOT / "artifacts" / "cutoff_logs"),
     }
     WorkerCls = _make_worker_cls()
     if mpc_cfg and mpc_cfg["device"].startswith("cuda"):
@@ -369,7 +478,7 @@ def _report(args, results, own_desc, tgt_desc, master_seed, elapsed) -> None:
               f"   (n={dec})")
         print(f"  이항검정 p-value    = {p:.3g}  (H0: 두 모델 실력 동일)")
         if p < 0.05:
-            strong, weak = ("ownship(RL)", "target(BT exe)") if w > l else ("target(BT exe)", "ownship(RL)")
+            strong, weak = ("ownship", "target(exe)") if w > l else ("target(exe)", "ownship")
             print(f"  → **{strong} 이 {weak} 보다 유의하게 강하다** (α=0.05)")
         else:
             print("  → 유의한 차이 없음 (α=0.05). 판수를 늘리면 결론이 갈릴 수 있다.")

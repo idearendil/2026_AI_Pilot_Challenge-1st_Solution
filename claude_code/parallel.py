@@ -221,24 +221,43 @@ def _make_worker_cls():
                 self._mpc_provider = make_mpc_provider(mpc_root, mpc_config)
             return self._mpc_provider
 
+        def _get_cutoff_provider(self, exe_path, port, force_own, force_tgt, timeout):
+            """컷오프 exe 상대 provider(worker 당 1개, 재사용). exe 를 1회만 띄운다.
+
+            UnrealExeProvider(내가 쓰던 provider)로 unreal_bt_client.exe 를 포트 port 로 구동한다
+            (팀원 CutoffUDPProvider 아님). context.ownship_state=상대기(exe), target_state=학습기.
+            """
+            if getattr(self, "_cutoff_provider", None) is None:
+                from claude_code.unreal_exe_provider import UnrealExeProvider
+                self._cutoff_provider = UnrealExeProvider(
+                    exe_path=exe_path, port=int(port),
+                    own_plane_id=1, enemy_plane_id=0,
+                    ownship_force_side=int(force_own), target_force_side=int(force_tgt),
+                    cwd=str(ROOT), step_timeout_sec=float(timeout), quiet=True)
+            return self._cutoff_provider
+
         def pool_init(self, state_dict, mean, var, count, weights, pool_max, seed,
                       bt_dll="", bt_rule="", bt_index=0, n_bt=0,
                       mpc_root="", mpc_config="", n_mpc=0,
-                      exp_states=(), exp_means=(), exp_vars=(), exp_counts=(), n_exp=0):
+                      exp_states=(), exp_means=(), exp_vars=(), exp_counts=(), n_exp=0,
+                      cutoff_exe="", cutoff_port=0, cutoff_force_own=1,
+                      cutoff_force_tgt=2, cutoff_timeout=0.5, n_cut=0):
             """opponent pool 초기화. target provider 를 pool 로 교체.
 
             이 워커의 **로컬** pool = [배정된 BT 1개(있으면)] + [MPC(있으면, 모든 워커 공통)]
-            + [exploiter n_exp개(모든 워커 공통, 고정)] + [snapshot...]. bt_index = 이 BT 의
-            **글로벌** 슬롯(0..n_bt-1), n_bt = 전체 BT 수, n_mpc = MPC 수(0/1, 글로벌 슬롯 n_bt),
-            n_exp = exploiter 수(글로벌 슬롯 n_bt+n_mpc..). 로컬 슬롯을 글로벌 슬롯으로 매핑해
-            (collect 참고) driver 가 상대별 EMA 를 분리 집계한다. BT·MPC·exploiter 슬롯은
-            고정(절대 evict 안 됨).
+            + [CUTOFF exe(있으면, 워커마다 1개)] + [exploiter n_exp개(모든 워커 공통, 고정)] +
+            [snapshot...]. bt_index = 이 BT 의 **글로벌** 슬롯(0..n_bt-1), n_bt = 전체 BT 수,
+            n_mpc = MPC 수(0/1, 글로벌 슬롯 n_bt), n_cut = 컷오프 수(0/1, 글로벌 슬롯 n_bt+n_mpc),
+            n_exp = exploiter 수(글로벌 슬롯 n_bt+n_mpc+n_cut..). 로컬 슬롯을 글로벌 슬롯으로
+            매핑해(collect 참고) driver 가 상대별 EMA 를 분리 집계한다. BT·MPC·CUTOFF·exploiter
+            슬롯은 고정(절대 evict 안 됨).
             """
             from claude_code.self_play import PoolSelfPlayProvider
             self._pool_max = max(1, int(pool_max))
             self._bt_index = int(bt_index)
             self._n_bt = int(n_bt)
             self._n_mpc = int(n_mpc)
+            self._n_cut = int(n_cut)
             self._n_exp = int(n_exp)
             provs = []
             self._bt_slots = 0
@@ -249,6 +268,11 @@ def _make_worker_cls():
             if mpc_root and n_mpc:
                 provs.append(self._get_mpc_provider(mpc_root, mpc_config))
                 self._mpc_slots = 1
+            self._cut_slots = 0
+            if cutoff_exe and n_cut:
+                provs.append(self._get_cutoff_provider(
+                    cutoff_exe, cutoff_port, cutoff_force_own, cutoff_force_tgt, cutoff_timeout))
+                self._cut_slots = 1
             self._exp_slots = 0
             for st, mn, vr, ct in zip(exp_states, exp_means, exp_vars, exp_counts):
                 provs.append(self._build_opp_provider(st, mn, vr, ct))
@@ -267,7 +291,7 @@ def _make_worker_cls():
             providers = list(self._pool_provider.providers)
             providers.append(prov)
             fixed_slots = (int(getattr(self, "_bt_slots", 0)) + int(getattr(self, "_mpc_slots", 0))
-                           + int(getattr(self, "_exp_slots", 0)))
+                           + int(getattr(self, "_cut_slots", 0)) + int(getattr(self, "_exp_slots", 0)))
             if len(providers) > self._pool_max:
                 providers.pop(fixed_slots)
             self._pool_provider.set_pool(providers)
@@ -289,7 +313,7 @@ def _make_worker_cls():
             prov = self._build_opp_provider(state_dict, mean, var, count)
             providers = list(self._pool_provider.providers)
             insert_at = int(getattr(self, "_bt_slots", 0)) + int(getattr(self, "_mpc_slots", 0)) \
-                + int(getattr(self, "_exp_slots", 0))
+                + int(getattr(self, "_cut_slots", 0)) + int(getattr(self, "_exp_slots", 0))
             providers.insert(insert_at, prov)   # 기존 exploiter 뒤·snapshot 앞
             self._pool_provider.set_pool(providers)
             self._exp_slots = int(getattr(self, "_exp_slots", 0)) + 1
@@ -314,19 +338,22 @@ def _make_worker_cls():
         def pool_set_all(self, state_dicts, means, vars_, counts, weights, pool_max, seed,
                          bt_dll="", bt_rule="", bt_index=0, n_bt=0,
                          mpc_root="", mpc_config="", n_mpc=0,
-                         exp_states=(), exp_means=(), exp_vars=(), exp_counts=(), n_exp=0):
+                         exp_states=(), exp_means=(), exp_vars=(), exp_counts=(), n_exp=0,
+                         cutoff_exe="", cutoff_port=0, cutoff_force_own=1,
+                         cutoff_force_tgt=2, cutoff_timeout=0.5, n_cut=0):
             """checkpoint 의 opponent pool 을 이 워커의 로컬 pool 로 복원.
 
             state_dicts 는 **snapshot 후보만** 오래된→최신. bt_dll 이 있으면 배정된 BT 1개를,
-            mpc_root/n_mpc 가 있으면 MPC 1개를, exp_states(n_exp개)가 있으면 exploiter 를 고정
-            슬롯으로 넣는다(순서: BT → MPC → exploiter → snapshot). bt_index/n_bt/n_mpc/n_exp 는
-            글로벌 매핑용.
+            mpc_root/n_mpc 가 있으면 MPC 1개를, cutoff_exe/n_cut 가 있으면 컷오프 exe 1개를,
+            exp_states(n_exp개)가 있으면 exploiter 를 고정 슬롯으로 넣는다(순서: BT → MPC →
+            CUTOFF → exploiter → snapshot). bt_index/n_bt/n_mpc/n_cut/n_exp 는 글로벌 매핑용.
             """
             from claude_code.self_play import PoolSelfPlayProvider
             self._pool_max = max(1, int(pool_max))
             self._bt_index = int(bt_index)
             self._n_bt = int(n_bt)
             self._n_mpc = int(n_mpc)
+            self._n_cut = int(n_cut)
             self._n_exp = int(n_exp)
             provs = []
             self._bt_slots = 0
@@ -337,6 +364,11 @@ def _make_worker_cls():
             if mpc_root and n_mpc:
                 provs.append(self._get_mpc_provider(mpc_root, mpc_config))
                 self._mpc_slots = 1
+            self._cut_slots = 0
+            if cutoff_exe and n_cut:
+                provs.append(self._get_cutoff_provider(
+                    cutoff_exe, cutoff_port, cutoff_force_own, cutoff_force_tgt, cutoff_timeout))
+                self._cut_slots = 1
             self._exp_slots = 0
             for st, mn, vr, ct in zip(exp_states, exp_means, exp_vars, exp_counts):
                 provs.append(self._build_opp_provider(st, mn, vr, ct))
@@ -411,18 +443,23 @@ def _make_worker_cls():
                         #   snap : n_bt + n_mpc + n_exp + (로컬 snapshot 순번)
                         bt_slots = int(getattr(self, "_bt_slots", 0))
                         mpc_slots = int(getattr(self, "_mpc_slots", 0))
+                        cut_slots = int(getattr(self, "_cut_slots", 0))
                         exp_slots = int(getattr(self, "_exp_slots", 0))
                         n_bt = int(getattr(self, "_n_bt", 0))
                         n_mpc = int(getattr(self, "_n_mpc", 0))
+                        n_cut = int(getattr(self, "_n_cut", 0))
                         n_exp = int(getattr(self, "_n_exp", 0))
                         if bt_slots and local < bt_slots:
                             gidx = int(getattr(self, "_bt_index", 0))
                         elif mpc_slots and local < bt_slots + mpc_slots:
                             gidx = n_bt                       # MPC 글로벌 슬롯
-                        elif exp_slots and local < bt_slots + mpc_slots + exp_slots:
-                            gidx = n_bt + n_mpc + (local - bt_slots - mpc_slots)   # exploiter
+                        elif cut_slots and local < bt_slots + mpc_slots + cut_slots:
+                            gidx = n_bt + n_mpc               # CUTOFF 글로벌 슬롯
+                        elif exp_slots and local < bt_slots + mpc_slots + cut_slots + exp_slots:
+                            gidx = n_bt + n_mpc + n_cut + (local - bt_slots - mpc_slots - cut_slots)
                         else:
-                            gidx = n_bt + n_mpc + n_exp + (local - bt_slots - mpc_slots - exp_slots)
+                            gidx = (n_bt + n_mpc + n_cut + n_exp
+                                    + (local - bt_slots - mpc_slots - cut_slots - exp_slots))
                         ep_opp_indices.append(gidx)
                     self._ep_return = 0.0
                     self._ep_len = 0
@@ -484,6 +521,18 @@ def _make_worker_cls():
                 self._ep_len = 0
             return results
 
+        def close_providers(self):
+            """워커의 opponent provider 들을 닫는다(컷오프 exe 프로세스 종료 등). 학습 종료 시 호출."""
+            try:
+                prov = getattr(self, "_pool_provider", None)
+                if prov is not None:
+                    prov.close()          # PoolSelfPlayProvider → 모든 sub-provider.close()
+                cut = getattr(self, "_cutoff_provider", None)
+                if cut is not None:
+                    cut.close()           # exe 프로세스 명시적 종료(중복 close 는 무해)
+            except Exception:
+                pass
+
     return RolloutWorker
 
 
@@ -494,7 +543,7 @@ class ParallelPPOTrainer:
 
     def __init__(self, env_kwargs, config: PPOConfig, num_workers: int,
                  self_play: bool, obs_dim: int, act_dim: int,
-                 bt_opponents=None, mpc_opponent=None):
+                 bt_opponents=None, mpc_opponent=None, cutoff_opponent=None):
         import ray
         self.cfg = config
         self.num_workers = max(1, int(num_workers))
@@ -505,6 +554,10 @@ class ParallelPPOTrainer:
         # 제약이 없어 모든 워커에 동일하게 넣는다(글로벌 단일 슬롯 n_bt). n_mpc = 0/1.
         self._mpc_root, self._mpc_config = (mpc_opponent or ("", ""))
         self._n_mpc = 1 if self._mpc_root else 0
+        # 컷오프 exe 고정 상대(dict 또는 None). MPC 와 같은 never-evict 글로벌 슬롯(n_bt+n_mpc)이나,
+        # 워커마다 exe 1개를 상주 실행한다(포트 base_port+worker_id). UnrealExeProvider 사용.
+        self._cutoff = dict(cutoff_opponent) if cutoff_opponent else None
+        self._n_cut = 1 if self._cutoff else 0
         # opponent pool 에 넣을 BT 목록 [(dll, rule), ...]. 워커를 여기에 round-robin 배정한다.
         # 한 프로세스 = BT rule 1개 제약 때문에, 워커별로 다른 BT 를 고정 배정하고 그 rule 을
         # 워커 프로세스 시작 시점(runtime_env)에 AIP_RULE_XML 로 주입한다(claude_code.bt_rule).
@@ -667,6 +720,16 @@ class ParallelPPOTrainer:
         counts = [(e["rms"]["count"] if e.get("rms") else 0.0) for e in entries]
         return states, means, vars_, counts
 
+    def _cut_kw(self, i: int) -> dict:
+        """워커 i 의 컷오프 exe pool_init/pool_set_all 키워드 인자(포트=base+i). 없으면 n_cut=0."""
+        if not self._cutoff:
+            return dict(cutoff_exe="", cutoff_port=0, cutoff_force_own=1,
+                        cutoff_force_tgt=2, cutoff_timeout=0.5, n_cut=0)
+        c = self._cutoff
+        return dict(cutoff_exe=str(c["exe_path"]), cutoff_port=int(c["base_port"]) + int(i),
+                    cutoff_force_own=int(c["force_own"]), cutoff_force_tgt=int(c["force_tgt"]),
+                    cutoff_timeout=float(c["step_timeout_sec"]), n_cut=1)
+
     def install_opponent_pool(self, pool_max, per_worker_weights, exploiter_entries=None) -> None:
         """모든 worker 의 opponent pool 초기화. broadcast.
 
@@ -686,7 +749,7 @@ class ParallelPPOTrainer:
                                self._pool_max, self.cfg.seed + 101 + i,
                                dll, rule, bti, self._n_bt,
                                self._mpc_root, self._mpc_config, self._n_mpc,
-                               eref, em, ev, ec, n_exp)
+                               eref, em, ev, ec, n_exp, **self._cut_kw(i))
             for i, (w, (dll, rule, bti)) in enumerate(zip(self.workers, self._bt_assign))
         ])
 
@@ -744,7 +807,7 @@ class ParallelPPOTrainer:
                                   self._pool_max, self.cfg.seed + 101 + i,
                                   dll, rule, bti, self._n_bt,
                                   self._mpc_root, self._mpc_config, self._n_mpc,
-                                  eref, em, ev, ec, n_exp)
+                                  eref, em, ev, ec, n_exp, **self._cut_kw(i))
             for i, (w, (dll, rule, bti)) in enumerate(zip(self.workers, self._bt_assign))
         ])
 
@@ -994,6 +1057,12 @@ class ParallelPPOTrainer:
     def close(self):
         try:
             import ray
+            # 워커의 opponent provider(특히 컷오프 exe 프로세스)를 먼저 정리한 뒤 Ray 종료.
+            if self._n_cut and getattr(self, "workers", None):
+                try:
+                    ray.get([w.close_providers.remote() for w in self.workers])
+                except Exception:
+                    pass
             ray.shutdown()
         except Exception:
             pass
