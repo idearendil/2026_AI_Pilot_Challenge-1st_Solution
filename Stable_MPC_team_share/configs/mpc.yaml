@@ -1,0 +1,46 @@
+simulation_hz: 60
+policy_hz: 10
+horizon_seconds: 2.0
+knot_seconds: 0.5
+compute_budget_ms: 80.0
+max_candidates: 48
+native_dll: runtime/predictor/Release/MPCJSBSim.dll
+asset_root: .
+
+cem:
+  candidates: 48
+  iterations: 2
+  elite_fraction: 0.1666666667
+  initial_std: [0.65, 0.65, 0.40, 0.25]
+  minimum_std: [0.10, 0.10, 0.08, 0.04]
+  maximum_std: [0.80, 0.80, 0.55, 0.35]
+  mean_smoothing: 0.25
+  std_smoothing: 0.35
+  seed: 20260802
+  # Fixed profile keeps candidate generation deterministic across machines/runs.
+  adaptive_candidate_counts: [48]
+
+prediction:
+  acceleration_time_constant_s: 1.25
+  turn_rate_time_constant_s: 1.5
+  acceleration_smoothing: 0.35
+  turn_rate_smoothing: 0.35
+  max_acceleration_mps2: 80.0
+  max_turn_rate_radps: 1.5
+  min_speed_mps: 80.0
+  max_speed_mps: 650.0
+
+weights:
+  damage_dealt: 140.0
+  damage_taken: 180.0
+  attack_geometry: 3.5
+  control_zone: 9.0
+  closure: 1.0
+  threat_geometry: 12.0
+  nose_advantage: 9.0
+  far_range: 4.0
+  overshoot: 6.0
+  ground: 120.0
+  envelope: 6.0
+  terminal_geometry: 28.0
+  control_slew: 0.03

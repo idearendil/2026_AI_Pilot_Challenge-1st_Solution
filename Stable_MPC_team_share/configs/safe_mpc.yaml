@@ -1,0 +1,8 @@
+safety_clearance_m: 380.0
+safety_pullout_accel_mps2: 28.0
+safety_roll_rate_radps: 1.6
+safety_level_roll_deg: 45.0
+safety_check_mode: lazy
+safety_policy: predictive
+robust_enabled: false
+candidate_selection: all_samples

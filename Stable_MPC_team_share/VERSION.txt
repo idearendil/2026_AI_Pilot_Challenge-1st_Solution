@@ -1,0 +1,3 @@
+Stable_MPC team share 1.0
+Frozen controller: 2026-08-05
+Source baseline: TopGun commit 228cc6aa0db82af56926ab9c3e630c2b8ad7809f
