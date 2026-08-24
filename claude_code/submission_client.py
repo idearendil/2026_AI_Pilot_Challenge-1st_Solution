@@ -23,11 +23,12 @@ config.json 필드
   server_ip        : 대회 서버 IP (예: "221.151.77.208")
   server_port      : 서버 UDP 포트 (기본 9999)
   team_name        : 참가 팀 이름
-  mode             : "altguard" | "basic"
-  bundle_dir       : basic 번들 경로(상대=config 기준). 두 모드 공통 사용.
-  mpc_root         : altguard 전용. Release_MPC_team_share 폴더 경로(상대).
-  guard_altitude_ft: altguard 저고도 전환 임계(기본 3000).
-  action_repeat    : 정책 재호출 주기(생략 시 altguard=1/60Hz, basic=6/10Hz).
+  mode             : "altguard" | "altblend" | "basic"
+  bundle_dir       : basic 번들 경로(상대=config 기준). 세 모드 공통 사용.
+  mpc_root         : altguard/altblend 전용. Release_MPC_team_share 폴더 경로(상대).
+  guard_altitude_ft: altguard 저고도 하드 전환 임계(기본 3000).
+  blend_hi_ft/blend_lo_ft: altblend 선형 블렌딩 상·하한(기본 4000/2000).
+  action_repeat    : 정책 재호출 주기(생략 시 altguard/altblend=1/60Hz, basic=6/10Hz).
   heartbeat_sec / recv_timeout_sec / command_delay_sec : 연결 튜닝(선택).
 """
 from __future__ import annotations
@@ -103,6 +104,36 @@ def _build_altguard(cfg: dict, base: Path):
     return provider, "tactical16", _dummy_obs, action_repeat
 
 
+def _build_altblend(cfg: dict, base: Path):
+    from claude_code.altblend_provider import make_altblend_provider
+
+    bundle_dir = _resolve(base, cfg["bundle_dir"])
+    mpc_root = _resolve(base, cfg.get("mpc_root", "Release_MPC_team_share"))
+    if not bundle_dir.exists():
+        raise FileNotFoundError(f"basic 번들을 찾을 수 없습니다: {bundle_dir}")
+    if not mpc_root.exists():
+        raise FileNotFoundError(f"MPC 자원 폴더를 찾을 수 없습니다: {mpc_root}")
+
+    hi = float(cfg.get("blend_hi_ft", 4000.0))
+    lo = float(cfg.get("blend_lo_ft", 2000.0))
+    provider = make_altblend_provider(
+        bundle_dir=str(bundle_dir),
+        mpc_root=str(mpc_root),
+        mpc_config_path=str(mpc_root / "configs" / "mpc.yaml"),
+        step_ratio=int(cfg.get("step_ratio", 6)),
+        device="cpu",
+        stochastic=True,
+        blend_hi_ft=hi,
+        blend_lo_ft=lo,
+    )
+    # altguard 와 마찬가지로 매 substep(60Hz) 호출을 받아 내부에서 actor(10Hz)/MPC(60Hz)를
+    # 섞으므로 정책 쪽 action_repeat 는 1 이어야 한다.
+    action_repeat = int(cfg.get("action_repeat", 1))
+    print(f"[{cfg['team_name']}] 모드: altblend "
+          f"({hi:.0f}~{lo:.0f}ft 에서 actor·MPC action 고도 선형 가중평균)")
+    return provider, "tactical16", _dummy_obs, action_repeat
+
+
 def _build_basic(cfg: dict, base: Path):
     from claude_code.action_provider import MLPActionProvider
     from dogfight.ai.student_hooks import load_observation_hook
@@ -167,10 +198,12 @@ def main() -> None:
 
     if mode == "altguard":
         provider, obs_mode, obs_fn, action_repeat = _build_altguard(cfg, base)
+    elif mode == "altblend":
+        provider, obs_mode, obs_fn, action_repeat = _build_altblend(cfg, base)
     elif mode == "basic":
         provider, obs_mode, obs_fn, action_repeat = _build_basic(cfg, base)
     else:
-        raise ValueError(f"알 수 없는 mode: {mode!r} (altguard 또는 basic)")
+        raise ValueError(f"알 수 없는 mode: {mode!r} (altguard/altblend/basic)")
 
     command_policy = ProviderCommandPolicy(
         action_provider=provider,

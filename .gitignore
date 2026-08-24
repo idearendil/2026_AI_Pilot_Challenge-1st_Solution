@@ -1,5 +1,6 @@
 claude_code/models
 wandb
 BattleServer_V1.1_VeryLow
+BattleServer_V1.2_VeryLow
 dist
 artifacts/cutoff_logs

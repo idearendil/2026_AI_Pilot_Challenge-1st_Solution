@@ -38,7 +38,8 @@ HIDDEN_IMPORTS = [
     "mpc", "mpc.config", "mpc.native", "mpc.planner", "mpc.provider",
     "mpc.target_prediction", "mpc.transforms",
     "claude_code.submission_client",
-    "claude_code.altguard_provider", "claude_code.action_provider",
+    "claude_code.altguard_provider", "claude_code.altblend_provider",
+    "claude_code.action_provider",
     "claude_code.model", "claude_code.my_observation",
     "dogfight.unreal", "dogfight.unreal.client", "dogfight.unreal.protocol",
     "dogfight.ai.action_provider", "dogfight.ai.student_hooks",
@@ -80,6 +81,11 @@ def _make_config(args) -> dict:
     if args.mode == "altguard":
         cfg["mpc_root"] = "Release_MPC_team_share"
         cfg["action_repeat"] = 1
+    elif args.mode == "altblend":
+        cfg["mpc_root"] = "Release_MPC_team_share"
+        cfg["action_repeat"] = 1
+        cfg["blend_hi_ft"] = 4000.0
+        cfg["blend_lo_ft"] = 2000.0
     else:
         cfg["action_repeat"] = 6
     return cfg
@@ -127,8 +133,8 @@ def _assemble(app_dir: Path, cfg: dict) -> None:
         shutil.rmtree(dst_model)
     shutil.copytree(BASIC_BUNDLE, dst_model)
     print(f"  + model/ ({BASIC_BUNDLE.name})")
-    # altguard MPC 자원(폴더 통째로: predictor DLL + f16 에셋 + configs)
-    if cfg["mode"] == "altguard":
+    # altguard/altblend MPC 자원(폴더 통째로: predictor DLL + f16 에셋 + configs)
+    if cfg["mode"] in ("altguard", "altblend"):
         dst_mpc = app_dir / "Release_MPC_team_share"
         if dst_mpc.exists():
             shutil.rmtree(dst_mpc)
@@ -149,7 +155,7 @@ def _zip(app_dir: Path, out_zip: Path) -> None:
 
 def main() -> None:
     ap = argparse.ArgumentParser(description="제출 exe/zip 빌더")
-    ap.add_argument("--mode", choices=["altguard", "basic"], default="altguard")
+    ap.add_argument("--mode", choices=["altguard", "altblend", "basic"], default="altguard")
     ap.add_argument("--team-name", default="team01")
     ap.add_argument("--server-ip", default="221.151.77.208")
     ap.add_argument("--server-port", type=int, default=9999)
@@ -158,7 +164,7 @@ def main() -> None:
 
     if not BASIC_BUNDLE.exists():
         raise FileNotFoundError(f"basic 번들 없음: {BASIC_BUNDLE}")
-    if args.mode == "altguard" and not MPC_ROOT.exists():
+    if args.mode in ("altguard", "altblend") and not MPC_ROOT.exists():
         raise FileNotFoundError(f"MPC 자원 폴더 없음: {MPC_ROOT}")
 
     _ensure_pyinstaller()
