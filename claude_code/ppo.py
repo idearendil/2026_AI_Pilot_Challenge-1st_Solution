@@ -15,6 +15,7 @@ import torch
 import torch.nn as nn
 
 from claude_code.model import make_actor_critic, discrete_indices_to_continuous
+from claude_code.mirror import build_obs_sign_mask, FLIP_ACTION_CHANNELS
 from claude_code.normalizers import RunningMeanStd
 
 OBS_CLIP = 10.0
@@ -126,6 +127,11 @@ class PPOConfig:
     # 분리돼 있어 target_kl 조기 종료의 영향을 받지 않고 항상 이 횟수만큼 돈다.
     critic_epochs: Optional[int] = None
     normalize_obs: bool = True          # 관측 running mean/std 정규화
+    # 좌우 대칭(mirror) 증강: claude164r 관측/이산 action 을 수직평면 기준 좌우반전한
+    # 대칭 샘플을 만들어, epoch 마다 각 샘플을 (원본|대칭) 중 랜덤으로 한 번만 사용한다.
+    # epoch 당 샘플 수는 그대로라 iter 당 epoch 수/연산량은 유지되고, 데이터는 좌우
+    # 대칭으로 커버된다. claude164r(=my_observation) 관측에서만 지원. 기본 ON.
+    mirror_augment: bool = True
     reconstruct_state: bool = False     # claude_code.my_observation HP 재구성 갱신
     seed: int = 0
     device: str = "cpu"
@@ -340,6 +346,65 @@ class PPOTrainer:
         return compute_gae(rewards, values, dones, last_value, last_done,
                            self.cfg.gamma, self.cfg.gae_lambda)
 
+    # ── 좌우 대칭(mirror) 증강 ────────────────────────────────────────────────
+    def _mirror_mask(self, obs_dim: int, device) -> torch.Tensor:
+        """좌우 대칭 부호 마스크(±1, obs_dim)를 lazy 생성·캐시. claude164r 전용."""
+        cached = getattr(self, "_mirror_mask_t", None)
+        if cached is not None and cached.shape[0] == obs_dim and cached.device == device:
+            return cached
+        mask = build_obs_sign_mask()
+        if mask.shape[0] != int(obs_dim):
+            raise ValueError(
+                f"mirror_augment 은 claude164r 관측(len {mask.shape[0]})에서만 지원 — "
+                f"현재 obs_dim={obs_dim}. --observation-module claude_code.my_observation 필요.")
+        self._mirror_mask_t = torch.as_tensor(mask, dtype=torch.float32, device=device)
+        return self._mirror_mask_t
+
+    def _build_mirror(self, batch):
+        """batch 의 대칭짝 (obs, action, old_logp) 텐서를 만든다. off 면 (None,None,None).
+
+        advantage·return 은 좌우반전에 불변이라 공유한다. 대칭 obs 는 정규화 관측에
+        대해 정확히: mirror_norm = M⊙norm + (M-1)·mean/std (= raw 를 M 으로 반전 후 같은
+        통계로 재정규화). 대칭 action 은 roll/rudder 채널 bin 순서 반전. 대칭 old_logp 는
+        수집시점(=아직 미갱신) 정책으로 정확히 재평가한다.
+        """
+        cfg = self.cfg
+        if not bool(getattr(cfg, "mirror_augment", False)):
+            return None, None, None
+        device = batch["obs"].device
+        Mt = PPOTrainer._mirror_mask(self, batch["obs"].shape[1], device)
+        obs0 = batch["obs"]
+        if self.obs_rms is not None:
+            mean = torch.as_tensor(self.obs_rms.mean, dtype=torch.float32, device=device)
+            std = torch.sqrt(
+                torch.as_tensor(self.obs_rms.var, dtype=torch.float32, device=device) + 1e-8)
+            mir_obs = torch.clamp(Mt * obs0 + (Mt - 1.0) * mean / std, -OBS_CLIP, OBS_CLIP)
+        else:
+            mir_obs = Mt * obs0
+        mir_act = batch["actions"].clone()
+        hi = float(self.model.num_bins) - 1.0
+        for ch in FLIP_ACTION_CHANNELS:
+            mir_act[:, ch] = hi - batch["actions"][:, ch]
+        with torch.no_grad():
+            mir_logp, _ = self.model.evaluate_actions(mir_obs, mir_act)
+        return mir_obs, mir_act, mir_logp
+
+    @staticmethod
+    def _select_mb(mb, obs, act, logp, mir_obs, mir_act, mir_logp):
+        """minibatch mb 에 대해 (원본|대칭)을 샘플별 랜덤 선택. 증강 off 면 원본 슬라이스.
+
+        랜덤 마스크는 매 호출(epoch·minibatch)마다 새로 뽑아, 같은 샘플도 epoch 마다
+        원본/대칭이 랜덤하게 갈린다. 어느 쪽이든 샘플은 epoch 당 정확히 한 번만 쓰인다.
+        """
+        o, a, lp = obs[mb], act[mb], logp[mb]
+        if mir_obs is None:
+            return o, a, lp
+        use = torch.rand(o.shape[0], device=o.device) < 0.5
+        u2 = use.unsqueeze(1)
+        return (torch.where(u2, mir_obs[mb], o),
+                torch.where(u2, mir_act[mb], a),
+                torch.where(use, mir_logp[mb], lp))
+
     # ── 정책 업데이트 ────────────────────────────────────────────────────────
     def update(self, batch):
         cfg = self.cfg
@@ -350,6 +415,10 @@ class PPOTrainer:
         returns = batch["returns"]
         old_logp = batch["logp"]
         old_values = batch["values"]
+
+        # 좌우 대칭 증강짝(off 면 None). 아래 두 루프의 minibatch 에서 샘플별 랜덤 선택된다.
+        # (ParallelPPOTrainer 는 PPOTrainer 를 상속하지 않고 메서드를 빌려 쓰므로 클래스 명시 호출.)
+        mir_obs, mir_act, mir_logp = PPOTrainer._build_mirror(self, batch)
 
         clip = cfg.clip_coef
         last_pl = last_vl = last_ent = last_kl = 0.0
@@ -363,9 +432,11 @@ class PPOTrainer:
             approx_kls = []
             for start in range(0, T, cfg.minibatch_size):
                 mb = idx[start:start + cfg.minibatch_size]
-                new_logp, entropy = self.model.evaluate_actions(
-                    batch["obs"][mb], batch["actions"][mb])
-                log_ratio = new_logp - old_logp[mb]
+                mb_obs, mb_act, mb_old_logp = PPOTrainer._select_mb(
+                    mb, batch["obs"], batch["actions"], old_logp,
+                    mir_obs, mir_act, mir_logp)
+                new_logp, entropy = self.model.evaluate_actions(mb_obs, mb_act)
+                log_ratio = new_logp - mb_old_logp
                 ratio = log_ratio.exp()
 
                 mb_adv = advantages[mb]
@@ -406,7 +477,13 @@ class PPOTrainer:
             np.random.shuffle(idx)
             for start in range(0, T, cfg.minibatch_size):
                 mb = idx[start:start + cfg.minibatch_size]
-                new_value = self.model.get_value(batch["obs"][mb])
+                # returns 는 좌우반전 불변이라 공유; obs 만 (원본|대칭) 샘플별 랜덤 선택.
+                if mir_obs is not None:
+                    use = torch.rand(len(mb), device=returns.device) < 0.5
+                    mb_obs = torch.where(use.unsqueeze(1), mir_obs[mb], batch["obs"][mb])
+                else:
+                    mb_obs = batch["obs"][mb]
+                new_value = self.model.get_value(mb_obs)
                 # value loss (clip 없이 단순 MSE — value 가 큰 오차를 빠르게 따라가도록)
                 value_loss = 0.5 * ((new_value - returns[mb]) ** 2).mean()
 

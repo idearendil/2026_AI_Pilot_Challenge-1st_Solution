@@ -142,6 +142,13 @@ def parse_args():
                         "critic 루프는 actor 루프와 분리돼 있어 --target-kl 조기 종료의 "
                         "영향을 받지 않고 항상 이 횟수만큼 돈다.")
     p.add_argument("--no-normalize-obs", action="store_true", help="관측 정규화 끄기")
+    # 좌우 대칭(mirror) 증강: 수직평면 기준 좌우반전한 대칭 관측/행동을 만들어 epoch 마다
+    # 각 샘플을 (원본|대칭) 중 랜덤으로 한 번만 쓴다. iter 당 epoch 수 유지. **기본 ON**
+    # (claude164r=my_observation 관측 전용). 끄려면 --no-mirror-augment.
+    p.add_argument("--mirror-augment", dest="mirror_augment", action="store_true", default=True,
+                   help="좌우 대칭 증강 켜기 (기본값).")
+    p.add_argument("--no-mirror-augment", dest="mirror_augment", action="store_false",
+                   help="좌우 대칭 증강 끄기.")
     # 기본값으로 claude_code 의 my_reward / my_observation 을 사용한다.
     # 프레임워크 기본 보상/관측을 쓰려면 빈 문자열을 넘긴다: --reward-module "" --observation-module ""
     p.add_argument("--reward-module", default="claude_code.my_reward",
@@ -387,6 +394,7 @@ def main():
         critic_lr=args.critic_lr,
         critic_epochs=args.critic_epochs,
         normalize_obs=not args.no_normalize_obs,
+        mirror_augment=args.mirror_augment,
         reconstruct_state=(args.observation_module == "claude_code.my_observation"),
         seed=args.seed,
         device=args.device,

@@ -62,13 +62,15 @@ class GeometryInfo():
         else:
             T = np.matmul(Tz_pi, np.matmul(Tx, np.matmul(Ty, Tz)))
             p_unit_t = np.matmul(T, p_unit_ned)
-            _angle = np.arccos(np.clip(p_unit_t[0],-1.0,1.0))*R2D
-            # 3D에서는 부호가 정의가 안되서... 아래는 수정이 필요할 수 있다.
-            sign = 1
-            if p_unit_t[1] < -0.10:
-                sign = -1
-            elif -0.01 < p_unit_t[1] < 0.01:
-                sign = np.sign(p_unit_t[2])
+            # 3D 좌우 부호: 표적 body y 성분(오른쪽 +, 왼쪽 -) 기준. 문턱을 정확히
+            # y=0 에 두어 좌우반전(y→-y)에 대해 부호가 정확히 반대칭이 되게 한다
+            # (관측 대칭 증강용). 정중앙(y=0)은 수직 z 로 tie-break(z 는 좌우반전 불변).
+            if p_unit_t[1] > 0:
+                sign = 1.0
+            elif p_unit_t[1] < 0:
+                sign = -1.0
+            else:
+                sign = 1.0 if p_unit_t[2] >= 0 else -1.0
             _angle = sign*np.arccos(np.clip(p_unit_t[0],-1.0,1.0))*R2D
 
         return _angle
