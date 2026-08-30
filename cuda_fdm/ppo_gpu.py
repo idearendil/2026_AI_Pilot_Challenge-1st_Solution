@@ -310,7 +310,7 @@ class PPOGPUConfig:
     max_grad_norm: float = 0.5
     target_kl: Optional[float] = 0.03
     num_bins: int = ACTION_BINS
-    hidden: tuple = (256, 256)
+    hidden: tuple = (768, 768)
     activation: str = "tanh"
     normalize_obs: bool = True
     norm_adv: bool = True

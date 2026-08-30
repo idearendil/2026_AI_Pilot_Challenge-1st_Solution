@@ -32,7 +32,7 @@ def main():
                          "미니배치 크기가 아님. 클수록 mb 작아지고 step 많아짐")
     ap.add_argument("--lr", type=float, default=3e-4)
     ap.add_argument("--critic-lr", type=float, default=None)
-    ap.add_argument("--gamma", type=float, default=0.999)
+    ap.add_argument("--gamma", type=float, default=0.995)
     ap.add_argument("--gae-lambda", type=float, default=0.95)
     ap.add_argument("--clip", type=float, default=0.2)
     ap.add_argument("--ent-coef", type=float, default=0.001)
