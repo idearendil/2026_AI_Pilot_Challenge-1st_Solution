@@ -19,6 +19,8 @@
 #define MAX_CLOSURE 1000.0
 #define VSPEED_SCALE 100.0
 #define PQR_SCALE 4.0
+#define ACCEL_SCALE 150.0
+
 #define AOA_SCALE 30.0
 #define SIDESLIP_SCALE 15.0
 #define MIN_ALT_M 300.0
@@ -251,10 +253,11 @@ __device__ double shaping_potential(double dist_ft, double a1, double a2) {
     if (!isfinite(_v)) _v = (_v > 0.0) ? 10.0 : ((_v < 0.0) ? -10.0 : 0.0); \
     (dst) = (float)_v; }
 
-// 관점 기체 obs 184 를 out 에 기록. so=own9, st=tgt9.
+// 관점 기체 obs 214 를 out 에 기록(50 scalar + 144 vector[48행,가속도 포함] + 20 action-hist). so=own9, st=tgt9.
 __device__ void build_obs_one(const double so[9], const double st[9],
                               double hp_o, double hp_t, double fuel_o, double fuel_t,
                               const double pqr_o[3], const double pqr_p[3],
+                              const double accel_o[3], const double accel_p[3],
                               double dmg_dealt, double dmg_taken, double t_ac,
                               const double* acth, float* out) {
     double Rnb_o[3][3], Rnb_t[3][3];
@@ -363,17 +366,23 @@ __device__ void build_obs_one(const double so[9], const double st[9],
     // frame ptr 배열
     const double (*F[6])[3] = {I3, Rnb_o, Rnb_t, Fmy, Fopp, Flos};
     double grav[3] = {0,0,1};
-    const double* V[7] = {grav, los_u, own_vn, tgt_vn, rel_vn, own_om_n, tgt_om_n};
-    const int LAY[38][3] = {
+    // V[7]=own_accel, V[8]=tgt_accel (이미 NED). kind=3 → accel(normz ±ACCEL_SCALE).
+    const double* V[9] = {grav, los_u, own_vn, tgt_vn, rel_vn, own_om_n, tgt_om_n,
+                          accel_o, accel_p};
+    const int LAY[48][3] = {
         {0,1,0},{0,2,0},{0,3,0},{0,4,0},{0,5,0},
         {1,0,0},{1,1,0},{1,2,0},{1,3,0},{1,4,0},
         {2,0,1},{2,1,1},{2,2,1},{2,4,1},{2,5,1},
         {3,0,1},{3,1,1},{3,2,1},{3,3,1},{3,5,1},
         {4,0,1},{4,1,1},{4,2,1},{4,3,1},{4,4,1},{4,5,1},
         {5,0,2},{5,1,2},{5,2,2},{5,3,2},{5,4,2},{5,5,2},
-        {6,0,2},{6,1,2},{6,2,2},{6,3,2},{6,4,2},{6,5,2}};
+        {6,0,2},{6,1,2},{6,2,2},{6,3,2},{6,4,2},{6,5,2},
+        // own_accel: world,mybody,oppbody,oppvel,los (myvel=3 제외) — 속도 항과 동일 패턴
+        {7,0,3},{7,1,3},{7,2,3},{7,4,3},{7,5,3},
+        // tgt_accel: world,mybody,oppbody,myvel,los (oppvel=4 제외)
+        {8,0,3},{8,1,3},{8,2,3},{8,3,3},{8,5,3}};
     int base = 50;
-    for (int i = 0; i < 38; i++) {
+    for (int i = 0; i < 48; i++) {
         int vi = LAY[i][0], fi = LAY[i][1], kind = LAY[i][2];
         const double (*Rm)[3] = F[fi];
         const double* vv = V[vi];
@@ -383,12 +392,13 @@ __device__ void build_obs_one(const double so[9], const double st[9],
             double val;
             if (kind == 0) val = comp[r];
             else if (kind == 1) val = normz(comp[r], -REL_VEL, REL_VEL);
+            else if (kind == 3) val = normz(comp[r], -ACCEL_SCALE, ACCEL_SCALE);
             else val = tanh(comp[r]/PQR_SCALE);
             STORE(out[base + i*3 + r], val);
         }
     }
-    // ── action history 20 ──
-    for (int j = 0; j < 20; j++) STORE(out[164 + j], acth[j]);
+    // ── action history 20 (벡터블록 48*3=144 뒤, base 50 → 50+144=194) ──
+    for (int j = 0; j < 20; j++) STORE(out[194 + j], acth[j]);
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -398,6 +408,7 @@ extern "C" __global__ void advance_kernel(
     double* prev_att, unsigned char* prev_valid, double* pqr,
     double* last_dmg_dealt, double* last_dmg_taken, double* hp_loss,
     double* act_hist, double* prev_x, unsigned char* prev_x_valid,
+    double* prev_vel, double* accel,
     double* reward, unsigned char* term, unsigned char* trunc_,
     int nenv,
     double OX, double OY, double OZ, double OSLAT, double OCLAT, double OSLON, double OCLON,
@@ -464,6 +475,17 @@ extern "C" __global__ void advance_kernel(
         if (prev_valid[a]) { log_so3(rd, dt, lg); }
         else { lg[0]=lg[1]=lg[2]=0.0; }
         pqr[a*3+0]=lg[0]; pqr[a*3+1]=lg[1]; pqr[a*3+2]=lg[2];
+        // 선가속도: v_ned = Rb2n·vbody = mvT(Ncurr, vbody). accel = (v_ned - prev_vel)/dt.
+        // prev_valid(=pqr 과 동일 유효성)로 첫 step 0. prev_valid 세팅 전에 읽어야 정합.
+        double vb[3] = {s9a[6], s9a[7], s9a[8]};
+        double vned[3]; mvT(Ncurr, vb, vned);
+        if (prev_valid[a]) {
+            double invdt = 1.0 / (dt > 1e-8 ? dt : 1e-8);
+            accel[a*3+0] = (vned[0]-prev_vel[a*3+0])*invdt;
+            accel[a*3+1] = (vned[1]-prev_vel[a*3+1])*invdt;
+            accel[a*3+2] = (vned[2]-prev_vel[a*3+2])*invdt;
+        } else { accel[a*3+0]=accel[a*3+1]=accel[a*3+2]=0.0; }
+        prev_vel[a*3+0]=vned[0]; prev_vel[a*3+1]=vned[1]; prev_vel[a*3+2]=vned[2];
         prev_att[a*3+0]=s9a[3]; prev_att[a*3+1]=s9a[4]; prev_att[a*3+2]=s9a[5];
         prev_valid[a]=1;
     }
@@ -539,7 +561,7 @@ extern "C" __global__ void advance_kernel(
 extern "C" __global__ void build_obs_kernel(
     const double* states,
     const double* hp, const double* fuel, const double* t_sec,
-    const double* pqr, const double* last_dmg_dealt, const double* last_dmg_taken,
+    const double* pqr, const double* accel, const double* last_dmg_dealt, const double* last_dmg_taken,
     const double* act_hist, float* obs, int nac,
     double OX, double OY, double OZ, double OSLAT, double OCLAT, double OSLON, double OCLON) {
     int a = blockIdx.x * blockDim.x + threadIdx.x;
@@ -551,7 +573,9 @@ extern "C" __global__ void build_obs_kernel(
     kin9(states + par*101, OX, OY, OZ, OSLAT, OCLAT, OSLON, OCLON, s9t);
     double pqr_o[3] = {pqr[a*3+0], pqr[a*3+1], pqr[a*3+2]};
     double pqr_p[3] = {pqr[par*3+0], pqr[par*3+1], pqr[par*3+2]};
+    double acc_o[3] = {accel[a*3+0], accel[a*3+1], accel[a*3+2]};
+    double acc_p[3] = {accel[par*3+0], accel[par*3+1], accel[par*3+2]};
     build_obs_one(s9o, s9t, hp[a], hp[par], fuel[a], fuel[par],
-                  pqr_o, pqr_p, last_dmg_dealt[a], last_dmg_taken[a],
-                  t_sec[e], act_hist + a*20, obs + a*184);
+                  pqr_o, pqr_p, acc_o, acc_p, last_dmg_dealt[a], last_dmg_taken[a],
+                  t_sec[e], act_hist + a*20, obs + a*214);
 }

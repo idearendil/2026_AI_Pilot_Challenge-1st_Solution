@@ -36,11 +36,12 @@ _GEN = _RELEASE / "cuda_fdm" / "gen"
 import my_observation as R          # claude_code/my_observation.py
 import my_reward as RW              # claude_code/my_reward.py
 
-OBS_SIZE = R.OBSERVATION_SIZE       # 184 (=50 scalar + 114 vector + 20 action-history)
+OBS_SIZE = R.OBSERVATION_SIZE       # 214 (=50 scalar + 144 vector[가속도 30 포함] + 20 action-history)
 VEC_LAYOUT = R._VEC_LAYOUT          # [(key, kind, frame), ...] 38개
 FRAME_NAMES = R.FRAME_NAMES
 ACT_LEN = R.ACTION_HISTORY_LEN
 ACT_DIM = R.ACTION_DIM
+_ACCEL = R.ACCEL_SCALE_M_S2         # 선가속도 정규화 상한[m/s^2]
 
 D2R = 3.141592653589793 / 180.0
 R2D = 180.0 / 3.141592653589793
@@ -255,6 +256,8 @@ class BatchObsReward:
         self.prev_att = torch.zeros(n, 3, device=dev, dtype=dt)
         self.prev_valid = torch.zeros(n, device=dev, dtype=torch.bool)
         self.pqr = torch.zeros(n, 3, device=dev, dtype=dt)
+        self.prev_vel = torch.zeros(n, 3, device=dev, dtype=dt)      # 직전 step NED 속도(accel용)
+        self.accel = torch.zeros(n, 3, device=dev, dtype=dt)         # 선가속도(NED)
         self.last_dmg_dealt = torch.zeros(n, device=dev, dtype=dt)   # rate
         self.last_dmg_taken = torch.zeros(n, device=dev, dtype=dt)   # rate
         self.hp_loss = torch.zeros(n, device=dev, dtype=dt)          # 이번 step a 의 HP 손실
@@ -305,6 +308,7 @@ class BatchObsReward:
         args = [p(st), p(ac), p(self.hp), p(self.fuel), p(self.t_sec), p(self.prev_att),
                 p(self.prev_valid), p(self.pqr), p(self.last_dmg_dealt), p(self.last_dmg_taken),
                 p(self.hp_loss), p(self.act_hist), p(self.prev_x), p(self.prev_x_valid),
+                p(self.prev_vel), p(self.accel),
                 p(self.reward_buf), p(self.term_buf), p(self.trunc_buf), _CT.c_int(self.nenv)]
         args += self._origin_args()
         args += [_CT.c_double(self.dt), _CT.c_double(min_alt), _CT.c_double(max_time),
@@ -319,10 +323,10 @@ class BatchObsReward:
         return self.reward_buf, self.term_buf, self.trunc_buf
 
     def kernel_build_obs(self, states):
-        """융합 build_obs 커널(1 thread/기체): states+재구성 → obs(nac,184) f32. 순수(비파괴)."""
+        """융합 build_obs 커널(1 thread/기체): states+재구성 → obs(nac,214) f32. 순수(비파괴)."""
         st = states.contiguous()
         p = lambda t: _CT.c_void_p(t.data_ptr())
-        args = [p(st), p(self.hp), p(self.fuel), p(self.t_sec), p(self.pqr),
+        args = [p(st), p(self.hp), p(self.fuel), p(self.t_sec), p(self.pqr), p(self.accel),
                 p(self.last_dmg_dealt), p(self.last_dmg_taken), p(self.act_hist),
                 p(self.obs_buf), _CT.c_int(self.nac)]
         args += self._origin_args()
@@ -334,6 +338,7 @@ class BatchObsReward:
     def reset_all(self):
         self.hp.fill_(1.0); self.fuel.fill_(1.0); self.t_sec.zero_()
         self.prev_att.zero_(); self.prev_valid.zero_(); self.pqr.zero_()
+        self.prev_vel.zero_(); self.accel.zero_()
         self.last_dmg_dealt.zero_(); self.last_dmg_taken.zero_(); self.hp_loss.zero_()
         self.act_hist.zero_(); self.prev_x.zero_(); self.prev_x_valid.zero_()
 
@@ -349,6 +354,8 @@ class BatchObsReward:
         self.prev_att.masked_fill_(ac1, 0.0)
         self.prev_valid.masked_fill_(ac, False)
         self.pqr.masked_fill_(ac1, 0.0)
+        self.prev_vel.masked_fill_(ac1, 0.0)
+        self.accel.masked_fill_(ac1, 0.0)
         self.last_dmg_dealt.masked_fill_(ac, 0.0)
         self.last_dmg_taken.masked_fill_(ac, 0.0)
         self.hp_loss.masked_fill_(ac, 0.0)
@@ -357,8 +364,8 @@ class BatchObsReward:
         self.prev_x_valid.masked_fill_(ac, False)
 
     # ── stagger 용 상태 snapshot/capture/restore ──────────────────────────────
-    _AC_KEYS = ("hp", "fuel", "prev_att", "prev_valid", "pqr", "last_dmg_dealt",
-                "last_dmg_taken", "hp_loss", "act_hist", "prev_x", "prev_x_valid")
+    _AC_KEYS = ("hp", "fuel", "prev_att", "prev_valid", "pqr", "prev_vel", "accel",
+                "last_dmg_dealt", "last_dmg_taken", "hp_loss", "act_hist", "prev_x", "prev_x_valid")
     _ENV_KEYS = ("t_sec",)
 
     def clone_state(self):
@@ -409,6 +416,11 @@ class BatchObsReward:
         r_delta = torch.bmm(Rb2n_prev.transpose(1, 2), Rb2n_curr)
         pqr_new = log_so3(r_delta) / max(self.dt, 1e-8)
         self.pqr = torch.where(self.prev_valid.unsqueeze(1), pqr_new, torch.zeros_like(pqr_new))
+        # 선가속도: NED 속도(Rb2n·vbody)의 step 차분. prev_valid(=pqr 과 동일 유효성) 로 첫 step 0.
+        vel_ned = _mv(ned_to_body(att).transpose(1, 2), own[:, 6:9])
+        accel_new = (vel_ned - self.prev_vel) / max(self.dt, 1e-8)
+        self.accel = torch.where(self.prev_valid.unsqueeze(1), accel_new, torch.zeros_like(accel_new))
+        self.prev_vel = vel_ned.clone()
         self.prev_att = att.clone()
         self.prev_valid = torch.ones_like(self.prev_valid)
         # last dmg (rate)
@@ -535,7 +547,8 @@ class BatchObsReward:
         vecs = {"gravity": torch.tensor([0.0, 0.0, 1.0], device=self.device,
                                         dtype=self.dtype).expand(self.nac, 3),
                 "los": los_u, "own_vel": own_vn, "tgt_vel": tgt_vn, "rel_vel": rel_vn,
-                "own_omega": own_om_n, "tgt_omega": tgt_om_n}
+                "own_omega": own_om_n, "tgt_omega": tgt_om_n,
+                "own_accel": self.accel, "tgt_accel": self.accel[self.partner]}
         vcols = []
         for key, kind, fr in VEC_LAYOUT:
             comp = _mv(frames[fr], vecs[key])       # (nac,3)
@@ -543,6 +556,8 @@ class BatchObsReward:
                 vcols.append(comp)
             elif kind == "vel":
                 vcols.append(normalize_t(comp, R.REL_VEL_MIN, R.REL_VEL_MAX))
+            elif kind == "accel":
+                vcols.append(normalize_t(comp, -_ACCEL, _ACCEL))
             else:  # omega
                 vcols.append(torch.tanh(comp / R.PQR_SCALE_RAD_S))
         vecb = torch.cat(vcols, 1)                  # (nac,114)

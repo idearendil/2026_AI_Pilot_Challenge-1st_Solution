@@ -294,7 +294,10 @@ class GpuDogfightVecEnv:
                 a = self._random_actions()
             else:
                 a = action_fn(self.obr.build_obs(self.state9_flat()))
-            self.obr.push_actions(a)
+            # step() 과 동일 규약: history 엔 raw throttle([-1,1]=2c-1), FDM 엔 command a.
+            a_hist = a.clone()
+            a_hist[:, 3] = 2.0 * a[:, 3] - 1.0
+            self.obr.push_actions(a_hist)
             self.sim.step(a, substeps=self.substeps)
             s9 = self.state9_flat()
             self.obr.advance(s9)
@@ -387,9 +390,17 @@ class GpuDogfightVecEnv:
         if self.ic_pool is None:
             self._ensure_ic_pool()
         self.sim.step(a, substeps=self.substeps)
+        # action history 는 정책 raw action([-1,1]^4)을 저장해야 한다: 추론(제출) 경로
+        # (action_provider)는 command 변환 **전** raw 를 reconstructor 에 push 하기 때문이다
+        # (throttle 도 [-1,1]). 여기 들어온 a 는 throttle 이 이미 command [0,1](=0.5z+0.5)로
+        # 변환된 값이라, history push 용으로만 throttle 을 raw [-1,1](=2c-1)로 되돌린다.
+        # FDM(sim.step)에는 command a 를 그대로 쓴다(FCS 는 throttle∈[0,1] 규약).
+        a_hist = a.clone()
+        a_hist[:, 3] = 2.0 * a[:, 3] - 1.0
         # 융합 커널: action push + advance + 종료 + reward 를 한 launch 로.
+        # (커널은 actions 를 action-history push 에만 쓴다 → a_hist 전달로 history 만 raw 로.)
         reward, term_u8, trunc_u8 = self.obr.kernel_advance(
-            self.sim.states, a, cfg=self.reward_cfg,
+            self.sim.states, a_hist, cfg=self.reward_cfg,
             min_alt=self.min_altitude_m, max_time=self.max_engage_time_s,
             reward_mode=self.reward_mode, alt_hunt_coef=self.alt_hunt_coef)
         term = term_u8.bool(); trunc = trunc_u8.bool()

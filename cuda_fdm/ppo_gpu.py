@@ -6,7 +6,7 @@ CPU 단일-env 용 claude_code/ppo.py 와 **동일한 학습 규약**을 GPU 벡
 동기화 없음; 로깅 sync 는 iteration 당 1회).
 
 원본과 동일한 부분:
-  - **관측** = claude164r(my_observation, 184dim) — 커널이 build_observation 과 비트일치.
+  - **관측** = claude164r(my_observation, 214dim; 가속도 30 추가) — 커널이 build_observation 과 비트일치.
   - **보상** = my_reward(MY_REWARD_CONFIG) — 커널이 compute_reward 와 비트일치.
   - **행동공간** = **discrete**: 4채널(roll/pitch/rudder/throttle) × num_bins(기본 21) 균등격자
     linspace(-1,1,21), 채널별 독립 Categorical(model.MLPDiscreteActorCritic 과 동일). 정책 raw
@@ -40,8 +40,21 @@ import numpy as np
 import torch
 import torch.nn as nn
 
+# aux 라벨(미래위치 잔차)을 아군 body 좌표계로 변환할 때 obs 와 동일한 회전을 쓴다.
+from cuda_fdm.obs_reward import ned_to_body as _ned_to_body, _mv as _mv3
+
 ACTION_BINS = 21   # 원본 train.py --action-bins 기본값과 동일(채널당 21 균등격자).
 ACT_HIST_DIM = 20  # 관측 마지막 블록 = 과거 5-step × 4채널 action. critic 의 상대-행동 extra 도 동일.
+
+# ── auxiliary 미래위치 예측 (표현학습) ────────────────────────────────────────
+# 내/상대 전투기의 '미래 위치'를 예측하는 보조 task. 라벨 = 각자 현재 속도로 등속직선
+# 비행했을 때의 baseline 위치와의 잔차벡터를, **아군(main) body 좌표계(현재 t)** 로 표현.
+# 상대는 AUX_OPP_H step 뒤, 나는 AUX_SELF_H step 뒤를 예측. actor·critic 두 trunk 에 각각
+# head 를 달아 표현학습(제출 시 actor aux head 는 잘라냄).
+AUX_OPP_H = 5      # 상대 미래위치 예측 지평(step)
+AUX_SELF_H = 10    # 내 미래위치 예측 지평(step)
+AUX_POS_SCALE_M = 100.0   # 잔차 라벨 정규화[m] (예측/라벨 O(1) 스케일)
+AUX_DIM = 6        # [상대 잔차(3), 내 잔차(3)]
 
 
 def make_action_grid(num_bins=ACTION_BINS, device="cpu"):
@@ -124,21 +137,33 @@ class ActorCritic(nn.Module):
     과거 action 등)를 관측해도 무방하므로, 상대 과거 5-step action(20dim)을 critic 에만 준다."""
 
     def __init__(self, obs_dim, act_dim=4, num_bins=ACTION_BINS, hidden=(256, 256),
-                 activation="tanh", critic_extra_dim=0):
+                 activation="tanh", critic_extra_dim=0, aux_dim=0):
         super().__init__()
         self.act_dim = act_dim
         self.num_bins = int(num_bins)
         self.critic_extra_dim = int(critic_extra_dim)
+        self.aux_dim = int(aux_dim)
         self.actor_body, ah = _mlp(obs_dim, hidden, activation)
         self.actor_logits = _layer_init(nn.Linear(ah, act_dim * self.num_bins), gain=0.01)
         self.critic_body, ch = _mlp(obs_dim + self.critic_extra_dim, hidden, activation)
         self.critic_head = _layer_init(nn.Linear(ch, 1), gain=1.0)
+        # aux 미래위치 예측 head(선택). actor/critic trunk 을 공유해 표현학습(제출 시 actor
+        # aux head 는 사용 안 함 → 번들 변환에서 잘라냄). critic 은 추론에서 아예 미사용.
+        if self.aux_dim > 0:
+            self.actor_aux_head = _layer_init(nn.Linear(ah, self.aux_dim), gain=0.01)
+            self.critic_aux_head = _layer_init(nn.Linear(ch, self.aux_dim), gain=0.01)
 
     def actor_parameters(self):
-        return list(self.actor_body.parameters()) + list(self.actor_logits.parameters())
+        ps = list(self.actor_body.parameters()) + list(self.actor_logits.parameters())
+        if self.aux_dim > 0:
+            ps += list(self.actor_aux_head.parameters())
+        return ps
 
     def critic_parameters(self):
-        return list(self.critic_body.parameters()) + list(self.critic_head.parameters())
+        ps = list(self.critic_body.parameters()) + list(self.critic_head.parameters())
+        if self.aux_dim > 0:
+            ps += list(self.critic_aux_head.parameters())
+        return ps
 
     def _critic_in(self, obs, cext):
         """critic 입력 = obs (+ 상대-행동 extra). extra 없으면 obs 그대로."""
@@ -146,8 +171,12 @@ class ActorCritic(nn.Module):
             return torch.cat([obs, cext], dim=-1)
         return obs
 
-    def get_value(self, obs, cext=None):
-        return self.critic_head(self.critic_body(self._critic_in(obs, cext))).squeeze(-1)
+    def get_value(self, obs, cext=None, with_aux=False):
+        feat = self.critic_body(self._critic_in(obs, cext))
+        v = self.critic_head(feat).squeeze(-1)
+        if with_aux and self.aux_dim > 0:
+            return v, self.critic_aux_head(feat)      # (B,), (B,aux_dim)
+        return v
 
     def _dist(self, obs):
         logits = self.actor_logits(self.actor_body(obs)).view(-1, self.act_dim, self.num_bins)
@@ -162,9 +191,15 @@ class ActorCritic(nn.Module):
         value = self.get_value(obs, cext)
         return action, logp, entropy, value
 
-    def evaluate_actions(self, obs, action):
-        dist = self._dist(obs)
-        return dist.log_prob(action).sum(-1), dist.entropy().sum(-1)
+    def evaluate_actions(self, obs, action, with_aux=False):
+        feat = self.actor_body(obs)
+        logits = self.actor_logits(feat).view(-1, self.act_dim, self.num_bins)
+        dist = torch.distributions.Categorical(logits=logits)
+        logp = dist.log_prob(action).sum(-1)
+        ent = dist.entropy().sum(-1)
+        if with_aux and self.aux_dim > 0:
+            return logp, ent, self.actor_aux_head(feat)   # 공유 trunk 1-pass
+        return logp, ent, None
 
     @torch.no_grad()
     def act(self, obs, sample=True):
@@ -195,9 +230,15 @@ class OpponentPool:
         self.evict_cap = int(evict_cap)
         self.sample = bool(sample)
         self.entries = []
+        self._next_id = 0            # 엔트리 안정 id(위치와 무관). 진행 중 에피소드의 상대
+        #                              identity 를 pool 구조변경(add/evict) 뒤에도 유지하기 위함.
 
     def size(self):
         return len(self.entries)
+
+    def entry_ids(self):
+        """현재 위치 순서의 엔트리 id 목록(위치→id). 구조변경 전후 매핑용."""
+        return [e["id"] for e in self.entries]
 
     def num_permanent(self):
         return sum(1 for e in self.entries if e["permanent"])
@@ -228,7 +269,8 @@ class OpponentPool:
     @torch.no_grad()
     def add(self, model, norm, permanent, ema=0.5):
         entry = {"net": self._mk_net(model), "norm": norm.clone() if norm is not None else None,
-                 "permanent": bool(permanent), "ema": float(ema)}
+                 "permanent": bool(permanent), "ema": float(ema), "id": self._next_id}
+        self._next_id += 1
         self.entries.append(entry)
         # evictable(비영구) 초과 시 oldest evictable FIFO 제거.
         ev = [i for i, e in enumerate(self.entries) if not e["permanent"]]
@@ -309,7 +351,9 @@ class OpponentPool:
                 norm.load_state_dict({k: torch.as_tensor(v, device=self.device)
                                       for k, v in d["norm"].items()})
             self.entries.append({"net": net, "norm": norm,
-                                 "permanent": bool(d["permanent"]), "ema": float(d.get("ema", 0.5))})
+                                 "permanent": bool(d["permanent"]), "ema": float(d.get("ema", 0.5)),
+                                 "id": self._next_id})
+            self._next_id += 1
 
 
 # ── config / stats ───────────────────────────────────────────────────────────
@@ -333,6 +377,9 @@ class PPOGPUConfig:
     activation: str = "tanh"
     # critic 에만 상대의 과거 5-step action(20dim)을 추가 입력으로 준다(actor 는 불변).
     critic_opp_actions: bool = True
+    # auxiliary 미래위치 예측(actor·critic 두 trunk 에 head). aux_coef 로 MSE 를 각 loss 에 가산.
+    aux_pred: bool = True
+    aux_coef: float = 0.1
     normalize_obs: bool = True
     norm_adv: bool = True
     seed: int = 0
@@ -405,9 +452,12 @@ class PPOGPUTrainer:
         # '상대' 블록. 상대의 관측 [ah_lo:obs_dim] 이 곧 상대의 과거 5-step action 이다.
         self._ah_lo = self.obs_dim - ACT_HIST_DIM
         self.cext_dim = ACT_HIST_DIM if config.critic_opp_actions else 0
+        self.aux_dim = AUX_DIM if config.aux_pred else 0
+        self._aux_dt = float(getattr(env, "obr", None).dt) if hasattr(env, "obr") else 0.1
         self._model_kwargs = dict(obs_dim=self.obs_dim, act_dim=self.act_dim,
                                   num_bins=config.num_bins, hidden=tuple(config.hidden),
-                                  activation=config.activation, critic_extra_dim=self.cext_dim)
+                                  activation=config.activation, critic_extra_dim=self.cext_dim,
+                                  aux_dim=self.aux_dim)
         self.grid = make_action_grid(config.num_bins, device=dev)
 
         self.model = ActorCritic(**self._model_kwargs).to(dev)
@@ -449,6 +499,17 @@ class PPOGPUTrainer:
         # critic 전용 상대-행동 extra 버퍼(cext_dim==0 이면 미사용).
         self.b_cext = (torch.zeros(T, self.nenv, self.cext_dim, device=dev)
                        if self.cext_dim > 0 else None)
+        # aux 미래위치 예측용 궤적 캡처(main/opp NED 위치·속도, main body 회전) + 라벨/마스크.
+        if self.aux_dim > 0:
+            self.b_mpos = torch.zeros(T, self.nenv, 3, device=dev)   # main NED 위치
+            self.b_mvel = torch.zeros(T, self.nenv, 3, device=dev)   # main NED 속도
+            self.b_opos = torch.zeros(T, self.nenv, 3, device=dev)   # opp NED 위치
+            self.b_ovel = torch.zeros(T, self.nenv, 3, device=dev)   # opp NED 속도
+            self.b_mR = torch.zeros(T, self.nenv, 3, 3, device=dev)  # main ned->body
+            self.b_auxlab = torch.zeros(T, self.nenv, AUX_DIM, device=dev)   # [opp3, self3]
+            self.b_auxmask = torch.zeros(T, self.nenv, 2, device=dev)        # [opp valid, self valid]
+        else:
+            self.b_mpos = self.b_auxlab = self.b_auxmask = None
 
     def _apply_schedule(self, it):
         """sched_period iter 마다 단계 k=(it-1)//period 로: lr·ent_coef ×= decay^k,
@@ -503,6 +564,52 @@ class PPOGPUTrainer:
             return self.norm.normalize_slice(raw, self._ah_lo, self.obs_dim)
         return raw
 
+    def _capture_aux(self, t):
+        """step t 시작 시(=s_t, env.step 전) main/opp 의 NED 위치·속도와 main 의 ned->body
+        회전을 저장한다. 이후 미래 위치(t+H) 와 함께 aux 라벨을 만든다."""
+        if self.aux_dim == 0:
+            return
+        s9 = self.env.state9()                       # (nenv,2,9) fp64
+        m = s9[:, 0, :]; o = s9[:, 1, :]
+        Rm = _ned_to_body(m[:, 3:6]); Ro = _ned_to_body(o[:, 3:6])
+        self.b_mpos[t] = m[:, 0:3].float()
+        self.b_opos[t] = o[:, 0:3].float()
+        self.b_mvel[t] = _mv3(Rm.transpose(1, 2), m[:, 6:9]).float()   # body vel → NED
+        self.b_ovel[t] = _mv3(Ro.transpose(1, 2), o[:, 6:9]).float()
+        self.b_mR[t] = Rm.float()
+
+    def _build_aux_labels(self, T):
+        """롤아웃 후 lookahead 로 aux 라벨/마스크 계산. 라벨 = (실제 t+H 위치 - 등속직선 baseline)
+        을 main body 좌표계(t)로 표현하고 AUX_POS_SCALE 로 정규화. 에피소드 경계를 넘거나
+        (b_done) 롤아웃 끝을 넘는 t 는 마스크 0(손실 제외). 상대 H=AUX_OPP_H, 나 H=AUX_SELF_H."""
+        if self.aux_dim == 0:
+            return
+        dt = self._aux_dt
+        self.b_auxlab.zero_(); self.b_auxmask.zero_()
+        done = self.b_done                            # (T,nenv): s_t 가 새 에피소드 시작이면 1
+        for t in range(T):
+            if t + AUX_OPP_H < T:
+                valid = (done[t + 1:t + AUX_OPP_H + 1].sum(0) == 0).float()
+                base = self.b_opos[t] + self.b_ovel[t] * (AUX_OPP_H * dt)
+                res = self.b_opos[t + AUX_OPP_H] - base
+                self.b_auxlab[t, :, 0:3] = _mv3(self.b_mR[t], res) / AUX_POS_SCALE_M
+                self.b_auxmask[t, :, 0] = valid
+            if t + AUX_SELF_H < T:
+                valid = (done[t + 1:t + AUX_SELF_H + 1].sum(0) == 0).float()
+                base = self.b_mpos[t] + self.b_mvel[t] * (AUX_SELF_H * dt)
+                res = self.b_mpos[t + AUX_SELF_H] - base
+                self.b_auxlab[t, :, 3:6] = _mv3(self.b_mR[t], res) / AUX_POS_SCALE_M
+                self.b_auxmask[t, :, 1] = valid
+
+    @staticmethod
+    def _aux_loss(pred, lab, mask):
+        """masked MSE. pred/lab (B,6)=[opp3,self3], mask (B,2)=[opp valid, self valid]."""
+        err = (pred - lab) ** 2
+        opp = (err[:, 0:3].sum(1) * mask[:, 0]).sum()
+        slf = (err[:, 3:6].sum(1) * mask[:, 1]).sum()
+        denom = (mask[:, 0].sum() + mask[:, 1].sum()) * 3.0 + 1e-8
+        return (opp + slf) / denom
+
     def _reset_env_state(self):
         obs = self.env.reset(stagger=True)
         self._next_obs = obs[:, 0, :].contiguous()
@@ -514,6 +621,27 @@ class PPOGPUTrainer:
     def _refresh_weights(self):
         self.opp_weights = self.pool.weights(self.cfg.pool_sample_temp, self.cfg.pool_uniform_floor)
         self.opp_assign = self._sample_opp(self.nenv)      # pool 구성 변경 시 전 재샘플(인덱스 정합)
+
+    def _remap_assign(self, old_ids):
+        """pool 구조변경(gate add/evict, milestone add) 뒤 opp_weights 만 갱신하고, opp_assign 은
+        **동일 상대(안정 id)를 계속 가리키도록 재매핑**한다. 전역 재샘플(_refresh_weights)은 진행
+        중 에피소드의 상대를 중간에 갈아치워(에피소드가 rollout 여러 개에 걸침) 관측·승패 귀속을
+        오염시키므로, pool 이 바뀌어도 env 는 자기 상대를 에피소드 끝(done)까지 유지해야 한다.
+        old_ids = 구조변경 **직전** 위치→id. 상대가 evict 된 env 만(불가피) 새로 샘플한다."""
+        self.opp_weights = self.pool.weights(self.cfg.pool_sample_temp, self.cfg.pool_uniform_floor)
+        new_ids = self.pool.entry_ids()
+        if not old_ids or not new_ids:
+            self.opp_assign = self._sample_opp(self.nenv)
+            return
+        id_to_new = {i: p for p, i in enumerate(new_ids)}
+        old_to_new = torch.tensor([id_to_new.get(i, -1) for i in old_ids],
+                                  dtype=torch.long, device=self.cfg.device)
+        cur = self.opp_assign.clamp(0, old_to_new.numel() - 1)
+        remapped = old_to_new[cur]                         # 살아남은 상대는 새 위치로, evict 는 -1
+        evicted = remapped < 0
+        if bool(evicted.any()):                            # 상대가 사라진 env 만 새로 샘플(드묾)
+            remapped = torch.where(evicted, self._sample_opp(self.nenv), remapped)
+        self.opp_assign = remapped
 
     # ── 롤아웃 수집 (main=학습, opponent=frozen) ──────────────────────────────
     @torch.no_grad()
@@ -538,6 +666,7 @@ class PPOGPUTrainer:
                 sampled = self._sample_opp(self.nenv)
                 self.opp_assign = torch.where(self._next_done.bool(), sampled, self.opp_assign)
 
+            self._capture_aux(t)                # s_t 궤적(위치/속도/회전) 캡처(aux 라벨용)
             main_obs = self._next_obs
             if self.norm is not None:
                 self.norm.update(main_obs)
@@ -609,6 +738,8 @@ class PPOGPUTrainer:
                 loss_by_opp.scatter_add_(0, self.opp_assign, dloss)
                 ep_by_opp.scatter_add_(0, self.opp_assign, done_b.float())
 
+        self._build_aux_labels(T)               # lookahead 로 aux 미래위치 라벨/마스크 생성
+
         last_n = self.norm.normalize(self._next_obs) if self.norm is not None else self._next_obs
         last_cext = self._opp_cext(self._next_opp_obs)
         last_value = self.model.get_value(last_n, last_cext)
@@ -643,11 +774,14 @@ class PPOGPUTrainer:
         b_ret = ret.reshape(N)
         b_val = self.b_val.reshape(N)
         b_cext = self.b_cext.reshape(N, self.cext_dim) if self.cext_dim > 0 else None
+        use_aux = self.aux_dim > 0
+        b_auxlab = self.b_auxlab.reshape(N, AUX_DIM) if use_aux else None
+        b_auxmask = self.b_auxmask.reshape(N, 2) if use_aux else None
 
         mb_size = max(1, N // cfg.num_minibatches)
         idx = torch.arange(N, device=cfg.device)
         clip = cfg.clip_coef
-        last_pl = last_vl = last_ent = last_kl = last_cf = 0.0
+        last_pl = last_vl = last_ent = last_kl = last_cf = last_aux = 0.0
         early = False
         epoch = 0
         for epoch in range(cfg.update_epochs):
@@ -655,7 +789,8 @@ class PPOGPUTrainer:
             kls = []
             for s in range(0, N, mb_size):
                 mb = perm[s:s + mb_size]
-                new_logp, entropy = self.model.evaluate_actions(b_obs[mb], b_act[mb])
+                new_logp, entropy, a_aux = self.model.evaluate_actions(
+                    b_obs[mb], b_act[mb], with_aux=use_aux)
                 log_ratio = new_logp - b_logp[mb]
                 ratio = log_ratio.exp()
 
@@ -668,6 +803,11 @@ class PPOGPUTrainer:
                 policy_loss = torch.max(pg1, pg2).mean()
                 ent = entropy.mean()
                 actor_loss = policy_loss - cfg.ent_coef * ent
+                # actor trunk aux 미래위치 예측(표현학습). 작은 계수로 정책 gradient 에 가산.
+                a_aux_loss = (self._aux_loss(a_aux, b_auxlab[mb], b_auxmask[mb])
+                              if use_aux else None)
+                if use_aux:
+                    actor_loss = actor_loss + cfg.aux_coef * a_aux_loss
 
                 self.actor_opt.zero_grad(set_to_none=True)
                 actor_loss.backward()
@@ -675,10 +815,17 @@ class PPOGPUTrainer:
                 self.actor_opt.step()
 
                 mb_cext = b_cext[mb] if b_cext is not None else None
-                new_value = self.model.get_value(b_obs[mb], mb_cext)
+                if use_aux:
+                    new_value, c_aux = self.model.get_value(b_obs[mb], mb_cext, with_aux=True)
+                    c_aux_loss = self._aux_loss(c_aux, b_auxlab[mb], b_auxmask[mb])
+                else:
+                    new_value = self.model.get_value(b_obs[mb], mb_cext)
                 value_loss = 0.5 * ((new_value - b_ret[mb]) ** 2).mean()
+                critic_loss = cfg.vf_coef * value_loss
+                if use_aux:                                   # critic trunk aux(추론 미사용)
+                    critic_loss = critic_loss + cfg.aux_coef * c_aux_loss
                 self.critic_opt.zero_grad(set_to_none=True)
-                (cfg.vf_coef * value_loss).backward()
+                critic_loss.backward()
                 nn.utils.clip_grad_norm_(self.model.critic_parameters(), cfg.max_grad_norm)
                 self.critic_opt.step()
 
@@ -687,6 +834,8 @@ class PPOGPUTrainer:
                     clipfrac = ((ratio - 1.0).abs() > clip).float().mean()
                 last_pl = policy_loss.detach(); last_vl = value_loss.detach()
                 last_ent = ent.detach(); last_cf = clipfrac
+                if use_aux:
+                    last_aux = a_aux_loss.detach()
             last_kl = torch.stack(kls).mean()
             if cfg.target_kl is not None and float(last_kl) > cfg.target_kl:
                 early = True
@@ -696,7 +845,7 @@ class PPOGPUTrainer:
         ev = torch.where(var_y == 0, torch.zeros((), device=cfg.device),
                          1.0 - (b_ret - b_val).var() / (var_y + 1e-8))
         return {"pl": last_pl, "vl": last_vl, "ent": last_ent, "kl": last_kl,
-                "cf": last_cf, "ev": ev, "epochs": epoch + 1, "early": early}
+                "cf": last_cf, "ev": ev, "epochs": epoch + 1, "early": early, "aux": last_aux}
 
     # ── main 상태 저장/복원 (exploiter 학습이 self.model 등을 임시 사용) ────────
     def _snapshot_learner(self):
@@ -813,6 +962,7 @@ class PPOGPUTrainer:
                     "policy_loss": float(u["pl"]), "value_loss": float(u["vl"]),
                     "entropy": float(u["ent"]), "approx_kl": float(u["kl"]),
                     "clipfrac": float(u["cf"]), "explained_variance": float(u["ev"]),
+                    "aux_pred_mse": float(u.get("aux", 0.0)),
                     "ent_coef": float(cfg.ent_coef), "clip_coef": float(cfg.clip_coef),
                     "lr": float(cfg.exploiter_lr), "elapsed_sec": dt,
                 })
@@ -874,6 +1024,9 @@ class PPOGPUTrainer:
             sps = self.cfg.rollout_steps * self.nenv / max(elapsed, 1e-9)
             pool_event = None
 
+            # pool 구조변경 **직전** 위치→id 스냅샷(상대 identity 보존 재매핑용). rollout·update 는
+            # pool 을 바꾸지 않으므로 이 시점 id 순서가 이번 rollout 의 opp_assign 위치와 정합.
+            old_pool_ids = self.pool.entry_ids()
             # EMA 갱신 → 게이팅(evictable 최소 EMA ≥ threshold 면 현재 main 추가).
             self.pool.update_emas(rstats["win_by_opp"], rstats["loss_by_opp"],
                                   rstats["ep_by_opp"], self.cfg.selfplay_ema_alpha)
@@ -883,6 +1036,7 @@ class PPOGPUTrainer:
             ema_mean = float(np.mean([e["ema"] for e in self.pool.entries])) if self.pool.size() else float("nan")
 
             # milestone: permanent main snapshot(+capacity) + exploiter.
+            exploiter_ran = False
             if self.cfg.milestone_period > 0 and it % self.cfg.milestone_period == 0:
                 self.pool.add(self.model, self.norm, permanent=True, ema=0.5)
                 pool_event = "milestone"
@@ -893,11 +1047,14 @@ class PPOGPUTrainer:
                     _mcb = ((lambda i, m: on_exploiter_iter(it, i, m))
                             if on_exploiter_iter is not None else None)
                     ewr = self.train_exploiter(metric_cb=_mcb)  # 매 iter 출력은 내부에서 처리
+                    exploiter_ran = True   # train_exploiter 가 끝에서 env 리셋+weights 재샘플 수행
                     print(f"[gpu-ppo] === exploiter 완료 wr_ema {ewr:.3f}, pool {self.pool.size()} "
                           f"(perm {self.pool.num_permanent()}, cap {self.pool.capacity()}) ===", flush=True)
 
-            if pool_event is not None:
-                self._refresh_weights()
+            if pool_event is not None and not exploiter_ran:
+                # 진행 중 에피소드의 상대를 중간에 바꾸지 않도록 전역 재샘플이 아니라 재매핑한다.
+                # (exploiter 가 돈 경우엔 train_exploiter 가 env 를 새로 리셋해 이미 처리됨.)
+                self._remap_assign(old_pool_ids)
 
             # 슬롯별 EMA(리포팅용): evict 슬롯은 FIFO 위치 기준, perm 은 추가 순.
             evict_slot_emas, perm_slot_emas = self.pool.slot_emas()
@@ -917,6 +1074,7 @@ class PPOGPUTrainer:
                        "alt_loss_rate": alt_loss_rate,
                        "lr": float(self.actor_opt.param_groups[0]["lr"]),
                        "ent_coef": float(self.cfg.ent_coef),
+                       "aux_loss": float(u.get("aux", 0.0)),
                        "rollout": int(self.cfg.rollout_steps)})
             history.append(stats)
             if on_iteration is not None:

@@ -72,6 +72,10 @@ def main():
                     help="exploiter 상대고도 log 사냥 보상 계수 C: C*(ln(상대 이전고도)-ln(상대 현재고도))")
     ap.add_argument("--no-critic-opp-actions", action="store_true",
                     help="critic 에 상대 과거 5-step action(20dim) 추가 입력을 주지 않음(기본은 줌)")
+    ap.add_argument("--no-aux-pred", action="store_true",
+                    help="미래위치 aux 예측(actor·critic head)을 끔(기본은 켬)")
+    ap.add_argument("--aux-coef", type=float, default=0.1,
+                    help="aux 미래위치 예측 MSE 를 actor/critic loss 에 더할 계수")
     ap.add_argument("--substeps", type=int, default=6)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--device", type=str, default="cuda")
@@ -109,6 +113,7 @@ def main():
         exploiter_init_iteration_rest=args.exploiter_init_iteration_rest,
         exploiter_alt_hunt_coef=args.exploiter_alt_hunt_coef,
         critic_opp_actions=not args.no_critic_opp_actions,
+        aux_pred=not args.no_aux_pred, aux_coef=args.aux_coef,
         seed=args.seed, device=args.device)
     trainer = PPOGPUTrainer(env, cfg)
     if args.save:
@@ -180,7 +185,7 @@ def main():
         msg = (f"it {s.iteration:5d} | ret {s.mean_return:8.3f} len {s.mean_length:6.1f} "
                f"eps {int(s.completed_episodes):5d} wr {wr:.3f} | pl {s.policy_loss:+.4f} "
                f"vl {s.value_loss:.3f} ent {s.entropy:.3f} kl {s.approx_kl:.4f} cf {s.clipfrac:.3f} "
-               f"ev {s.explained_variance:+.3f} | pool {s.extra['pool_size']}"
+               f"ev {s.explained_variance:+.3f} aux {s.extra.get('aux_loss', 0.0):.4f} | pool {s.extra['pool_size']}"
                f"(p{s.extra['pool_perm']}) emin {s.extra['ema_min']:.3f} "
                f"| {s.steps_per_sec/1e6:.2f}M sps {s.elapsed_sec*1e3:.0f}ms")
         if s.extra.get("early_stop"):
@@ -204,6 +209,7 @@ def main():
                     "losses/policy_loss": s.policy_loss, "losses/value_loss": s.value_loss,
                     "losses/entropy": s.entropy, "losses/approx_kl": s.approx_kl,
                     "losses/clipfrac": s.clipfrac, "losses/explained_variance": s.explained_variance,
+                    "losses/aux_pred_mse": s.extra.get("aux_loss", 0.0),
                     "pool/size": s.extra["pool_size"], "pool/permanent": s.extra["pool_perm"],
                     "pool/ema_min": s.extra["ema_min"], "pool/ema_mean": s.extra["ema_mean"],
                     "perf/steps_per_sec": s.steps_per_sec, "perf/elapsed_sec": s.elapsed_sec,

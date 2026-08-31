@@ -120,6 +120,8 @@ MAX_RANGE_M = 2500.0
 MAX_CLOSURE_SPEED = 1000.0
 VERTICAL_SPEED_SCALE = 100.0
 PQR_SCALE_RAD_S = 4.0
+# 가속도(선가속도) 정규화 상한[m/s^2]. accel = d(v_ned)/dt 의 step 차분. 고기동(≈9g≈88)+여유.
+ACCEL_SCALE_M_S2 = 150.0
 AOA_SCALE_DEG = 30.0
 SIDESLIP_SCALE_DEG = 15.0
 MIN_ALTITUDE_M = 300.0
@@ -219,6 +221,11 @@ VECTOR_SPECS = [
     ("rel_vel",   "vel",   frozenset()),
     ("own_omega", "omega", frozenset()),
     ("tgt_omega", "omega", frozenset()),
+    # 선가속도(내/상대). 속도 항과 동일 패턴: 자기-속도정렬 frame 1개씩 제외(5 frame). accel
+    # 은 속도축과 정렬돼 있지 않지만, 그 frame 성분은 다른 frame 에서 복원 가능하므로 제외해도
+    # 정보 손실이 사실상 없다(속도 항 규약과 대칭 유지).
+    ("own_accel", "accel", frozenset({"myvel"})),
+    ("tgt_accel", "accel", frozenset({"oppvel"})),
 ]
 
 
@@ -447,6 +454,11 @@ class StateReconstructor:
         self.prev_tgt_att = None
         self.own_pqr_est = np.zeros(3, dtype=np.float64)
         self.tgt_pqr_est = np.zeros(3, dtype=np.float64)
+        # 선가속도 추정용: 직전 step 의 NED 속도(내/상대). 첫 step 은 None → accel 0.
+        self.prev_own_vel_ned = None
+        self.prev_tgt_vel_ned = None
+        self.own_accel_est = np.zeros(3, dtype=np.float64)
+        self.tgt_accel_est = np.zeros(3, dtype=np.float64)
         # 직전 ACTION_HISTORY_LEN 개 action(각 ACTION_DIM 차원). row 0 = 가장 최근. 에피소드
         # 시작 시 전부 0(= 0 step 이전 action 없음). push_action 으로 갱신.
         self.action_history = np.zeros((ACTION_HISTORY_LEN, ACTION_DIM), dtype=np.float64)
@@ -489,6 +501,18 @@ class StateReconstructor:
         self.tgt_pqr_est = _estimate_pqr(self.prev_tgt_att, curr_tgt_att, self.dt)
         self.prev_own_att = curr_own_att
         self.prev_tgt_att = curr_tgt_att
+
+        # 선가속도 추정: NED 속도의 step 차분(pqr 을 자세차분으로 추정하는 것과 동일 패턴).
+        own_vel_ned = _ned_to_body_matrix(
+            own[StateIndex.ROLL], own[StateIndex.PITCH], own[StateIndex.YAW]).T @ own[6:9]
+        tgt_vel_ned = _ned_to_body_matrix(
+            tgt[StateIndex.ROLL], tgt[StateIndex.PITCH], tgt[StateIndex.YAW]).T @ tgt[6:9]
+        self.own_accel_est = (np.zeros(3) if self.prev_own_vel_ned is None
+                              else (own_vel_ned - self.prev_own_vel_ned) / self.dt)
+        self.tgt_accel_est = (np.zeros(3) if self.prev_tgt_vel_ned is None
+                              else (tgt_vel_ned - self.prev_tgt_vel_ned) / self.dt)
+        self.prev_own_vel_ned = own_vel_ned
+        self.prev_tgt_vel_ned = tgt_vel_ned
 
         self.t_sec += self.dt
 
@@ -700,6 +724,9 @@ def build_observation(ownship_state, target_state, geo_info, wez_config=None,
         "rel_vel": rel_vel_ned,
         "own_omega": own_omega_ned,
         "tgt_omega": tgt_omega_ned,
+        # 선가속도(reconstructor 가 NED 속도 차분으로 추정). own=내 accel, tgt=상대 accel.
+        "own_accel": np.asarray(rec.own_accel_est, dtype=np.float64),
+        "tgt_accel": np.asarray(rec.tgt_accel_est, dtype=np.float64),
     }
 
     vec_feats = []
@@ -710,6 +737,10 @@ def build_observation(ownship_state, target_state, geo_info, wez_config=None,
         elif kind == "vel":
             vec_feats.extend(
                 normalize(float(comp[i]), REL_VEL_MIN, REL_VEL_MAX) for i in range(3)
+            )
+        elif kind == "accel":
+            vec_feats.extend(
+                normalize(float(comp[i]), -ACCEL_SCALE_M_S2, ACCEL_SCALE_M_S2) for i in range(3)
             )
         else:  # omega
             vec_feats.extend(

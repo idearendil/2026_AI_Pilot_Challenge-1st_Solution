@@ -57,6 +57,8 @@ def remap_state_dict(cuda_sd: dict, num_hidden: int) -> dict:
     obs_dim = int(cuda_sd["actor_body.0.weight"].shape[1])   # actor 입력폭 = 진짜 obs_dim
     out: dict = {}
     for k, v in cuda_sd.items():
+        if k.startswith("actor_aux_head.") or k.startswith("critic_aux_head."):
+            continue                                 # aux 미래위치 예측 head: 추론(제출) 미사용
         if k.startswith("actor_body."):
             out["actor_logits." + k[len("actor_body."):]] = v
         elif k.startswith("actor_logits."):          # 단독 head(weight/bias)
