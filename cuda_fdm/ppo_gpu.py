@@ -876,20 +876,26 @@ class PPOGPUTrainer:
         self.global_step = int(snap["global_step"])
 
     # ── exploiter 학습: 현재 main 을 유일 상대로 새 정책을 scratch 부터 학습 ────
-    def train_exploiter(self, log=None, metric_cb=None):
+    def train_exploiter(self, log=None, metric_cb=None, alt_hunt=True):
         """metric_cb(i, metrics_dict): 매 exploiter iteration 의 전체 지표를 넘겨(wandb 섹터
-        로깅용). log(i, wr, eps): 콘솔 출력용 간단 콜백(기존 호환)."""
+        로깅용). log(i, wr, eps): 콘솔 출력용 간단 콜백(기존 호환).
+        alt_hunt=True 면 상대고도 log 사냥 보상(reward_mode=1)으로 '고도추락 전문' exploiter 를,
+        False 면 main 과 동일한 보상(reward_mode=0)으로 일반 exploiter 를 학습한다."""
         cfg = self.cfg
         if cfg.exploiter_iters <= 0:
             return None
         saved = self._snapshot_learner()
-        # exploiter 보상 모드 토글: shaping 제거 + 상대(=frozen main) 고도 log 사냥(reward_mode=1).
-        # 이들 exploiter 는 main 을 '고도 추락'으로 패배시키도록 전문 학습된다. 끝나면 원복.
+        # exploiter 보상 모드 토글(끝나면 원복). alt_hunt=True: shaping 제거 + 상대(=frozen main)
+        # 고도 log 사냥(reward_mode=1) → 고도추락 전문. alt_hunt=False: main 과 동일(reward_mode=0).
         _saved_rmode, _saved_coef = self.env.reward_mode, self.env.alt_hunt_coef
-        self.env.reward_mode = 1
+        self.env.reward_mode = 1 if alt_hunt else 0
         self.env.alt_hunt_coef = float(cfg.exploiter_alt_hunt_coef)
-        print(f"[gpu-ppo]   exploiter 보상: 상대고도 log 사냥(reward_mode=1, "
-              f"C={cfg.exploiter_alt_hunt_coef}) + damage/고도이탈 종료 보상", flush=True)
+        if alt_hunt:
+            print(f"[gpu-ppo]   exploiter 보상: 상대고도 log 사냥(reward_mode=1, "
+                  f"C={cfg.exploiter_alt_hunt_coef}) + damage/고도이탈 종료 보상", flush=True)
+        else:
+            print("[gpu-ppo]   exploiter 보상: main 과 동일(reward_mode=0, "
+                  "거리/조준 shaping + damage/고도이탈 종료 보상)", flush=True)
         frozen_net = ActorCritic(**self._model_kwargs).to(cfg.device)
         frozen_net.load_state_dict(copy.deepcopy(self.model.state_dict()))
         frozen_net.eval()
@@ -1041,12 +1047,16 @@ class PPOGPUTrainer:
                 self.pool.add(self.model, self.norm, permanent=True, ema=0.5)
                 pool_event = "milestone"
                 if self.cfg.exploiter_iters > 0:
+                    # milestone_period 의 홀수 배수(500,1500,2500,…) exploiter 만 고도사냥
+                    # (reward_mode=1), 짝수 배수(1000,2000,3000,…) 는 main 과 동일 보상.
+                    alt_hunt = (it // self.cfg.milestone_period) % 2 == 1
                     print(f"[gpu-ppo] === exploiter 학습 시작 @it{it} "
-                          f"(max {self.cfg.exploiter_iters}it, target wr_ema ≥ {self.cfg.exploiter_win_target}) ===",
+                          f"({'고도사냥' if alt_hunt else 'main보상'}, "
+                          f"max {self.cfg.exploiter_iters}it, target wr_ema ≥ {self.cfg.exploiter_win_target}) ===",
                           flush=True)
                     _mcb = ((lambda i, m: on_exploiter_iter(it, i, m))
                             if on_exploiter_iter is not None else None)
-                    ewr = self.train_exploiter(metric_cb=_mcb)  # 매 iter 출력은 내부에서 처리
+                    ewr = self.train_exploiter(metric_cb=_mcb, alt_hunt=alt_hunt)  # 매 iter 출력은 내부에서 처리
                     exploiter_ran = True   # train_exploiter 가 끝에서 env 리셋+weights 재샘플 수행
                     print(f"[gpu-ppo] === exploiter 완료 wr_ema {ewr:.3f}, pool {self.pool.size()} "
                           f"(perm {self.pool.num_permanent()}, cap {self.pool.capacity()}) ===", flush=True)
