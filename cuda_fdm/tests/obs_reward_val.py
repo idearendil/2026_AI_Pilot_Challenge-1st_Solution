@@ -142,17 +142,15 @@ def test_terminal_reward():
     term = torch.ones(nenv, dtype=torch.bool, device="cuda")
     gpu_r = bor.compute_reward(s9, term).cpu().numpy()
     cfg = MR.MY_REWARD_CONFIG
-    exp = {0: cfg["ownship_alt_reward"], 3: cfg["target_alt_reward"],
-           4: cfg["loss_reward"]}
-    # ac0: own 이탈 -20; ac3: 자기 own alt 이탈? ac3 own=s9[3] alt 100 → own_below -20.
-    # (env1 에서 관점 ac2 의 target=ac3 이 이탈 → ac2 는 +5)
-    exp = {0: -20.0, 1: 5.0,      # ac0 own이탈; ac1 의 target(ac0) 이탈 → +5
-           2: 5.0,               # ac2 의 target(ac3) 이탈 → +5
-           3: -20.0}             # ac3 own 이탈 → -20
+    ds = float(cfg["damage_scale"])   # 고도이탈 종료 = ±(남은 HP)*damage_scale (hp 기본 1.0)
+    # ac0 own 이탈 → -(hp0=1)*ds; ac1 의 target(ac0) 이탈 → +(hp0=1)*ds;
+    # ac2 의 target(ac3) 이탈 → +(hp3=1)*ds; ac3 own 이탈 → -(hp3=1)*ds.
+    exp = {0: -1.0 * ds, 1: 1.0 * ds,
+           2: 1.0 * ds, 3: -1.0 * ds}
     err = 0.0
     for a, v in exp.items():
         err = max(err, abs(gpu_r[a] - v))
-    # ac4: own HP0 → loss_reward(0) + (own alt 5000 정상) → 0
+    # ac4: own HP0(고도 정상) → loss_reward(0) → 0
     err = max(err, abs(gpu_r[4] - cfg["loss_reward"]))
     ok = err < 1e-9
     print(f"(D) terminal 보상 합성 케이스: 최대오차 {err:.2e} -> {'OK' if ok else 'FAIL'}")

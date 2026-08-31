@@ -68,6 +68,10 @@ def main():
                     help="first iter 의 exploiter 를 이 iter 시점 main net 으로 초기화")
     ap.add_argument("--exploiter-init-iteration-rest", type=int, default=1000,
                     help="그 외 모든 exploiter 를 이 iter 시점 main net 으로 초기화")
+    ap.add_argument("--exploiter-alt-hunt-coef", type=float, default=5.0,
+                    help="exploiter 상대고도 log 사냥 보상 계수 C: C*(ln(상대 이전고도)-ln(상대 현재고도))")
+    ap.add_argument("--no-critic-opp-actions", action="store_true",
+                    help="critic 에 상대 과거 5-step action(20dim) 추가 입력을 주지 않음(기본은 줌)")
     ap.add_argument("--substeps", type=int, default=6)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--device", type=str, default="cuda")
@@ -103,6 +107,8 @@ def main():
         exploiter_clip_coef=args.exploiter_clip_coef,
         exploiter_init_iteration_first=args.exploiter_init_iteration_first,
         exploiter_init_iteration_rest=args.exploiter_init_iteration_rest,
+        exploiter_alt_hunt_coef=args.exploiter_alt_hunt_coef,
+        critic_opp_actions=not args.no_critic_opp_actions,
         seed=args.seed, device=args.device)
     trainer = PPOGPUTrainer(env, cfg)
     if args.save:

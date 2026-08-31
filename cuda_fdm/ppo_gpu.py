@@ -41,6 +41,7 @@ import torch
 import torch.nn as nn
 
 ACTION_BINS = 21   # 원본 train.py --action-bins 기본값과 동일(채널당 21 균등격자).
+ACT_HIST_DIM = 20  # 관측 마지막 블록 = 과거 5-step × 4채널 action. critic 의 상대-행동 extra 도 동일.
 
 
 def make_action_grid(num_bins=ACTION_BINS, device="cpu"):
@@ -78,6 +79,13 @@ class RunningNorm:
         n = (x - self.mean) / torch.sqrt(self.var + self.eps)
         return n.clamp_(-self.clip, self.clip)
 
+    @torch.no_grad()
+    def normalize_slice(self, x, s, e):
+        """관측의 [s:e] 차원 통계로 x(...,e-s) 를 정규화. critic 전용 상대-행동 히스토리처럼
+        관측의 특정 블록과 동일 분포인 값을 같은 통계로 정규화할 때 쓴다."""
+        n = (x - self.mean[s:e]) / torch.sqrt(self.var[s:e] + self.eps)
+        return n.clamp(-self.clip, self.clip)
+
     def state_dict(self):
         return {"mean": self.mean.clone(), "var": self.var.clone(), "count": self.count.clone()}
 
@@ -109,16 +117,21 @@ def _mlp(inp, hidden, act):
 
 class ActorCritic(nn.Module):
     """분리형 actor/critic MLP. actor=(act_dim×num_bins) 로짓 → 채널별 독립 Categorical.
-    claude_code.model.MLPDiscreteActorCritic 과 동일한 정책 구조."""
+    claude_code.model.MLPDiscreteActorCritic 과 동일한 정책 구조.
+
+    critic_extra_dim>0 이면 critic 만 관측(obs_dim) 뒤에 추가 입력(critic_extra_dim)을 더
+    받는다(actor 는 그대로 obs_dim). self-play 에서 critic 은 actor 가 볼 수 없는 정보(상대의
+    과거 action 등)를 관측해도 무방하므로, 상대 과거 5-step action(20dim)을 critic 에만 준다."""
 
     def __init__(self, obs_dim, act_dim=4, num_bins=ACTION_BINS, hidden=(256, 256),
-                 activation="tanh"):
+                 activation="tanh", critic_extra_dim=0):
         super().__init__()
         self.act_dim = act_dim
         self.num_bins = int(num_bins)
+        self.critic_extra_dim = int(critic_extra_dim)
         self.actor_body, ah = _mlp(obs_dim, hidden, activation)
         self.actor_logits = _layer_init(nn.Linear(ah, act_dim * self.num_bins), gain=0.01)
-        self.critic_body, ch = _mlp(obs_dim, hidden, activation)
+        self.critic_body, ch = _mlp(obs_dim + self.critic_extra_dim, hidden, activation)
         self.critic_head = _layer_init(nn.Linear(ch, 1), gain=1.0)
 
     def actor_parameters(self):
@@ -127,20 +140,26 @@ class ActorCritic(nn.Module):
     def critic_parameters(self):
         return list(self.critic_body.parameters()) + list(self.critic_head.parameters())
 
-    def get_value(self, obs):
-        return self.critic_head(self.critic_body(obs)).squeeze(-1)
+    def _critic_in(self, obs, cext):
+        """critic 입력 = obs (+ 상대-행동 extra). extra 없으면 obs 그대로."""
+        if self.critic_extra_dim > 0 and cext is not None:
+            return torch.cat([obs, cext], dim=-1)
+        return obs
+
+    def get_value(self, obs, cext=None):
+        return self.critic_head(self.critic_body(self._critic_in(obs, cext))).squeeze(-1)
 
     def _dist(self, obs):
         logits = self.actor_logits(self.actor_body(obs)).view(-1, self.act_dim, self.num_bins)
         return torch.distributions.Categorical(logits=logits)
 
-    def get_action_and_value(self, obs, action=None):
+    def get_action_and_value(self, obs, cext=None, action=None):
         dist = self._dist(obs)
         if action is None:
             action = dist.sample()                          # (B, act_dim) long
         logp = dist.log_prob(action).sum(-1)
         entropy = dist.entropy().sum(-1)
-        value = self.critic_head(self.critic_body(obs)).squeeze(-1)
+        value = self.get_value(obs, cext)
         return action, logp, entropy, value
 
     def evaluate_actions(self, obs, action):
@@ -312,6 +331,8 @@ class PPOGPUConfig:
     num_bins: int = ACTION_BINS
     hidden: tuple = (768, 768)
     activation: str = "tanh"
+    # critic 에만 상대의 과거 5-step action(20dim)을 추가 입력으로 준다(actor 는 불변).
+    critic_opp_actions: bool = True
     normalize_obs: bool = True
     norm_adv: bool = True
     seed: int = 0
@@ -342,6 +363,9 @@ class PPOGPUConfig:
     exploiter_lr: float = 1e-4
     exploiter_ent_coef: float = 5e-5
     exploiter_clip_coef: float = 0.4
+    # exploiter 는 shaping 대신 상대 고도 log 사냥 보상을 쓴다(reward_mode=1). 매 step
+    #   C*(ln(상대 이전고도) - ln(상대 현재고도)) = C*ln(상대고도 감소비). C = 아래 계수.
+    exploiter_alt_hunt_coef: float = 5.0
 
 
 @dataclass
@@ -377,9 +401,13 @@ class PPOGPUTrainer:
         self.obs_dim = int(env.OBS_SIZE)
         self.act_dim = 4
         self.min_alt = float(getattr(env, "min_altitude_m", 300.0))
+        # critic 전용 상대-행동 extra: 관측 마지막 20dim(=자기 과거5×4 action) 과 동일 형태의
+        # '상대' 블록. 상대의 관측 [ah_lo:obs_dim] 이 곧 상대의 과거 5-step action 이다.
+        self._ah_lo = self.obs_dim - ACT_HIST_DIM
+        self.cext_dim = ACT_HIST_DIM if config.critic_opp_actions else 0
         self._model_kwargs = dict(obs_dim=self.obs_dim, act_dim=self.act_dim,
                                   num_bins=config.num_bins, hidden=tuple(config.hidden),
-                                  activation=config.activation)
+                                  activation=config.activation, critic_extra_dim=self.cext_dim)
         self.grid = make_action_grid(config.num_bins, device=dev)
 
         self.model = ActorCritic(**self._model_kwargs).to(dev)
@@ -418,6 +446,9 @@ class PPOGPUTrainer:
         self.b_rew = torch.zeros(T, self.nenv, device=dev)
         self.b_done = torch.zeros(T, self.nenv, device=dev)
         self.b_val = torch.zeros(T, self.nenv, device=dev)
+        # critic 전용 상대-행동 extra 버퍼(cext_dim==0 이면 미사용).
+        self.b_cext = (torch.zeros(T, self.nenv, self.cext_dim, device=dev)
+                       if self.cext_dim > 0 else None)
 
     def _apply_schedule(self, it):
         """sched_period iter 마다 단계 k=(it-1)//period 로: lr·ent_coef ×= decay^k,
@@ -460,6 +491,17 @@ class PPOGPUTrainer:
     def _sample_opp(self, n):
         """가중치(opp_weights) 기반 opponent 인덱스 n 개 샘플."""
         return torch.multinomial(self.opp_weights, n, replacement=True)
+
+    def _opp_cext(self, opp_obs):
+        """상대 관측(nenv,OBS)에서 상대 과거 5-step action(20dim)을 뽑아 critic extra 로.
+        관측의 action-history 블록과 동일 분포이므로 같은 정규화 통계([ah_lo:obs_dim])를 쓴다.
+        cext_dim==0 이면 None."""
+        if self.cext_dim == 0:
+            return None
+        raw = opp_obs[:, self._ah_lo:self.obs_dim]
+        if self.norm is not None:
+            return self.norm.normalize_slice(raw, self._ah_lo, self.obs_dim)
+        return raw
 
     def _reset_env_state(self):
         obs = self.env.reset(stagger=True)
@@ -505,7 +547,10 @@ class PPOGPUTrainer:
             self.b_obs[t] = obs_n
             self.b_done[t] = self._next_done
 
-            act_idx, logp, _, value = self.model.get_action_and_value(obs_n)
+            cext_n = self._opp_cext(self._next_opp_obs)     # critic 전용 상대-행동 extra
+            if self.cext_dim > 0:
+                self.b_cext[t] = cext_n
+            act_idx, logp, _, value = self.model.get_action_and_value(obs_n, cext_n)
             self.b_act[t] = act_idx
             self.b_logp[t] = logp
             self.b_val[t] = value
@@ -528,7 +573,8 @@ class PPOGPUTrainer:
 
             term_obs = info["terminal_obs"][:, 0, :]
             tn = self.norm.normalize(term_obs) if self.norm is not None else term_obs
-            v_boot = self.model.get_value(tn)
+            term_cext = self._opp_cext(info["terminal_obs"][:, 1, :])
+            v_boot = self.model.get_value(tn, term_cext)
             self.b_rew[t] = raw_reward + gamma * v_boot * trunc.float()
 
             self._next_obs = obs[:, 0, :]
@@ -564,7 +610,8 @@ class PPOGPUTrainer:
                 ep_by_opp.scatter_add_(0, self.opp_assign, done_b.float())
 
         last_n = self.norm.normalize(self._next_obs) if self.norm is not None else self._next_obs
-        last_value = self.model.get_value(last_n)
+        last_cext = self._opp_cext(self._next_opp_obs)
+        last_value = self.model.get_value(last_n, last_cext)
 
         adv = torch.zeros_like(self.b_rew)
         lastgae = torch.zeros(self.nenv, device=dev)
@@ -595,6 +642,7 @@ class PPOGPUTrainer:
         b_adv = adv.reshape(N)
         b_ret = ret.reshape(N)
         b_val = self.b_val.reshape(N)
+        b_cext = self.b_cext.reshape(N, self.cext_dim) if self.cext_dim > 0 else None
 
         mb_size = max(1, N // cfg.num_minibatches)
         idx = torch.arange(N, device=cfg.device)
@@ -626,7 +674,8 @@ class PPOGPUTrainer:
                 nn.utils.clip_grad_norm_(self.model.actor_parameters(), cfg.max_grad_norm)
                 self.actor_opt.step()
 
-                new_value = self.model.get_value(b_obs[mb])
+                mb_cext = b_cext[mb] if b_cext is not None else None
+                new_value = self.model.get_value(b_obs[mb], mb_cext)
                 value_loss = 0.5 * ((new_value - b_ret[mb]) ** 2).mean()
                 self.critic_opt.zero_grad(set_to_none=True)
                 (cfg.vf_coef * value_loss).backward()
@@ -685,6 +734,13 @@ class PPOGPUTrainer:
         if cfg.exploiter_iters <= 0:
             return None
         saved = self._snapshot_learner()
+        # exploiter 보상 모드 토글: shaping 제거 + 상대(=frozen main) 고도 log 사냥(reward_mode=1).
+        # 이들 exploiter 는 main 을 '고도 추락'으로 패배시키도록 전문 학습된다. 끝나면 원복.
+        _saved_rmode, _saved_coef = self.env.reward_mode, self.env.alt_hunt_coef
+        self.env.reward_mode = 1
+        self.env.alt_hunt_coef = float(cfg.exploiter_alt_hunt_coef)
+        print(f"[gpu-ppo]   exploiter 보상: 상대고도 log 사냥(reward_mode=1, "
+              f"C={cfg.exploiter_alt_hunt_coef}) + damage/고도이탈 종료 보상", flush=True)
         frozen_net = ActorCritic(**self._model_kwargs).to(cfg.device)
         frozen_net.load_state_dict(copy.deepcopy(self.model.state_dict()))
         frozen_net.eval()
@@ -768,6 +824,8 @@ class PPOGPUTrainer:
 
         self.pool.add(self.model, self.norm, permanent=True, ema=0.5)
 
+        # 보상 모드 원복(main 학습은 다시 reward_mode=0).
+        self.env.reward_mode, self.env.alt_hunt_coef = _saved_rmode, _saved_coef
         cfg.ent_coef, cfg.clip_coef = base_ent, base_clip
         if saved["norm"] is not None and self.norm is None:
             self.norm = RunningNorm(self.obs_dim, cfg.device)

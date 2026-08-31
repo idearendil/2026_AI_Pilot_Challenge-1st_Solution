@@ -168,7 +168,7 @@ class GpuDogfightVecEnv:
 
     def __init__(self, nenv, substeps=6, precision="fp64", block=128, seed=None,
                  device="cuda", min_altitude_m=300.0, max_engage_time_s=200.0,
-                 reward_cfg=None):
+                 reward_cfg=None, reward_mode=0, alt_hunt_coef=0.0):
         # step_ratio=6 (대회): RL step 1회 = sim 6프레임 = action_repeat.
         self.sim = GpuDogfight(nenv, substeps=substeps, planes_per_env=2,
                                precision=precision, block=block)
@@ -190,6 +190,10 @@ class GpuDogfightVecEnv:
         self.min_altitude_m = min_altitude_m
         self.max_engage_time_s = max_engage_time_s
         self.reward_cfg = reward_cfg
+        # 보상 모드: 0=main(거리/조준 shaping), 1=exploiter(shaping 제거 + 상대고도 log 사냥).
+        # 학습 루프(train_exploiter)가 exploiter 구간 동안 1 로 토글하고 끝나면 0 으로 복원한다.
+        self.reward_mode = int(reward_mode)
+        self.alt_hunt_coef = float(alt_hunt_coef)
         # 관측(claude164r)/보상(my_reward) 배치 계산기 + 재구성 상태.
         self.obr = BatchObsReward(nenv, device=device)
         # autoreset 용 GPU IC 풀: 재시드를 CPU seed 빌드 없이 GPU gather 로(동기화 제거).
@@ -386,7 +390,8 @@ class GpuDogfightVecEnv:
         # 융합 커널: action push + advance + 종료 + reward 를 한 launch 로.
         reward, term_u8, trunc_u8 = self.obr.kernel_advance(
             self.sim.states, a, cfg=self.reward_cfg,
-            min_alt=self.min_altitude_m, max_time=self.max_engage_time_s)
+            min_alt=self.min_altitude_m, max_time=self.max_engage_time_s,
+            reward_mode=self.reward_mode, alt_hunt_coef=self.alt_hunt_coef)
         term = term_u8.bool(); trunc = trunc_u8.bool()
         done = term | trunc
         reward = reward.view(self.nenv, 2).clone()

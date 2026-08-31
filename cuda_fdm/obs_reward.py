@@ -291,9 +291,13 @@ class BatchObsReward:
         return [_CT.c_double(self._ox), _CT.c_double(self._oy), _CT.c_double(self._oz),
                 _CT.c_double(s), _CT.c_double(c), _CT.c_double(so), _CT.c_double(co)]
 
-    def kernel_advance(self, states, actions, cfg=None, min_alt=300.0, max_time=200.0):
+    def kernel_advance(self, states, actions, cfg=None, min_alt=300.0, max_time=200.0,
+                       reward_mode=0, alt_hunt_coef=0.0):
         """융합 advance+reward 커널(1 thread/env): action push, hp/연료/pqr/시간 적분,
-        종료 판정, 보상 계산을 한 번에. sim.step **후** 호출. 반환 (reward(nac,), term, trunc)."""
+        종료 판정, 보상 계산을 한 번에. sim.step **후** 호출. 반환 (reward(nac,), term, trunc).
+
+        reward_mode 0=main(거리/조준 shaping), 1=exploiter(shaping 제거 + 상대고도 log 사냥;
+        alt_hunt_coef=C). own_damage_weight/damage_scale/고도이탈 종료 보상은 두 모드 공통."""
         cfg = cfg if cfg is not None else RW.MY_REWARD_CONFIG
         st = states.contiguous(); ac = actions.contiguous()
         own_w = float(cfg.get("own_damage_weight", 0.5))
@@ -308,7 +312,8 @@ class BatchObsReward:
                  _CT.c_double(float(cfg["shaping_reward_scale"])),
                  _CT.c_double(float(cfg["win_reward"])), _CT.c_double(float(cfg["loss_reward"])),
                  _CT.c_double(float(cfg["ownship_alt_reward"])),
-                 _CT.c_double(float(cfg["target_alt_reward"]))]
+                 _CT.c_double(float(cfg["target_alt_reward"])),
+                 _CT.c_int(int(reward_mode)), _CT.c_double(float(alt_hunt_coef))]
         grid = ((self.nenv + self.block - 1) // self.block, 1, 1)
         self._k_adv.launch(grid, (self.block, 1, 1), args)
         return self.reward_buf, self.term_buf, self.trunc_buf
@@ -565,28 +570,26 @@ class BatchObsReward:
                                (loss_t - loss_o * own_w) * dmg_scale,
                                torch.zeros_like(hp_o))
 
-        # shaping (per aircraft, telescoping)
+        # shaping (per aircraft, telescoping; 고도항 제거)
         scale = float(cfg["shaping_reward_scale"])
         dist_ft = distance_m(own, tgt) / _FT2M       # reward 규약(/0.3048)
         a1 = ata_deg(own, tgt).abs()
         a2 = ata_deg(tgt, own).abs()
-        own_alt_ft = (-own[:, 2]) / _FT2M
-        cur_x = self._shaping_potential(dist_ft, a1, a2, own_alt_ft)
+        cur_x = self._shaping_potential(dist_ft, a1, a2)
         r_shaping = torch.where(self.prev_x_valid & (scale != 0.0),
                                 (cur_x - self.prev_x) * scale, torch.zeros_like(cur_x))
         if scale != 0.0:
             self.prev_x = cur_x
             self.prev_x_valid = torch.ones_like(self.prev_x_valid)
 
-        # terminal (win/loss=0; alt reward). terminated_env 에서만.
+        # terminal: 고도이탈 종료 보상 = 남은 HP 전량 상실/소멸(±hp*damage_scale). win/loss=0.
+        dmg_scale = float(cfg["damage_scale"])
         term_ac = terminated_env.repeat_interleave(2)
         own_below = (-own[:, 2]) < R.MIN_ALTITUDE_M
         tgt_below = (-tgt[:, 2]) < R.MIN_ALTITUDE_M
         r_term = torch.zeros_like(hp_o)
-        r_term = torch.where(term_ac & own_below,
-                             torch.full_like(hp_o, float(cfg["ownship_alt_reward"])), r_term)
-        r_term = torch.where(term_ac & (~own_below) & tgt_below,
-                             torch.full_like(hp_o, float(cfg["target_alt_reward"])), r_term)
+        r_term = torch.where(term_ac & own_below, -hp_o * dmg_scale, r_term)
+        r_term = torch.where(term_ac & (~own_below) & tgt_below, hp_t * dmg_scale, r_term)
         r_term = r_term + torch.where(term_ac & (hp_t <= 0.0),
                                       torch.full_like(hp_o, float(cfg["win_reward"])), torch.zeros_like(hp_o))
         r_term = r_term + torch.where(term_ac & (hp_o <= 0.0),
@@ -594,8 +597,8 @@ class BatchObsReward:
         return r_damage + r_shaping + r_term
 
     @staticmethod
-    def _shaping_potential(dist_ft, a1, a2, own_alt_ft):
-        """my_reward._shaping_potential 벡터화."""
+    def _shaping_potential(dist_ft, a1, a2):
+        """my_reward._shaping_potential 벡터화(거리/조준만; 고도항 제거)."""
         near = dist_ft <= 500.0
         mid = (~near) & (dist_ft <= 15000.0)
         base_near = dist_ft + 14000.0
@@ -605,8 +608,4 @@ class BatchObsReward:
         x_mid = (base_mid + base_mid * (90.0 - a1) / 90.0 * 2.5
                  - base_mid * (90.0 - a2) / 90.0 * 2.5 + 985000.0)
         x_far = 1000000.0 - dist_ft
-        x = torch.where(near, x_near, torch.where(mid, x_mid, x_far))
-        in_alt = (own_alt_ft >= RW._ALT_SHAPING_FLOOR_FT) & (own_alt_ft <= RW._ALT_SHAPING_TOP_FT)
-        d = own_alt_ft - RW._ALT_SHAPING_TOP_FT
-        x = x + torch.where(in_alt, -(d * d) / RW._ALT_SHAPING_DIVISOR, torch.zeros_like(x))
-        return x
+        return torch.where(near, x_near, torch.where(mid, x_mid, x_far))

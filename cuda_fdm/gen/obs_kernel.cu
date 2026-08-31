@@ -42,10 +42,6 @@
 #define T3_CONE 3.0
 #define T2_START 100.0
 #define T3_START 150.0
-// shaping
-#define ALT_FLOOR_FT 1000.0
-#define ALT_TOP_FT 4000.0
-#define ALT_DIV 11.25
 
 #define CLAMP(x,a,b) ((x)<(a)?(a):((x)>(b)?(b):(x)))
 
@@ -235,7 +231,9 @@ __device__ double damage(double r_ft, double ata_abs, double t) {
     return 0.0;
 }
 
-__device__ double shaping_potential(double dist_ft, double a1, double a2, double own_alt_ft) {
+// 거리/조준 포텐셜(고도항 제거: 고도 관련 shaping 은 전면 삭제). a1=아군→상대 |ATA|,
+// a2=상대→아군 |ATA|. 값이 클수록 유리. 경계 500ft·15000ft 에서 연속.
+__device__ double shaping_potential(double dist_ft, double a1, double a2) {
     double x;
     if (dist_ft <= 500.0) {
         double base = dist_ft + 14000.0;
@@ -245,10 +243,6 @@ __device__ double shaping_potential(double dist_ft, double a1, double a2, double
         x = base + base*(90.0-a1)/90.0*2.5 - base*(90.0-a2)/90.0*2.5 + 985000.0;
     } else {
         x = 1000000.0 - dist_ft;
-    }
-    if (own_alt_ft >= ALT_FLOOR_FT && own_alt_ft <= ALT_TOP_FT) {
-        double d = own_alt_ft - ALT_TOP_FT;
-        x += -(d*d)/ALT_DIV;
     }
     return x;
 }
@@ -409,7 +403,11 @@ extern "C" __global__ void advance_kernel(
     double OX, double OY, double OZ, double OSLAT, double OCLAT, double OSLON, double OCLON,
     double dt, double min_alt, double max_time,
     double own_w, double dmg_scale, double shap_scale,
-    double win_r, double loss_r, double own_alt_r, double tgt_alt_r) {
+    double win_r, double loss_r, double own_alt_r, double tgt_alt_r,
+    int reward_mode, double alt_hunt_coef) {
+    // reward_mode 0 = main(거리/조준 shaping), 1 = exploiter(shaping 제거 + 상대고도 log 사냥).
+    // own_alt_r/tgt_alt_r 는 더 이상 쓰이지 않는다(고도이탈 종료 보상 = 남은 HP 전량 상실
+    // = ±hp*dmg_scale 로 동적 계산). 인자 순서 안정성 위해 시그니처에는 남겨둔다.
     int e = blockIdx.x * blockDim.x + threadIdx.x;
     if (e >= nenv) return;
     int o = 2*e, p = 2*e + 1;
@@ -484,38 +482,58 @@ extern "C" __global__ void advance_kernel(
     // reward (관점 o, p)
     double dist_ft = dist / FT2M;
     double a1 = fabs(ata_op), a2 = fabs(ata_po);
+    // 이전 step 포텐셜(telescoping) 을 두 관점 갱신 전에 원본으로 읽어둔다.
+    double px_o_old = prev_x[o], px_p_old = prev_x[p];
+    unsigned char pv_o = prev_x_valid[o], pv_p = prev_x_valid[p];
+    // 이번 step 포텐셜. main(0)=거리/조준 shaping, exploiter(1)=상대고도 log(단위·1000 은
+    // 차분에서 상쇄되므로 무해; alt<=0 방어로 하한 clamp).
+    double pot_o, pot_p;
+    if (reward_mode == 0) {
+        pot_o = shaping_potential(dist_ft, a1, a2);
+        pot_p = shaping_potential(dist_ft, a2, a1);
+    } else {
+        double aof = alt_o/FT2M/1000.0; if (aof < 1e-4) aof = 1e-4;
+        double apf = alt_p/FT2M/1000.0; if (apf < 1e-4) apf = 1e-4;
+        pot_o = log(aof); pot_p = log(apf);
+    }
     // persp o
     {
-        double cur_x = shaping_potential(dist_ft, a1, a2, alt_o/FT2M);
         double r_dam = (hp_o_new > 0.0 && hp_p_new > 0.0)
                      ? (loss_p - loss_o*own_w)*dmg_scale : 0.0;
-        double r_sh = (prev_x_valid[o] && shap_scale != 0.0) ? (cur_x - prev_x[o])*shap_scale : 0.0;
-        if (shap_scale != 0.0) { prev_x[o] = cur_x; prev_x_valid[o] = 1; }
+        double r_ex;
+        if (reward_mode == 0)
+            r_ex = (pv_o && shap_scale != 0.0) ? (pot_o - px_o_old)*shap_scale : 0.0;
+        else   // 상대(p) 고도 하강 사냥: C*(ln(상대 이전고도) - ln(상대 현재고도)).
+            r_ex = pv_p ? (px_p_old - pot_p)*alt_hunt_coef : 0.0;
         double r_t = 0.0;
         if (te) {
-            if (alt_o < min_alt) r_t = own_alt_r;
-            else if (alt_p < min_alt) r_t = tgt_alt_r;
+            if (alt_o < min_alt) r_t += -hp_o_new*dmg_scale;      // 내 고도이탈 = 남은 HP 전량 상실
+            else if (alt_p < min_alt) r_t += hp_p_new*dmg_scale;  // 상대 고도이탈 = 상대 남은 HP 전량 소멸
             if (hp_p_new <= 0.0) r_t += win_r;
             if (hp_o_new <= 0.0) r_t += loss_r;
         }
-        reward[o] = r_dam + r_sh + r_t;
+        reward[o] = r_dam + r_ex + r_t;
     }
     // persp p
     {
-        double cur_x = shaping_potential(dist_ft, a2, a1, alt_p/FT2M);
         double r_dam = (hp_o_new > 0.0 && hp_p_new > 0.0)
                      ? (loss_o - loss_p*own_w)*dmg_scale : 0.0;
-        double r_sh = (prev_x_valid[p] && shap_scale != 0.0) ? (cur_x - prev_x[p])*shap_scale : 0.0;
-        if (shap_scale != 0.0) { prev_x[p] = cur_x; prev_x_valid[p] = 1; }
+        double r_ex;
+        if (reward_mode == 0)
+            r_ex = (pv_p && shap_scale != 0.0) ? (pot_p - px_p_old)*shap_scale : 0.0;
+        else
+            r_ex = pv_o ? (px_o_old - pot_o)*alt_hunt_coef : 0.0;
         double r_t = 0.0;
         if (te) {
-            if (alt_p < min_alt) r_t = own_alt_r;
-            else if (alt_o < min_alt) r_t = tgt_alt_r;
+            if (alt_p < min_alt) r_t += -hp_p_new*dmg_scale;
+            else if (alt_o < min_alt) r_t += hp_o_new*dmg_scale;
             if (hp_o_new <= 0.0) r_t += win_r;
             if (hp_p_new <= 0.0) r_t += loss_r;
         }
-        reward[p] = r_dam + r_sh + r_t;
+        reward[p] = r_dam + r_ex + r_t;
     }
+    // telescoping 포텐셜 갱신(항상 저장 → 위상 정합; shaping 계수와 무관).
+    prev_x[o] = pot_o; prev_x[p] = pot_p; prev_x_valid[o] = 1; prev_x_valid[p] = 1;
 }
 
 extern "C" __global__ void build_obs_kernel(

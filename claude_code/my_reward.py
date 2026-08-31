@@ -1,15 +1,16 @@
 # -*- coding: utf-8 -*-
 """[편집 가능] claude_code 보상 함수.
 
-규칙(종료 보상 3분리):
+규칙(종료 보상):
   - [종료·HP] 상대 HP<=0 으로 종료(내가 이김)          →  +win_reward(0)
               내 HP<=0   으로 종료(상대가 이김)         →  +loss_reward(0)
-  - [종료·고도] 내 고도가 최소고도(=300m≈1000ft) 이하로 종료  →  ownship_alt_reward(-20)
-                상대 고도가 최소고도 이하로 종료             →  target_alt_reward(+5)
+  - [종료·고도] 내 고도가 최소고도(=300m≈1000ft) 이하로 종료  →  -(내 남은 HP)*damage_scale
+                상대 고도가 최소고도 이하로 종료             →  +(상대 남은 HP)*damage_scale
+                (= "남은 HP 를 한 번에 전량 상실/소멸한 것"과 동일한 보상. 예전 -20/+5 상수 폐기.)
   - [보조] 양측이 살아있는(HP>0) 매 step:
            reward += (상대 HP 감소량 - 본인 HP 감소량*own_damage_weight) * damage_scale(10)
            (HP 감소량 = 이번 step 에 입은 damage = 함수 인자 target_damage / ownship_damage)
-           own_damage_weight 기본 0.5, 학습 단계 k>=2(2000 iter~)에서 1.0 으로 상향(스케줄).
+           own_damage_weight = 1.0 = 완전 대칭(내가 받는 damage 와 상대가 받는 damage 동일 계수).
   - [보조] 상황 포텐셜 shaping: 거리/조준을 하나의 포텐셜 함수 x 로 합친 뒤 그 step 차분에
            계수를 곱해 준다.  reward += (x_cur - x_prev) * shaping_reward_scale.
            x = _shaping_potential(distance[ft], A1[deg], A2[deg]) 이고
@@ -51,27 +52,23 @@ from dogfight.sim.state_schema import StateIndex
 
 _FT_TO_M = 0.3048
 
-# 고도 안전 shaping 파라미터(_shaping_potential 고도항). 아군 고도가 TOP 이하로
-# 내려가면 포텐셜을 -(alt-TOP)^2/DIVISOR 만큼 떨어뜨려 하강을 억제한다.
-# telescoping 이라 episode 총합 = (alt_pot(끝고도)-alt_pot(시작고도))*shaping_scale.
-# 목표: TOP(4000ft, 항=0)에서 FLOOR(1000ft)까지 강하 시 고도항 총합 ≈ -40.
-#   필요 potential 차 = -40 / shaping_scale(0.00005) = -800000
-#   -(1000-4000)^2/DIVISOR = -9000000/DIVISOR = -800000  →  DIVISOR = 11.25
-# 범위는 원래대로 좁혀(1000~4000ft) 세기만 강화 유지: 좁은 구간에 -40 을 몰아넣어
-# 4000ft 아래에서 하강 억제 신호가 예전보다 훨씬 가파르다(1000ft potential -800000).
-_ALT_SHAPING_FLOOR_FT = 1000.0    # 이 아래는 사실상 패배 임박(min_altitude 근처)
-_ALT_SHAPING_TOP_FT = 4000.0      # 이 위는 안전 → 고도항 0 (zero point)
-_ALT_SHAPING_DIVISOR = 11.25      # 4000→1000ft 강하 시 고도항 총합 = -40
+# (제거됨) 고도 안전 shaping 파라미터: 고도 관련 shaping 은 전면 삭제되었다. 고도 하락은
+# 이제 shaping 이 아니라 "고도이탈 종료 = 남은 HP 전량 상실(±hp*damage_scale)" 로만 다룬다.
 
 MY_REWARD_CONFIG = {
     "win_reward": 0.0,       # 상대 HP<=0 으로 종료(내가 이김)
     "loss_reward": 0.0,     # 내 HP<=0 으로 종료(상대가 이김)
-    "ownship_alt_reward": -20.0,   # 내 고도가 최소고도 이하로 떨어져 종료
-    "target_alt_reward": 5.0,      # 상대 고도가 최소고도 이하로 떨어져 종료
+    # [DEPRECATED] 아래 두 고도 종료 상수는 더 이상 쓰이지 않는다. 고도이탈 종료 보상은
+    # "남은 HP 를 한 번에 전량 상실/소멸한 것"과 동일하게 동적 계산한다:
+    #   내 고도이탈 종료   → -(내 남은 HP)   * damage_scale
+    #   상대 고도이탈 종료 → +(상대 남은 HP) * damage_scale
+    # (키는 하위호환/커널 인자 순서 유지를 위해 남겨둔다.)
+    "ownship_alt_reward": -20.0,
+    "target_alt_reward": 5.0,
     "damage_scale": 10.0,   # (상대 HP감소 - 내 HP감소*own_damage_weight) * 이 값, 양측 생존 중 매 step
-    # 내 HP 감소량에 곱하는 가중치. 기본 0.5(상대 피해보다 절반만 반영). 학습 스케줄이
-    # 2000 iter(단계 k>=2) 도달 시 1.0(상대와 동일 취급)으로 올린다(ppo._apply_iteration_schedule).
-    "own_damage_weight": 0.5,
+    # 내 HP 감소량에 곱하는 가중치. 이제 1.0 = 상대와 완전 대칭(내가 받는 damage 와 상대가 받는
+    # damage 를 동일 계수로 반영). 고도이탈 종료 보상도 이 대칭 규약(±hp*damage_scale)을 따른다.
+    "own_damage_weight": 1.0,
     # 상황 포텐셜 shaping 계수. reward += (x_cur - x_prev) * 이 값.
     # x 는 _shaping_potential(거리[ft], A1[deg], A2[deg]) 로 대략 ~1e6 스케일이다.
     #   대표 궤적(원거리 20000ft·조준無 → 근거리 1000ft·내 조준0°·상대 90°)의
@@ -94,18 +91,12 @@ _prev_x: float | None = None       # 직전 step 의 포텐셜값 x (거리/조�
 _prev_sim_time: float | None = None
 
 
-def _shaping_potential(distance_ft: float, a1_deg: float, a2_deg: float,
-                       own_alt_ft: float) -> float:
-    """거리(ft)/조준(A1,A2 deg, 0~180) + 아군 고도(ft) 를 합친 상황 포텐셜.
+def _shaping_potential(distance_ft: float, a1_deg: float, a2_deg: float) -> float:
+    """거리(ft)/조준(A1,A2 deg, 0~180) 만으로 만든 상황 포텐셜(고도항 제거).
 
     A1 = 아군→상대 LOS(|ATA|), A2 = 상대→아군 LOS(|ATA|). 값이 클수록 유리.
     경계 500ft·15000ft 에서 연속. (90-A) 항은 A>90(등 뒤) 이면 음수가 되어 자연스럽게
-    페널티로 작동하므로 clamp 하지 않는다.
-
-    고도 항: FLOOR(1000ft)~TOP(4000ft) 구간에서만 -(alt-TOP)^2/DIVISOR 를 더한다.
-    (TOP=4000ft 에서 0, 1000ft 에서 -800000). 고도가 분계점(min_altitude≈1000ft)에
-    가까워질수록 포텐셜이 낮아져(차분이 음수) 하강을 억제한다(고도 하락 패배 방지).
-    telescoping 이라 4000→1000ft 강하 시 고도항 episode 총합 = -40(예전 -1.8 강화).
+    페널티로 작동하므로 clamp 하지 않는다. (고도 관련 shaping 은 전면 삭제되었다.)
     """
     if distance_ft <= 500.0:
         base = distance_ft + 14000.0
@@ -120,10 +111,6 @@ def _shaping_potential(distance_ft: float, a1_deg: float, a2_deg: float,
              + 985000.0)
     else:
         x = 1000000.0 - distance_ft
-
-    if _ALT_SHAPING_FLOOR_FT <= own_alt_ft <= _ALT_SHAPING_TOP_FT:
-        d = own_alt_ft - _ALT_SHAPING_TOP_FT
-        x += -(d * d) / _ALT_SHAPING_DIVISOR
     return x
 
 
@@ -173,28 +160,27 @@ def compute_reward(
             geo_info._get_antenna_train_angle(ownship_state, target_state, False)))
         a2 = abs(float(
             geo_info._get_antenna_train_angle(target_state, ownship_state, False)))
-        # StateIndex.ALT 는 meter → ft 로 환산(고도 안전 항 입력).
-        own_alt_ft = float(ownship_state[StateIndex.ALT]) / _FT_TO_M
-        cur_x = _shaping_potential(dist_ft, a1, a2, own_alt_ft)
+        cur_x = _shaping_potential(dist_ft, a1, a2)
         if not new_episode:
             r_shaping = (cur_x - _prev_x) * shaping_scale
         _prev_x = cur_x
     _prev_sim_time = cur_sim_time
 
-    # [종료] 3분리: (1) HP 승/패  (2) 내 고도 하락 -20  (3) 상대 고도 하락 +5
+    # [종료] (1) HP 승/패(=0)  (2) 고도이탈 = 남은 HP 전량 상실/소멸(±hp*damage_scale).
     r_terminal = 0.0
     if terminated:
+        dmg_scale = float(reward_config["damage_scale"])
         # (1) HP 로 승부가 난 경우
         if tgt_hp <= 0.0:
             r_terminal += float(reward_config["win_reward"])
         if own_hp <= 0.0:
             r_terminal += float(reward_config["loss_reward"])
-        # (2) 내 고도가 최소고도 이하로 떨어져 종료 → -20
+        # (2) 내 고도이탈 종료 → 내 남은 HP 전량을 한 번에 잃은 것과 동일: -(own_hp)*damage_scale
         if end_condition == _OWNSHIP_ALT_END:
-            r_terminal += float(reward_config["ownship_alt_reward"])
-        # (3) 상대 고도가 최소고도 이하로 떨어져 종료 → +5
+            r_terminal += -max(0.0, own_hp) * dmg_scale
+        # (3) 상대 고도이탈 종료 → 상대 남은 HP 전량 소멸과 동일: +(tgt_hp)*damage_scale
         if end_condition == _TARGET_ALT_END:
-            r_terminal += float(reward_config["target_alt_reward"])
+            r_terminal += max(0.0, tgt_hp) * dmg_scale
 
     total = r_damage + r_shaping + r_terminal
     return float(total), {"damage": r_damage, "shaping": r_shaping,

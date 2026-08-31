@@ -48,8 +48,13 @@ def remap_state_dict(cuda_sd: dict, num_hidden: int) -> dict:
       actor_logits.*   -> actor_logits.{2L}.*   (단독 head → Sequential 끝)
       critic_body.k.*  -> critic.k.*
       critic_head.*    -> critic.{2L}.*
-    """
+
+    critic 이 상대-행동 extra(critic_extra_dim>0)로 학습된 경우 critic_body.0.weight 의
+    입력폭이 obs_dim+extra 라 제출용 critic(입력=obs_dim)과 안 맞는다. 추론(제출)에서는
+    critic 을 전혀 쓰지 않으므로, 이 첫 critic 레이어의 extra 입력열을 잘라 obs_dim 폭으로
+    맞춘다(actor 는 obs_dim 그대로라 영향 없음)."""
     head_idx = 2 * num_hidden
+    obs_dim = int(cuda_sd["actor_body.0.weight"].shape[1])   # actor 입력폭 = 진짜 obs_dim
     out: dict = {}
     for k, v in cuda_sd.items():
         if k.startswith("actor_body."):
@@ -57,6 +62,8 @@ def remap_state_dict(cuda_sd: dict, num_hidden: int) -> dict:
         elif k.startswith("actor_logits."):          # 단독 head(weight/bias)
             out[f"actor_logits.{head_idx}." + k[len("actor_logits."):]] = v
         elif k.startswith("critic_body."):
+            if k == "critic_body.0.weight" and v.shape[1] > obs_dim:
+                v = v[:, :obs_dim].contiguous()      # critic extra 입력열 제거(추론 미사용)
             out["critic." + k[len("critic_body."):]] = v
         elif k.startswith("critic_head."):
             out[f"critic.{head_idx}." + k[len("critic_head."):]] = v
