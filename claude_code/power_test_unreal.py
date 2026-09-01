@@ -202,8 +202,10 @@ def _make_worker_cls():
 def parse_args():
     p = argparse.ArgumentParser(
         description="RL 번들 vs unreal_bt_client.exe 파워 테스트(리플레이 없음)")
-    p.add_argument("--ownship-bundle-dir", default="",
-                   help="RL(ownship) claude 번들 경로 (--ownship-gylee 면 생략 가능)")
+    p.add_argument("--ownship-bundle-dir",
+                   default=str(ROOT / "artifacts" / "models" / "team01" / "basic2"),
+                   help="RL(ownship) claude 번들 경로 (--ownship-gylee 면 생략 가능). "
+                        "기본 basic2 = 현재 모델 구조(obs 214, accel+aux)로 학습한 번들")
     p.add_argument("--deterministic", action="store_true",
                    help="RL action 을 정책 분포 샘플링 대신 argmax(deterministic)로 결정. "
                         "기본은 학습과 동일한 stochastic 샘플링")

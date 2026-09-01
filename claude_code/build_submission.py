@@ -26,7 +26,8 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 SRC = ROOT / "src"
 MPC_ROOT = ROOT / "Release_MPC_team_share"
-BASIC_BUNDLE = ROOT / "artifacts" / "models" / "team01" / "basic"
+# 기본 ownship 번들 = basic2(현재 모델 구조: obs 214, accel+aux 로 학습). --bundle-dir 로 교체 가능.
+DEFAULT_BUNDLE = ROOT / "artifacts" / "models" / "team01" / "basic2"
 ENTRY = ROOT / "claude_code" / "submission_client.py"
 APP_NAME = "DogfightSubmission"
 
@@ -123,7 +124,7 @@ def _run_pyinstaller(work: Path, dist: Path) -> Path:
     return app_dir
 
 
-def _assemble(app_dir: Path, cfg: dict) -> None:
+def _assemble(app_dir: Path, cfg: dict, bundle_dir: Path) -> None:
     # config.json
     (app_dir / "config.json").write_text(
         json.dumps(cfg, indent=2, ensure_ascii=False), encoding="utf-8")
@@ -131,8 +132,8 @@ def _assemble(app_dir: Path, cfg: dict) -> None:
     dst_model = app_dir / "model"
     if dst_model.exists():
         shutil.rmtree(dst_model)
-    shutil.copytree(BASIC_BUNDLE, dst_model)
-    print(f"  + model/ ({BASIC_BUNDLE.name})")
+    shutil.copytree(bundle_dir, dst_model)
+    print(f"  + model/ ({bundle_dir.name})")
     # altguard/altblend MPC 자원(폴더 통째로: predictor DLL + f16 에셋 + configs)
     if cfg["mode"] in ("altguard", "altblend"):
         dst_mpc = app_dir / "Release_MPC_team_share"
@@ -156,14 +157,17 @@ def _zip(app_dir: Path, out_zip: Path) -> None:
 def main() -> None:
     ap = argparse.ArgumentParser(description="제출 exe/zip 빌더")
     ap.add_argument("--mode", choices=["altguard", "altblend", "basic"], default="altguard")
+    ap.add_argument("--bundle-dir", default=str(DEFAULT_BUNDLE),
+                    help="ownship 번들 경로(기본 basic2 = 현재 모델 구조 obs 214)")
     ap.add_argument("--team-name", default="team01")
     ap.add_argument("--server-ip", default="221.151.77.208")
     ap.add_argument("--server-port", type=int, default=9999)
     ap.add_argument("--out", default=None, help="출력 루트(기본 dist/submission_<mode>)")
     args = ap.parse_args()
 
-    if not BASIC_BUNDLE.exists():
-        raise FileNotFoundError(f"basic 번들 없음: {BASIC_BUNDLE}")
+    bundle_dir = Path(args.bundle_dir).resolve()
+    if not bundle_dir.exists():
+        raise FileNotFoundError(f"ownship 번들 없음: {bundle_dir}")
     if args.mode in ("altguard", "altblend") and not MPC_ROOT.exists():
         raise FileNotFoundError(f"MPC 자원 폴더 없음: {MPC_ROOT}")
 
@@ -181,7 +185,7 @@ def main() -> None:
           f"server={args.server_ip}:{args.server_port} ===")
 
     app_dir = _run_pyinstaller(work, dist)
-    _assemble(app_dir, cfg)
+    _assemble(app_dir, cfg, bundle_dir)
 
     # onedir 를 out_root/DogfightSubmission 로 옮겨 최종 정리
     final_app = out_root / APP_NAME

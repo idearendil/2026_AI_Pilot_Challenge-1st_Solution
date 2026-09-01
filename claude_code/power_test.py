@@ -25,6 +25,12 @@
     --target-backend gylee --games 100
   (다른 snapshot 을 붙이려면 --target-gylee-snapshot <경로>, stochastic 상대면
    --target-gylee-explore. 내 모델(ownship)은 항상 stochastic.)
+
+예시 (내 rl 모델 vs Stable_MPC_team_share safe MPC, 100판):
+  python claude_code/power_test.py \
+    --ownship-backend rl --ownship-bundle-dir artifacts/models/team01/basic2 \
+    --target-backend mpc --games 100
+  (다른 MPC 폴더/설정은 --target-mpc-root/--target-mpc-config/--target-safety-config.)
 """
 from __future__ import annotations
 
@@ -244,6 +250,16 @@ def _make_worker_cls():
                     device="cpu", explore=bool(spec["gylee_explore"]),
                     verify_checksum=False)
                 self.env._target_action_provider = self.tgt_provider
+            elif spec["target_backend"] == "mpc":
+                # Stable_MPC_team_share safe MPC(네이티브 predictor, 60Hz). env 가 매 substep
+                # 호출을 넘겨주고 provider 내부에서 pqr·시간·action_repeat(10Hz replan)를 맞춘다
+                # (대회 SafeMPCCommandPolicy 와 동일). env 관측 모듈과 무관(자체 state 규약).
+                from claude_code.stable_mpc_provider import StableMPCProvider
+                self.tgt_provider = StableMPCProvider(
+                    spec["mpc_root"],
+                    mpc_config_path=(spec["mpc_config"] or None),
+                    safety_config_path=(spec["mpc_safety_config"] or None))
+                self.env._target_action_provider = self.tgt_provider
 
         def play(self, jobs):
             import torch
@@ -298,9 +314,10 @@ def parse_args():
                    help="ownship 종류. altguard = 평상시 basic 번들(10Hz stochastic) + 고도 "
                         "임계값 이하에서 team-share MPC(60Hz) 로 자동 전환하는 복합 에이전트")
     p.add_argument("--target-backend",
-                   choices=["rl", "bt", "gylee", "loiter", "fixed", "autopilot"],
+                   choices=["rl", "bt", "gylee", "mpc", "loiter", "fixed", "autopilot"],
                    default="bt",
-                   help="상대 종류. gylee = 팀원 model2_gylee 패키지의 고정 opponent(47D·19bin)")
+                   help="상대 종류. gylee = 팀원 model2_gylee 패키지의 고정 opponent(47D·19bin). "
+                        "mpc = Stable_MPC_team_share safe MPC(네이티브 F-16 predictor, 60Hz)")
     p.add_argument("--ownship-bundle-dir", help="ownship rl 일 때 claude 번들 경로")
     p.add_argument("--target-bundle-dir", help="target rl 일 때 claude 번들 경로")
     p.add_argument("--target-rl-deterministic", action="store_true",
@@ -315,6 +332,13 @@ def parse_args():
     p.add_argument("--target-gylee-explore", action="store_true",
                    help="gylee opponent 를 stochastic(sample)으로. 기본은 deterministic(argmax) "
                         "— 고정 비교 상대로는 결정론이 해석하기 쉬움(model card §6).")
+    # ── target = Stable_MPC_team_share safe MPC ──
+    p.add_argument("--target-mpc-root", default=str(ROOT / "Stable_MPC_team_share"),
+                   help="mpc 상대가 쓸 team-share safe MPC 폴더(기본 Stable_MPC_team_share)")
+    p.add_argument("--target-mpc-config", default="",
+                   help="mpc 상대 MPC config yaml(생략 시 <mpc-root>/configs/mpc.yaml)")
+    p.add_argument("--target-safety-config", default="",
+                   help="mpc 상대 safety config yaml(생략 시 <mpc-root>/configs/safe_mpc.yaml)")
     p.add_argument("--ownship-bt-dll", default=_DEF_OWNSHIP_BT)
     p.add_argument("--target-bt-dll", default=_DEF_TARGET_BT)
     # ── altguard(고도 안전망) ownship 옵션 ──
@@ -375,6 +399,13 @@ def main():
     if args.target_backend == "gylee" and not Path(args.target_gylee_snapshot).is_file():
         raise ValueError(
             f"--target-backend gylee 의 snapshot 을 찾을 수 없습니다: {args.target_gylee_snapshot}")
+    if args.target_backend == "mpc":
+        if not Path(args.target_mpc_root).is_dir():
+            raise ValueError(f"--target-backend mpc 의 MPC 폴더를 찾을 수 없습니다: {args.target_mpc_root}")
+        for _lbl, _p in (("--target-mpc-config", args.target_mpc_config),
+                         ("--target-safety-config", args.target_safety_config)):
+            if _p and not Path(_p).is_file():
+                raise ValueError(f"{_lbl} 파일을 찾을 수 없습니다: {_p}")
 
     # 관측 모듈: env 는 하나뿐이라 양쪽 rl 번들이 같은 모듈을 써야 한다.
     from claude_code.model import load_bundle
@@ -392,7 +423,7 @@ def main():
     obs_module = next(iter(obs_modules.values()), "")
 
     # provider 로 조종하는 상대(rl / bt-provider)는 env 가 자체 AI 를 만들지 않도록 fixed.
-    provider_target = (args.target_backend in ("rl", "gylee")
+    provider_target = (args.target_backend in ("rl", "gylee", "mpc")
                        or (args.target_backend == "bt"
                            and args.target_bt_mode == "provider"))
     overrides = {
@@ -436,6 +467,8 @@ def main():
     elif args.target_backend == "gylee":
         tgt_desc = (f"gylee({Path(args.target_gylee_snapshot).name}, "
                     f"{'stochastic' if args.target_gylee_explore else 'deterministic'})")
+    elif args.target_backend == "mpc":
+        tgt_desc = f"stable-mpc({Path(args.target_mpc_root).name}, safe MPC 60Hz)"
     else:
         tgt_desc = args.target_backend
     print(f"[power_test] ownship = {own_desc}")
@@ -467,6 +500,9 @@ def main():
         "bt_rule": args.bt_rule_xml,
         "gylee_snapshot": args.target_gylee_snapshot,
         "gylee_explore": args.target_gylee_explore,
+        "mpc_root": str(args.target_mpc_root),
+        "mpc_config": str(args.target_mpc_config),
+        "mpc_safety_config": str(args.target_safety_config),
         "target_rl_explore": (not args.target_rl_deterministic),
         "target_rl_high_rate": bool(args.target_rl_high_rate),
         "altguard_mpc_root": str(args.ownship_mpc_root),
