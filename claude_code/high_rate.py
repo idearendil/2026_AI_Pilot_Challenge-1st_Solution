@@ -50,6 +50,11 @@ class HighRateProvider(ActionProvider):
         self.source = source
         # 에피소드 첫 관측은 advance 없이 fresh recon(GPU 학습 reset→build 규약).
         self._first_boundary = True
+        # LSTM(recurrent) 정책이면 hidden 을 보관한다. **매 substep(60Hz) 재결정**하되 hidden 은
+        # **STEP_RATIO 경계(10Hz = 학습 recurrent 주기)에서만 commit** 한다(그 사이엔 직전
+        # committed hidden 을 입력으로 fresh 기하 반응만 얻음). episode 마다 리셋(0).
+        self._is_lstm = hasattr(self.model, "init_hidden")
+        self._hidden = None
 
     def reset(self, context: ActionContext | None = None) -> None:
         if self.recon is not None:
@@ -57,6 +62,7 @@ class HighRateProvider(ActionProvider):
         self.q.clear()
         self._sub = 0
         self._first_boundary = True
+        self._hidden = None
 
     def _subsampled_history(self) -> np.ndarray:
         """60Hz 큐 → 0.1s(STEP_RATIO) 간격 K 개(row0=가장 최근=STEP substep 전). 부족분 0 패딩."""
@@ -93,7 +99,15 @@ class HighRateProvider(ActionProvider):
         obs_t = torch.as_tensor(self._normalize(obs), dtype=torch.float32,
                                 device=self.device).unsqueeze(0)
         with torch.no_grad():
-            if self.explore:
+            if self._is_lstm:
+                if self._hidden is None:
+                    self._hidden = self.model.init_hidden(1, self.device)
+                act_fn = self.model.act_stochastic if self.explore else self.model.act_deterministic
+                idx, new_h = act_fn(obs_t, self._hidden)
+                if self._sub % self.step == 0:      # 10Hz 경계에서만 hidden 전진(학습 주기)
+                    self._hidden = new_h
+                raw = idx.squeeze(0).cpu().numpy()
+            elif self.explore:
                 if hasattr(self.model, "act_stochastic"):
                     raw = self.model.act_stochastic(obs_t)
                 else:

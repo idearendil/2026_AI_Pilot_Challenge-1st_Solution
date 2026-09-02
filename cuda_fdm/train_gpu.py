@@ -32,13 +32,17 @@ def main():
                          "미니배치 크기가 아님. 클수록 mb 작아지고 step 많아짐")
     ap.add_argument("--lr", type=float, default=3e-4)
     ap.add_argument("--critic-lr", type=float, default=None)
-    ap.add_argument("--gamma", type=float, default=0.997)
+    ap.add_argument("--gamma", type=float, default=0.995)
     ap.add_argument("--gae-lambda", type=float, default=0.95)
     ap.add_argument("--clip", type=float, default=0.2)
     ap.add_argument("--ent-coef", type=float, default=0.005)
     ap.add_argument("--target-kl", type=float, default=0.03)
     ap.add_argument("--no-norm-obs", action="store_true")
     ap.add_argument("--num-bins", type=int, default=21, help="채널별 discrete 행동 격자 수(원본 train.py 기본=21)")
+    ap.add_argument("--lstm-hidden", type=int, default=512,
+                    help="actor/critic LSTM trunk 차원(기본 512)")
+    ap.add_argument("--lstm-layers", type=int, default=3,
+                    help="actor/critic LSTM 층 수(단방향/시간순, 기본 3)")
     # ── iteration 스케줄 (sched-period iter 마다 단계 상승) ──
     ap.add_argument("--sched-period", type=int, default=2000,
                     help="이 iter 수마다 단계 k↑: lr·ent-coef ×= 각 decay, rollout += increment (0이면 비활성)")
@@ -100,6 +104,7 @@ def main():
         update_epochs=args.epochs, num_minibatches=args.minibatches,
         lr=args.lr, critic_lr=args.critic_lr, ent_coef=args.ent_coef,
         target_kl=args.target_kl, normalize_obs=not args.no_norm_obs, num_bins=args.num_bins,
+        lstm_hidden=args.lstm_hidden, lstm_layers=args.lstm_layers,
         sched_period=args.sched_period, sched_lr_decay=args.sched_lr_decay,
         sched_ent_decay=args.sched_ent_decay, sched_rollout_increment=args.sched_rollout_increment,
         pool_evict_cap=args.pool_evict_cap, selfplay_gate_threshold=args.selfplay_gate_threshold,

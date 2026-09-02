@@ -35,43 +35,25 @@ for _p in (ROOT, ROOT / "src"):
     if str(_p) not in sys.path:
         sys.path.insert(0, str(_p))
 
-from claude_code.model import make_actor_critic, save_bundle
+from claude_code.model import make_lstm_actor, save_bundle
 
 
-def remap_state_dict(cuda_sd: dict, num_hidden: int) -> dict:
-    """CUDA ActorCritic state_dict → MLPDiscreteActorCritic 키로 변환(값·shape 불변).
+def remap_state_dict(cuda_sd: dict) -> dict:
+    """CUDA ActorCritic(LSTM) state_dict → 추론용 LSTMDiscreteActor 키로 변환(값·shape 불변).
 
-    CUDA body Sequential 의 Linear 는 index 0,2,..,2(L-1) 에 있고, 출력 Linear 는
-    별도 attribute(actor_logits/critic_head). 제출용은 출력층이 같은 Sequential 의
-    index 2L 에 온다. → body 는 prefix 만 교체, head 는 index 2L 로 이동.
-      actor_body.k.*   -> actor_logits.k.*      (k 그대로)
-      actor_logits.*   -> actor_logits.{2L}.*   (단독 head → Sequential 끝)
-      critic_body.k.*  -> critic.k.*
-      critic_head.*    -> critic.{2L}.*
-
-    critic 이 상대-행동 extra(critic_extra_dim>0)로 학습된 경우 critic_body.0.weight 의
-    입력폭이 obs_dim+extra 라 제출용 critic(입력=obs_dim)과 안 맞는다. 추론(제출)에서는
-    critic 을 전혀 쓰지 않으므로, 이 첫 critic 레이어의 extra 입력열을 잘라 obs_dim 폭으로
-    맞춘다(actor 는 obs_dim 그대로라 영향 없음)."""
-    head_idx = 2 * num_hidden
-    obs_dim = int(cuda_sd["actor_body.0.weight"].shape[1])   # actor 입력폭 = 진짜 obs_dim
+    두 모듈은 actor trunk 파라미터 이름이 **완전히 동일**하다(`actor_lstm.*`, `actor_logits.*`).
+    critic(critic_lstm/critic_head)·aux head(actor_aux_head/critic_aux_head)는 추론(제출)에서
+    전혀 안 쓰므로 버린다. → actor_lstm.*/actor_logits.* 만 그대로 복사한다."""
     out: dict = {}
     for k, v in cuda_sd.items():
-        if k.startswith("actor_aux_head.") or k.startswith("critic_aux_head."):
-            continue                                 # aux 미래위치 예측 head: 추론(제출) 미사용
-        if k.startswith("actor_body."):
-            out["actor_logits." + k[len("actor_body."):]] = v
-        elif k.startswith("actor_logits."):          # 단독 head(weight/bias)
-            out[f"actor_logits.{head_idx}." + k[len("actor_logits."):]] = v
-        elif k.startswith("critic_body."):
-            if k == "critic_body.0.weight" and v.shape[1] > obs_dim:
-                v = v[:, :obs_dim].contiguous()      # critic extra 입력열 제거(추론 미사용)
-            out["critic." + k[len("critic_body."):]] = v
-        elif k.startswith("critic_head."):
-            out[f"critic.{head_idx}." + k[len("critic_head."):]] = v
+        if k.startswith("actor_lstm.") or k.startswith("actor_logits."):
+            out[k] = v
+        elif (k.startswith("critic_lstm.") or k.startswith("critic_head.")
+              or k.startswith("actor_aux_head.") or k.startswith("critic_aux_head.")):
+            continue                                 # critic·aux: 추론(제출) 미사용 → 버림
         else:
-            raise KeyError(f"예상치 못한 CUDA state_dict 키: {k!r} "
-                           f"(actor_body/actor_logits/critic_body/critic_head 만 지원)")
+            raise KeyError(f"예상치 못한 CUDA state_dict 키: {k!r} (actor_lstm/actor_logits/"
+                           "critic_lstm/critic_head/*_aux_head 만 지원)")
     return out
 
 
@@ -129,17 +111,20 @@ def main():
     cuda_sd = ckpt["model"]
     cfg = ckpt.get("cfg", {}) or {}
 
-    # 구조 파라미터: cfg 우선, obs_dim/act_dim 은 가중치 shape 에서 역산(신뢰 가능).
-    hidden = tuple(cfg.get("hidden", (256, 256)))
-    activation = cfg.get("activation", "tanh")
+    # 구조 파라미터: obs_dim/act_dim/num_bins/lstm 은 가중치 shape 에서 역산(신뢰 가능).
+    #   actor_lstm.weight_ih_l0: (4*H, obs_dim)  → obs_dim = shape[1], H = shape[0]//4
+    #   actor_logits.weight:     (act_dim*num_bins, H)
+    #   lstm_layers = weight_ih_l{k} 개수
+    obs_dim = int(cuda_sd["actor_lstm.weight_ih_l0"].shape[1])
+    lstm_hidden = int(cuda_sd["actor_lstm.weight_ih_l0"].shape[0] // 4)
+    lstm_layers = sum(1 for k in cuda_sd if k.startswith("actor_lstm.weight_ih_l"))
     num_bins = int(cfg.get("num_bins", cuda_sd["actor_logits.weight"].shape[0] // 4))
-    obs_dim = int(cuda_sd["actor_body.0.weight"].shape[1])
     act_dim = int(cuda_sd["actor_logits.weight"].shape[0] // num_bins)
 
-    remapped = remap_state_dict(cuda_sd, num_hidden=len(hidden))
+    remapped = remap_state_dict(cuda_sd)
 
-    model = make_actor_critic(obs_dim=obs_dim, act_dim=act_dim, num_bins=num_bins,
-                              hidden=hidden, activation=activation)
+    model = make_lstm_actor(obs_dim=obs_dim, act_dim=act_dim, num_bins=num_bins,
+                            lstm_hidden=lstm_hidden, lstm_layers=lstm_layers)
     model.load_state_dict(remapped, strict=True)   # strict → 키/shape 완전 일치 검증(불일치 시 예외)
     model.eval()
 
@@ -162,7 +147,7 @@ def main():
     print(f"[gpu_ckpt_to_bundle] iter {it} → 번들 저장 완료: {out}")
     print(f"  - from: {ckpt_path}")
     print(f"  - obs_size={obs_dim} act={act_dim} num_bins={num_bins} "
-          f"hidden={hidden} act_fn={activation} obs_norm={'yes' if obs_norm else 'no'}")
+          f"lstm={lstm_layers}x{lstm_hidden} obs_norm={'yes' if obs_norm else 'no'}")
     print(f"  - observation_mode={obs_mode}")
     print("  - metadata.json / policy_weights.pkl.gz")
 

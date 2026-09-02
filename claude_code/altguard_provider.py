@@ -106,6 +106,10 @@ class AltGuardMPCProvider(ActionProvider):
         self._cached = np.array([0.0, 0.0, 0.0, 1.0], dtype=np.float32)
         # 에피소드 첫 관측은 advance 없이 fresh recon(GPU 학습 reset→build 규약).
         self._first_boundary = True
+        # LSTM(recurrent) basic 정책이면 hidden 을 보관하며 episode 마다 리셋. basic 이 실제로
+        # 결정하는 boundary(10Hz)에서만 hidden 이 전진한다(MPC 제어 구간엔 정지 — 복귀 시 이어감).
+        self._is_lstm = hasattr(self.model, "init_hidden")
+        self._hidden = None
 
     # ---------------------------------------------------------------- helpers
     def _basic_command(self, own: np.ndarray, tgt: np.ndarray) -> np.ndarray:
@@ -115,7 +119,13 @@ class AltGuardMPCProvider(ActionProvider):
         obs_t = torch.as_tensor(obs, dtype=torch.float32, device=self.device).unsqueeze(0)
         with torch.no_grad():
             act_fn = self.model.act_stochastic if self.stochastic else self.model.act_deterministic
-            raw = act_fn(obs_t).squeeze(0).cpu().numpy()
+            if self._is_lstm:
+                if self._hidden is None:
+                    self._hidden = self.model.init_hidden(1, self.device)
+                raw, self._hidden = act_fn(obs_t, self._hidden)
+                raw = raw.squeeze(0).cpu().numpy()
+            else:
+                raw = act_fn(obs_t).squeeze(0).cpu().numpy()
         if hasattr(self.model, "num_bins"):
             raw = self._to_cont(raw, self.model.num_bins)
         raw = np.asarray(raw, dtype=np.float64).reshape(-1)[:4]
@@ -149,6 +159,7 @@ class AltGuardMPCProvider(ActionProvider):
         self._mode = "basic"
         self._cached = np.array([0.0, 0.0, 0.0, 1.0], dtype=np.float32)
         self._first_boundary = True
+        self._hidden = None
 
     def compute_action(self, context: ActionContext) -> ActionResult:
         own = np.asarray(context.ownship_state, dtype=np.float64)
