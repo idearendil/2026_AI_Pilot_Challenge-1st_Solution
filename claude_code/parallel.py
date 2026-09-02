@@ -466,6 +466,11 @@ def _make_worker_cls():
                     if self._reset_recon is not None:
                         self._reset_recon()
                     next_obs, _ = self.env.reset()
+                    # 에피소드 첫 관측은 GPU 학습과 동일하게 fresh recon(advance 안 함).
+                # 0-lag: 이번 step advance 뒤 관측을 다시 만든다(reconstruct 사용 시). done 이면
+                # 위 reset 된 fresh recon 으로 obs(0) 를 만든다(= env.reset 관측과 동일).
+                if self._advance_recon is not None:
+                    next_obs = self.env.get_observation()
                 self._next_obs = np.asarray(next_obs, dtype=np.float32)
                 self._next_done = done
 

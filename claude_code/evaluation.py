@@ -95,6 +95,7 @@ def play_games(env, model, cur_rms_mean, cur_rms_var, seeds, stochastic: bool,
         o, _ = env.reset(seed=int(seed))
         if reconstruct:
             reset_reconstructor()
+        # 에피소드 첫 관측은 GPU 학습과 동일하게 fresh recon(advance 안 함).
         done, ret, steps, terminal = False, 0.0, 0, 0.0
         own_hp, tgt_hp = 1.0, 1.0
         while not done:
@@ -113,6 +114,7 @@ def play_games(env, model, cur_rms_mean, cur_rms_var, seeds, stochastic: bool,
             o, r, term, trunc, info = env.step(env_a)
             if reconstruct:
                 advance_reconstructor(env._ownship_state, env._target_state)
+                o = env.get_observation()   # 0-lag: advance 뒤 관측 재빌드
             ret += float(r)
             steps += 1
             done = bool(term or trunc)

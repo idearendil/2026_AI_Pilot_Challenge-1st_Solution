@@ -232,6 +232,7 @@ class PPOTrainer:
         obs, _ = env.reset(seed=config.seed)
         if self._reset_recon is not None:
             self._reset_recon()
+        # 에피소드 첫 관측은 GPU 학습(kernel: reset→build, advance 없음)과 동일하게 fresh recon.
         self._next_obs = np.asarray(obs, dtype=np.float32)
         self._next_done = False
         self._ep_return = 0.0
@@ -286,8 +287,10 @@ class PPOTrainer:
                 self._push_action(env_action)
             next_obs, reward, terminated, truncated, info = self.env.step(env_action)
             done = bool(terminated or truncated)
-            # HP 재구성 갱신: 이번 RL-step 결과 state 로 1회 advance (obs 는 step 안에서
-            # advance 전 HP 를 읽었으므로 추론 경로와 동일한 1-step lag).
+            # HP 재구성 갱신: 이번 RL-step 결과 state 로 1회 advance. advance 후 관측을 다시
+            # 빌드해(아래) 이번 step 의 pqr/accel/HP 를 반영한다 = 0-lag. 배포 MLPActionProvider·
+            # self-play opponent·altguard 모두 0-lag 라, learner 도 같은 시점의 관측으로 학습해야
+            # train/deploy 및 상대와 관측 규약이 일치한다.
             if self._advance_recon is not None:
                 self._advance_recon(self.env._ownship_state, self.env._target_state)
             self.global_step += 1
@@ -314,7 +317,12 @@ class PPOTrainer:
                 if self._reset_recon is not None:
                     self._reset_recon()
                 next_obs, _ = self.env.reset()
+                # 에피소드 첫 관측은 GPU 학습과 동일하게 fresh recon(advance 안 함).
 
+            # 0-lag: 이번 step advance 뒤 관측을 다시 만든다(reconstruct 사용 시). done 이면 위에서
+            # reset 된 fresh recon 으로 obs(0) 를 만든다(= env.reset 관측과 동일).
+            if self._advance_recon is not None:
+                next_obs = self.env.get_observation()
             self._next_obs = np.asarray(next_obs, dtype=np.float32)
             self._next_done = done
 

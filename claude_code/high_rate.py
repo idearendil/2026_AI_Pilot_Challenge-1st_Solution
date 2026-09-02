@@ -48,12 +48,15 @@ class HighRateProvider(ActionProvider):
         self.q: deque = deque(maxlen=self.K * self.step)   # 60Hz raw-action 큐
         self._sub = 0
         self.source = source
+        # 에피소드 첫 관측은 advance 없이 fresh recon(GPU 학습 reset→build 규약).
+        self._first_boundary = True
 
     def reset(self, context: ActionContext | None = None) -> None:
         if self.recon is not None:
             self.recon.reset()
         self.q.clear()
         self._sub = 0
+        self._first_boundary = True
 
     def _subsampled_history(self) -> np.ndarray:
         """60Hz 큐 → 0.1s(STEP_RATIO) 간격 K 개(row0=가장 최근=STEP substep 전). 부족분 0 패딩."""
@@ -78,8 +81,11 @@ class HighRateProvider(ActionProvider):
         own = np.asarray(context.ownship_state, dtype=np.float64)
         opp = np.asarray(context.target_state, dtype=np.float64)
         # pqr/HP/time 등은 0.1s(STEP_RATIO) 주기로만 advance(학습과 동일 dt·간격).
+        # 에피소드 첫 boundary 는 advance 스킵(fresh recon, GPU 학습 reset 규약).
         if self.recon is not None and self._sub % self.step == 0:
-            self.recon.advance(own, opp)
+            if not self._first_boundary:
+                self.recon.advance(own, opp)
+            self._first_boundary = False
         # action history 는 60Hz 큐를 0.1s 간격으로 subsample 해 매 substep 주입.
         if self.uses_hist and self.recon is not None:
             self.recon.action_history = self._subsampled_history()

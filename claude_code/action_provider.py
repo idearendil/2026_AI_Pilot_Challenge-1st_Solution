@@ -42,10 +42,16 @@ class MLPActionProvider(ActionProvider):
         self._reconstruct = self.metadata.get("observation_module") == "claude_code.my_observation"
         if self._reconstruct:
             from claude_code.my_observation import (reset_reconstructor, advance_reconstructor,
-                                                    push_action_reconstructor)
+                                                    push_action_reconstructor, build_observation)
+            from GeoMathUtil import GeometryInfo
             self._reset_recon = reset_reconstructor
             self._advance_recon = advance_reconstructor
             self._push_action = push_action_reconstructor
+            # 0-lag 관측을 직접 빌드하기 위한 함수/기하 헬퍼(전역 _RECON 을 읽는다).
+            self._build_observation = build_observation
+            self._geo = GeometryInfo()
+            # 에피소드 첫 관측은 GPU 학습과 동일하게 advance 없이 fresh recon 으로 빌드한다.
+            self._first_recon_call = True
 
         # ── 진단 로깅 ─────────────────────────────────────────────────────────
         # 서버 관측 규약(속도 좌표계·각도 단위·단위계)이 학습과 맞는지 첫 프레임들에서
@@ -66,6 +72,7 @@ class MLPActionProvider(ActionProvider):
         # MLP 정책은 recurrent state 가 없으므로 reset 시 별도 처리 불필요.
         if self._reconstruct:
             self._reset_recon()
+            self._first_recon_call = True
         if self._debug_obs:
             # reset 이 매 게임 시작마다 실제로 불리는지 확인용(안 불리면 t_sec 누적 → 규약 어긋남).
             print(f"[OBS_DEBUG] === reset() 호출됨 (게임 시작, reconstructor t_sec=0 으로 초기화) ===",
@@ -73,19 +80,29 @@ class MLPActionProvider(ActionProvider):
             self._dbg_n = 0
 
     def compute_action(self, context: ActionContext) -> ActionResult:
-        # HP/damage 재구성을 RL-step 당 1회 갱신 (관측 빌드 전에 호출되어도 1-step lag 로
-        # 학습 경로와 동일). context 에 양측 state 가 채워져 있을 때만.
+        # 0-lag: reconstruct 관측이면 이번 RL-step state 로 advance 한 뒤 관측을 **직접 빌드**한다.
+        # 호출부가 advance 전에 만들어 넘긴 context.observation 을 쓰면 pqr/accel/HP 가 1-step
+        # lag 되어, 0-lag 로 학습된 정책·self-play 상대와 관측 시점이 어긋난다. 양측 state 가 있을
+        # 때만(없으면 아래 context.observation 폴백). build_observation 은 전역 _RECON 을 읽는다.
         if (self._reconstruct and context.ownship_state is not None
                 and context.target_state is not None):
-            self._advance_recon(context.ownship_state, context.target_state)
-
-        observation = context.observation
-        if observation is None:
-            raise ValueError(
-                "MLPActionProvider 는 context.observation 이 필요합니다 "
-                "(ProviderCommandPolicy 가 tactical16 관측을 채워줍니다)."
-            )
-        obs = np.asarray(observation, dtype=np.float32).reshape(-1)
+            # 에피소드 첫 호출은 advance 없이 fresh recon 으로 빌드(GPU 학습 reset→build 규약).
+            # 이후는 매 스텝 advance→build = 0-lag. 학습(GPU/CPU)·self-play·altguard 와 동일.
+            if not self._first_recon_call:
+                self._advance_recon(context.ownship_state, context.target_state)
+            self._first_recon_call = False
+            obs = np.asarray(
+                self._build_observation(context.ownship_state, context.target_state,
+                                        self._geo, None),
+                dtype=np.float32).reshape(-1)
+        else:
+            observation = context.observation
+            if observation is None:
+                raise ValueError(
+                    "MLPActionProvider 는 context.observation 이 필요합니다 "
+                    "(ProviderCommandPolicy 가 tactical16 관측을 채워줍니다)."
+                )
+            obs = np.asarray(observation, dtype=np.float32).reshape(-1)
         if obs.shape[0] != self.obs_dim:
             raise ValueError(
                 f"관측 차원 불일치: got {obs.shape[0]}, expected {self.obs_dim}"

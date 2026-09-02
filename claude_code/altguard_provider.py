@@ -104,6 +104,8 @@ class AltGuardMPCProvider(ActionProvider):
         self._sub = 0                 # 에피소드 시작부터의 substep 카운터(=시간 격자)
         self._mode = "basic"
         self._cached = np.array([0.0, 0.0, 0.0, 1.0], dtype=np.float32)
+        # 에피소드 첫 관측은 advance 없이 fresh recon(GPU 학습 reset→build 규약).
+        self._first_boundary = True
 
     # ---------------------------------------------------------------- helpers
     def _basic_command(self, own: np.ndarray, tgt: np.ndarray) -> np.ndarray:
@@ -146,6 +148,7 @@ class AltGuardMPCProvider(ActionProvider):
         self._sub = 0
         self._mode = "basic"
         self._cached = np.array([0.0, 0.0, 0.0, 1.0], dtype=np.float32)
+        self._first_boundary = True
 
     def compute_action(self, context: ActionContext) -> ActionResult:
         own = np.asarray(context.ownship_state, dtype=np.float64)
@@ -161,7 +164,10 @@ class AltGuardMPCProvider(ActionProvider):
 
         if boundary:
             # RL-step 마다 1회: reconstructor 갱신(HP/pqr/시간) + 모드 판정.
-            self._rec.advance(own, tgt)
+            # 에피소드 첫 boundary 는 advance 스킵(fresh recon, GPU 학습 reset 규약).
+            if not self._first_boundary:
+                self._rec.advance(own, tgt)
+            self._first_boundary = False
             self._mode = "mpc" if alt_m <= self.thr_m else "basic"
             if self._mode == "mpc":
                 cmd = self._mpc_command(own, tgt, own_pqr_deg, tgt_pqr_deg, t)

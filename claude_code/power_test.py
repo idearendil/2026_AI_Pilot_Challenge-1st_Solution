@@ -236,6 +236,8 @@ def _make_worker_cls():
                     m, meta = load_bundle(spec["target_bundle_dir"], device="cpu")
                     rms = (RunningMeanStd.from_state_dict(meta["obs_normalization"])
                            if meta.get("obs_normalization") else None)
+                    # SelfPlayProvider 는 advance→build(0-lag). ownship(MLPActionProvider)·
+                    # 학습 learner 도 0-lag 이므로 같은 번들 mirror 가 공정하게 나온다.
                     self.tgt_provider = SelfPlayProvider(
                         m, rms, self.env._observation_fn, self.env._observation_mode,
                         self.step_ratio, "cpu", explore=tgt_explore)

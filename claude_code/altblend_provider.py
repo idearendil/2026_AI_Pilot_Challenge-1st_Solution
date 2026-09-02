@@ -97,6 +97,8 @@ class AltBlendMPCProvider(ActionProvider):
 
         self._sub = 0                 # 에피소드 시작부터의 substep 카운터(=시간 격자)
         self._actor_cmd = np.array([0.0, 0.0, 0.0, 1.0], dtype=np.float32)
+        # 에피소드 첫 관측은 advance 없이 fresh recon(GPU 학습 reset→build 규약).
+        self._first_boundary = True
 
     # ---------------------------------------------------------------- helpers
     def _mpc_weight(self, alt_m: float) -> float:
@@ -145,6 +147,7 @@ class AltBlendMPCProvider(ActionProvider):
         self._tgt_rates.reset()
         self._sub = 0
         self._actor_cmd = np.array([0.0, 0.0, 0.0, 1.0], dtype=np.float32)
+        self._first_boundary = True
 
     def compute_action(self, context: ActionContext) -> ActionResult:
         own = np.asarray(context.ownship_state, dtype=np.float64)
@@ -161,7 +164,10 @@ class AltBlendMPCProvider(ActionProvider):
 
         if boundary:
             # RL-step 마다 1회: reconstructor 갱신(HP/pqr/시간) + actor 재결정(캐시).
-            self._rec.advance(own, tgt)
+            # 에피소드 첫 boundary 는 advance 스킵(fresh recon, GPU 학습 reset 규약).
+            if not self._first_boundary:
+                self._rec.advance(own, tgt)
+            self._first_boundary = False
             self._actor_cmd = self._actor_command(own, tgt)
         actor_cmd = self._actor_cmd
 

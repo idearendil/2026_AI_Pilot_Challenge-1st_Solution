@@ -80,11 +80,14 @@ class SelfPlayProvider(ActionProvider):
         self._recon = StateReconstructor()
         self._count = 0
         self._cached: ActionResult | None = None
+        # 에피소드 첫 관측은 GPU 학습(reset→build, advance 없음)과 동일하게 fresh recon 으로.
+        self._first_call = True
 
     def reset(self, context: ActionContext | None = None) -> None:
         self._recon.reset()
         self._count = 0
         self._cached = None
+        self._first_call = True
 
     def _normalize(self, obs: np.ndarray) -> np.ndarray:
         if self.obs_rms is None:
@@ -93,9 +96,14 @@ class SelfPlayProvider(ActionProvider):
         return np.clip(n, -10.0, 10.0).astype(np.float32)
 
     def _build_obs(self, own, opp) -> np.ndarray:
-        # claude16 재구성 관측: 상대 관점 reconstructor 로 HP 누적 + 관측 생성
+        # claude16 재구성 관측: 상대 관점 reconstructor 로 HP 누적 + 관측 생성.
+        # advance → build 순서(0-lag): 이번 step 의 pqr/accel/HP 가 관측에 즉시 반영된다.
+        # 단 에피소드 첫 관측은 advance 없이 fresh recon(GPU 학습 reset→build 규약). 학습
+        # learner·배포 MLPActionProvider 와 동일한 0-lag 규약.
         if self.observation_fn is my_observation.build_observation:
-            self._recon.advance(own, opp)
+            if not self._first_call:
+                self._recon.advance(own, opp)
+            self._first_call = False
             return my_observation.build_observation(own, opp, self._geo, None,
                                                     reconstructor=self._recon)
         # 기타 custom 관측: 실제 state 값(학습 중엔 HP 등 존재)으로 생성
