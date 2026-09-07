@@ -128,111 +128,84 @@ def _mlp(inp, hidden, act):
     return nn.Sequential(*layers), last
 
 
-def _init_lstm(lstm):
-    """LSTM 파라미터 직교 초기화(weight) + bias 0. (recurrent 안정화)"""
-    for name, p in lstm.named_parameters():
-        if "weight" in name:
-            nn.init.orthogonal_(p, 1.0)
-        elif "bias" in name:
-            nn.init.zeros_(p)
-    return lstm
-
-
 class ActorCritic(nn.Module):
-    """분리형 actor/critic **단방향 다층 LSTM** 정책. actor=(act_dim×num_bins) 로짓 → 채널별
-    독립 Categorical. trunk 은 actor·critic 각각 nn.LSTM(obs→lstm_hidden, lstm_layers,
-    batch_first, bidirectional=False) 이라 정보가 **시간순으로만** 흐른다. head 는 LSTM 출력
-    (lstm_hidden)에서 바로 로짓/가치/aux 를 낸다.
+    """분리형 actor/critic MLP. actor=(act_dim×num_bins) 로짓 → 채널별 독립 Categorical.
+    claude_code.model.MLPDiscreteActorCritic 과 동일한 정책 구조.
 
-    hidden state 규약(중요): 모든 forward 는 **1-스텝** 입력 (B,obs) 과 hidden (h,c) 을 받아
-    (out, new_hidden) 을 돌려준다. 호출부(rollout/BPTT)가 episode 경계(done)에서 hidden 을 0
-    으로 리셋하고 시간순으로 이어붙인다. (nn.LSTM 은 입력 hidden 을 in-place 로 바꾸지 않는다.)
+    critic_extra_dim>0 이면 critic 만 관측(obs_dim) 뒤에 추가 입력(critic_extra_dim)을 더
+    받는다(actor 는 그대로 obs_dim). self-play 에서 critic 은 actor 가 볼 수 없는 정보(상대의
+    과거 action 등)를 관측해도 무방하므로, 상대 과거 5-step action(20dim)을 critic 에만 준다."""
 
-    critic_extra_dim>0 이면 critic LSTM 만 입력폭이 obs_dim+critic_extra_dim (상대 과거행동 등
-    actor 가 못 보는 정보). aux_dim>0 이면 actor/critic 각 trunk 출력에 미래위치 예측 head."""
-
-    def __init__(self, obs_dim, act_dim=4, num_bins=ACTION_BINS, lstm_hidden=512,
-                 lstm_layers=3, critic_extra_dim=0, aux_dim=0, **_ignored):
+    def __init__(self, obs_dim, act_dim=4, num_bins=ACTION_BINS, hidden=(256, 256),
+                 activation="tanh", critic_extra_dim=0, aux_dim=0):
         super().__init__()
         self.act_dim = act_dim
         self.num_bins = int(num_bins)
         self.critic_extra_dim = int(critic_extra_dim)
         self.aux_dim = int(aux_dim)
-        self.lstm_hidden = int(lstm_hidden)
-        self.lstm_layers = int(lstm_layers)
-        H, L = self.lstm_hidden, self.lstm_layers
-        self.actor_lstm = _init_lstm(nn.LSTM(obs_dim, H, L, batch_first=True))
-        self.actor_logits = _layer_init(nn.Linear(H, act_dim * self.num_bins), gain=0.01)
-        self.critic_lstm = _init_lstm(nn.LSTM(obs_dim + self.critic_extra_dim, H, L,
-                                              batch_first=True))
-        self.critic_head = _layer_init(nn.Linear(H, 1), gain=1.0)
-        # aux 미래위치 예측 head(선택). 제출 시 actor aux head 는 미사용(번들 변환에서 잘라냄),
-        # critic 은 추론에서 아예 미사용.
+        self.actor_body, ah = _mlp(obs_dim, hidden, activation)
+        self.actor_logits = _layer_init(nn.Linear(ah, act_dim * self.num_bins), gain=0.01)
+        self.critic_body, ch = _mlp(obs_dim + self.critic_extra_dim, hidden, activation)
+        self.critic_head = _layer_init(nn.Linear(ch, 1), gain=1.0)
+        # aux 미래위치 예측 head(선택). actor/critic trunk 을 공유해 표현학습(제출 시 actor
+        # aux head 는 사용 안 함 → 번들 변환에서 잘라냄). critic 은 추론에서 아예 미사용.
         if self.aux_dim > 0:
-            self.actor_aux_head = _layer_init(nn.Linear(H, self.aux_dim), gain=0.01)
-            self.critic_aux_head = _layer_init(nn.Linear(H, self.aux_dim), gain=0.01)
+            self.actor_aux_head = _layer_init(nn.Linear(ah, self.aux_dim), gain=0.01)
+            self.critic_aux_head = _layer_init(nn.Linear(ch, self.aux_dim), gain=0.01)
 
-    # ── 파라미터 그룹(분리 optimizer) ─────────────────────────────────────────
     def actor_parameters(self):
-        ps = list(self.actor_lstm.parameters()) + list(self.actor_logits.parameters())
+        ps = list(self.actor_body.parameters()) + list(self.actor_logits.parameters())
         if self.aux_dim > 0:
             ps += list(self.actor_aux_head.parameters())
         return ps
 
     def critic_parameters(self):
-        ps = list(self.critic_lstm.parameters()) + list(self.critic_head.parameters())
+        ps = list(self.critic_body.parameters()) + list(self.critic_head.parameters())
         if self.aux_dim > 0:
             ps += list(self.critic_aux_head.parameters())
         return ps
 
-    # ── hidden 초기화 ─────────────────────────────────────────────────────────
-    def init_actor_hidden(self, batch, device):
-        h = torch.zeros(self.lstm_layers, int(batch), self.lstm_hidden, device=device)
-        return (h, torch.zeros_like(h))
-
-    def init_critic_hidden(self, batch, device):
-        return self.init_actor_hidden(batch, device)
-
     def _critic_in(self, obs, cext):
+        """critic 입력 = obs (+ 상대-행동 extra). extra 없으면 obs 그대로."""
         if self.critic_extra_dim > 0 and cext is not None:
             return torch.cat([obs, cext], dim=-1)
         return obs
 
-    # ── 1-스텝 trunk forward ──────────────────────────────────────────────────
-    def actor_features(self, obs, hidden):
-        y, hidden = self.actor_lstm(obs.unsqueeze(1), hidden)   # (B,1,obs)->(B,1,H)
-        return y.squeeze(1), hidden
+    def get_value(self, obs, cext=None, with_aux=False):
+        feat = self.critic_body(self._critic_in(obs, cext))
+        v = self.critic_head(feat).squeeze(-1)
+        if with_aux and self.aux_dim > 0:
+            return v, self.critic_aux_head(feat)      # (B,), (B,aux_dim)
+        return v
 
-    def critic_features(self, obs, cext, hidden):
-        y, hidden = self.critic_lstm(self._critic_in(obs, cext).unsqueeze(1), hidden)
-        return y.squeeze(1), hidden
+    def _dist(self, obs):
+        logits = self.actor_logits(self.actor_body(obs)).view(-1, self.act_dim, self.num_bins)
+        return torch.distributions.Categorical(logits=logits)
 
-    # ── 고수준 forward (모두 1-스텝, hidden in/out) ───────────────────────────
-    def actor_forward(self, obs, hidden, action=None, with_aux=False):
-        feat, hidden = self.actor_features(obs, hidden)
-        logits = self.actor_logits(feat).view(-1, self.act_dim, self.num_bins)
-        dist = torch.distributions.Categorical(logits=logits)
+    def get_action_and_value(self, obs, cext=None, action=None):
+        dist = self._dist(obs)
         if action is None:
-            action = dist.sample()                              # (B, act_dim) long
+            action = dist.sample()                          # (B, act_dim) long
         logp = dist.log_prob(action).sum(-1)
         entropy = dist.entropy().sum(-1)
-        aux = self.actor_aux_head(feat) if (with_aux and self.aux_dim > 0) else None
-        return action, logp, entropy, aux, hidden
+        value = self.get_value(obs, cext)
+        return action, logp, entropy, value
 
-    def critic_forward(self, obs, cext, hidden, with_aux=False):
-        feat, hidden = self.critic_features(obs, cext, hidden)
-        v = self.critic_head(feat).squeeze(-1)
-        aux = self.critic_aux_head(feat) if (with_aux and self.aux_dim > 0) else None
-        return v, aux, hidden
-
-    @torch.no_grad()
-    def act(self, obs, hidden, sample=True):
-        """frozen opponent 용 (행동 index(B,act_dim), new_hidden). sample=False 면 argmax."""
-        feat, hidden = self.actor_features(obs, hidden)
+    def evaluate_actions(self, obs, action, with_aux=False):
+        feat = self.actor_body(obs)
         logits = self.actor_logits(feat).view(-1, self.act_dim, self.num_bins)
         dist = torch.distributions.Categorical(logits=logits)
-        idx = dist.sample() if sample else logits.argmax(-1)
-        return idx, hidden
+        logp = dist.log_prob(action).sum(-1)
+        ent = dist.entropy().sum(-1)
+        if with_aux and self.aux_dim > 0:
+            return logp, ent, self.actor_aux_head(feat)   # 공유 trunk 1-pass
+        return logp, ent, None
+
+    @torch.no_grad()
+    def act(self, obs, sample=True):
+        """frozen opponent 용 행동 index(B,act_dim). sample=False 면 argmax(deterministic)."""
+        dist = self._dist(obs)
+        return dist.sample() if sample else dist.logits.argmax(-1)
 
 
 def action_to_env(idx, num_bins, grid=None):
@@ -345,30 +318,16 @@ class OpponentPool:
         return torch.as_tensor(p, dtype=torch.float32, device=self.device)
 
     @torch.no_grad()
-    def act_recurrent(self, opp_obs, assign, hidden):
-        """opp_obs(nenv,OBS), assign(nenv,), hidden=(h,c) 각 (L,nenv,H) → (idx(nenv,4), hidden).
-
-        각 env 는 정확히 하나의 entry 에 배정돼 있으므로 entry 별 partition 으로 **각 env 를
-        한 번씩만** forward 한다(전체 P 배 forward 아님). 배정이 바뀐(=done 후 재샘플된) env 는
-        호출 전 hidden 이 이미 0 리셋돼 있어야 한다(상대가 바뀌면 recurrent state 도 새 출발).
-        entry net 의 lstm 은 전부 같은 (L,H) 구조라 hidden 슬롯을 그대로 공유한다."""
+    def act(self, opp_obs, assign):
+        """opp_obs(nenv,OBS), assign(nenv,) → 행동 index(nenv,4). P forward 후 gather."""
         P = self.size()
-        nenv = opp_obs.shape[0]
-        out = torch.zeros(nenv, 4, dtype=torch.long, device=opp_obs.device)
-        h, c = hidden
-        assign = assign.clamp(0, max(P - 1, 0))
-        for ei, e in enumerate(self.entries):
-            m = assign == ei
-            if not bool(m.any()):
-                continue
-            oo = opp_obs[m]
-            on = e["norm"].normalize(oo) if e["norm"] is not None else oo
-            idx, (nh, nc) = e["net"].act(on, (h[:, m].contiguous(), c[:, m].contiguous()),
-                                         sample=self.sample)
-            out[m] = idx.long()
-            h[:, m] = nh
-            c[:, m] = nc
-        return out, (h, c)
+        outs = []
+        for e in self.entries:
+            on = e["norm"].normalize(opp_obs) if e["norm"] is not None else opp_obs
+            outs.append(e["net"].act(on, sample=self.sample))     # (nenv,4) long
+        stacked = torch.stack(outs, 0)                            # (P,nenv,4)
+        idx = assign.clamp(0, P - 1).view(1, -1, 1).expand(1, opp_obs.shape[0], 4)
+        return stacked.gather(0, idx).squeeze(0)
 
     def state_dicts(self):
         out = []
@@ -414,14 +373,8 @@ class PPOGPUConfig:
     max_grad_norm: float = 0.5
     target_kl: Optional[float] = 0.03
     num_bins: int = ACTION_BINS
-    hidden: tuple = (768, 768)   # (LSTM 트렁크에선 미사용; 메타/호환용으로만 유지)
-    activation: str = "tanh"     # (LSTM 트렁크에선 미사용)
-    # ── actor/critic trunk = 단방향(시간순) 다층 LSTM ──────────────────────────
-    # actor·critic 모두 3층·512차원 LSTM(batch_first, bidirectional=False)로 시간순으로만
-    # 정보를 흘린다. hidden 은 rollout 동안 스텝마다 이어지고 episode 경계(done)에서 0 리셋,
-    # update 는 env 단위 시퀀스 truncated-BPTT 로 hidden 을 앞부터 재계산한다.
-    lstm_hidden: int = 512
-    lstm_layers: int = 3
+    hidden: tuple = (768, 768)
+    activation: str = "tanh"
     # critic 에만 상대의 과거 5-step action(20dim)을 추가 입력으로 준다(actor 는 불변).
     critic_opp_actions: bool = True
     # auxiliary 미래위치 예측(actor·critic 두 trunk 에 head). aux_coef 로 MSE 를 각 loss 에 가산.
@@ -502,10 +455,9 @@ class PPOGPUTrainer:
         self.aux_dim = AUX_DIM if config.aux_pred else 0
         self._aux_dt = float(getattr(env, "obr", None).dt) if hasattr(env, "obr") else 0.1
         self._model_kwargs = dict(obs_dim=self.obs_dim, act_dim=self.act_dim,
-                                  num_bins=config.num_bins,
-                                  lstm_hidden=int(config.lstm_hidden),
-                                  lstm_layers=int(config.lstm_layers),
-                                  critic_extra_dim=self.cext_dim, aux_dim=self.aux_dim)
+                                  num_bins=config.num_bins, hidden=tuple(config.hidden),
+                                  activation=config.activation, critic_extra_dim=self.cext_dim,
+                                  aux_dim=self.aux_dim)
         self.grid = make_action_grid(config.num_bins, device=dev)
 
         self.model = ActorCritic(**self._model_kwargs).to(dev)
@@ -665,19 +617,6 @@ class PPOGPUTrainer:
         self._next_done = torch.zeros(self.nenv, device=self.cfg.device)
         self.opp_assign = self._sample_opp(self.nenv)
         self.ep_ret.zero_(); self.ep_len.zero_()
-        # recurrent hidden(진행 상태): actor/critic/opponent 각각 (L,nenv,H). episode 시작이라
-        # 전부 0(fresh). 이후 rollout 스텝마다 이어지고 done 인 env 는 다음 스텝 시작에 0 리셋.
-        dev = self.cfg.device
-        self._actor_h = self.model.init_actor_hidden(self.nenv, dev)
-        self._critic_h = self.model.init_critic_hidden(self.nenv, dev)
-        self._opp_h = self.model.init_actor_hidden(self.nenv, dev)
-
-    def _reset_hidden_where_done(self, done):
-        """done(nenv,) 인 env 의 actor/critic/opponent hidden 을 0 으로(새 episode fresh)."""
-        keep = (1.0 - done).view(1, -1, 1)
-        self._actor_h = (self._actor_h[0] * keep, self._actor_h[1] * keep)
-        self._critic_h = (self._critic_h[0] * keep, self._critic_h[1] * keep)
-        self._opp_h = (self._opp_h[0] * keep, self._opp_h[1] * keep)
 
     def _refresh_weights(self):
         self.opp_weights = self.pool.weights(self.cfg.pool_sample_temp, self.cfg.pool_uniform_floor)
@@ -722,18 +661,10 @@ class PPOGPUTrainer:
         loss_by_opp = torch.zeros(P, device=dev)
         ep_by_opp = torch.zeros(P, device=dev)       # opponent 별 완료 에피소드 수(무승부 포함, EMA 분모)
 
-        # BPTT 재현용: 이번 rollout t=0 시작 hidden(리셋 적용 **전**의 이월 hidden)을 저장.
-        # update 는 여기서부터 b_done[t] 리셋을 매 스텝 재적용하며 hidden 을 앞부터 재계산한다.
-        self.b_actor_h0 = (self._actor_h[0].clone(), self._actor_h[1].clone())
-        self.b_critic_h0 = (self._critic_h[0].clone(), self._critic_h[1].clone())
-
         for t in range(T):
             if opp_kind == "pool":
                 sampled = self._sample_opp(self.nenv)
                 self.opp_assign = torch.where(self._next_done.bool(), sampled, self.opp_assign)
-
-            # done 인 env(새 episode 시작)는 actor/critic/opponent hidden 을 0 으로 리셋.
-            self._reset_hidden_where_done(self._next_done)
 
             self._capture_aux(t)                # s_t 궤적(위치/속도/회전) 캡처(aux 라벨용)
             main_obs = self._next_obs
@@ -748,19 +679,17 @@ class PPOGPUTrainer:
             cext_n = self._opp_cext(self._next_opp_obs)     # critic 전용 상대-행동 extra
             if self.cext_dim > 0:
                 self.b_cext[t] = cext_n
-            act_idx, logp, _, _, self._actor_h = self.model.actor_forward(obs_n, self._actor_h)
-            value, _, self._critic_h = self.model.critic_forward(obs_n, cext_n, self._critic_h)
+            act_idx, logp, _, value = self.model.get_action_and_value(obs_n, cext_n)
             self.b_act[t] = act_idx
             self.b_logp[t] = logp
             self.b_val[t] = value
 
             if opp_kind == "pool":
-                opp_idx, self._opp_h = self.pool.act_recurrent(
-                    self._next_opp_obs, self.opp_assign, self._opp_h)
+                opp_idx = self.pool.act(self._next_opp_obs, self.opp_assign)
             else:
                 oo = self._next_opp_obs
                 on = frozen_opp[1].normalize(oo) if frozen_opp[1] is not None else oo
-                opp_idx, self._opp_h = frozen_opp[0].act(on, self._opp_h, sample=cfg.opp_sample)
+                opp_idx = frozen_opp[0].act(on, sample=cfg.opp_sample)
 
             act = torch.empty(self.nac, self.act_dim, device=dev)
             act[0::2] = action_to_env(act_idx, cfg.num_bins, self.grid)
@@ -771,13 +700,10 @@ class PPOGPUTrainer:
             trunc = info["truncated"]
             done_env = done.float()
 
-            # truncation 부트스트랩 V(terminal_obs): terminal_obs 로 이어지는 critic hidden 은
-            # 방금 obs_t 를 처리한 뒤 hidden(self._critic_h)이다(리셋 전; 다음 스텝 시작에서
-            # done 이면 어차피 리셋됨). 그 hidden 으로 terminal_obs 를 1-스텝 평가한다.
             term_obs = info["terminal_obs"][:, 0, :]
             tn = self.norm.normalize(term_obs) if self.norm is not None else term_obs
             term_cext = self._opp_cext(info["terminal_obs"][:, 1, :])
-            v_boot, _, _ = self.model.critic_forward(tn, term_cext, self._critic_h)
+            v_boot = self.model.get_value(tn, term_cext)
             self.b_rew[t] = raw_reward + gamma * v_boot * trunc.float()
 
             self._next_obs = obs[:, 0, :]
@@ -816,9 +742,7 @@ class PPOGPUTrainer:
 
         last_n = self.norm.normalize(self._next_obs) if self.norm is not None else self._next_obs
         last_cext = self._opp_cext(self._next_opp_obs)
-        # GAE 부트스트랩 V(next_obs): 이월된 critic hidden 으로 1-스텝 평가(done 인 env 는
-        # next_nonterminal 로 0 처리되므로 hidden 리셋 여부 무관).
-        last_value, _, _ = self.model.critic_forward(last_n, last_cext, self._critic_h)
+        last_value = self.model.get_value(last_n, last_cext)
 
         adv = torch.zeros_like(self.b_rew)
         lastgae = torch.zeros(self.nenv, device=dev)
@@ -839,92 +763,67 @@ class PPOGPUTrainer:
                  "win_by_opp": win_by_opp, "loss_by_opp": loss_by_opp, "ep_by_opp": ep_by_opp}
         return adv, ret, stats
 
-    # ── recurrent 시퀀스 truncated-BPTT (actor/critic hidden 재계산) ───────────
-    def _replay_actor(self, me, use_aux):
-        """env 부분집합 me 에 대해 t=0..T-1 을 actor LSTM 으로 재생(BPTT).
-        b_actor_h0 에서 시작해 매 스텝 b_done 리셋 후 1-스텝 전진. 저장된 b_act 로 logp/ent 계산.
-        반환: new_logp(T,B), entropy(T,B), a_aux(T,B,AUX) or None."""
-        T = self.cfg.rollout_steps
-        h = (self.b_actor_h0[0][:, me].contiguous(), self.b_actor_h0[1][:, me].contiguous())
-        logps, ents, auxs = [], [], []
-        for t in range(T):
-            keep = (1.0 - self.b_done[t, me]).view(1, -1, 1)
-            h = (h[0] * keep, h[1] * keep)
-            _, logp, ent, a_aux, h = self.model.actor_forward(
-                self.b_obs[t, me], h, action=self.b_act[t, me], with_aux=use_aux)
-            logps.append(logp); ents.append(ent)
-            if use_aux:
-                auxs.append(a_aux)
-        a_aux = torch.stack(auxs) if use_aux else None
-        return torch.stack(logps), torch.stack(ents), a_aux
-
-    def _replay_critic(self, me, use_aux):
-        """env 부분집합 me 에 대해 critic LSTM 재생(BPTT). 반환: new_value(T,B), c_aux or None."""
-        T = self.cfg.rollout_steps
-        h = (self.b_critic_h0[0][:, me].contiguous(), self.b_critic_h0[1][:, me].contiguous())
-        vals, auxs = [], []
-        for t in range(T):
-            keep = (1.0 - self.b_done[t, me]).view(1, -1, 1)
-            h = (h[0] * keep, h[1] * keep)
-            cext_t = self.b_cext[t, me] if self.cext_dim > 0 else None
-            v, c_aux, h = self.model.critic_forward(self.b_obs[t, me], cext_t, h, with_aux=use_aux)
-            vals.append(v)
-            if use_aux:
-                auxs.append(c_aux)
-        c_aux = torch.stack(auxs) if use_aux else None
-        return torch.stack(vals), c_aux
-
+    # ── 정책 업데이트 ────────────────────────────────────────────────────────
     def update(self, adv, ret):
-        """recurrent PPO 업데이트. **env(시퀀스) 단위 미니배치** — 시간축은 섞지 않고 통째로
-        truncated-BPTT 한다. actor/critic 은 hidden 상호의존이 있어 각각 별도 BPTT 패스로
-        (분리 optimizer·LR 유지) 재생한다. adv/ret 은 (T,nenv) 2D."""
         cfg = self.cfg
-        T = cfg.rollout_steps
-        nenv = self.nenv
+        N = cfg.rollout_steps * self.nenv
+        b_obs = self.b_obs.reshape(N, self.obs_dim)
+        b_act = self.b_act.reshape(N, self.act_dim)
+        b_logp = self.b_logp.reshape(N)
+        b_adv = adv.reshape(N)
+        b_ret = ret.reshape(N)
+        b_val = self.b_val.reshape(N)
+        b_cext = self.b_cext.reshape(N, self.cext_dim) if self.cext_dim > 0 else None
         use_aux = self.aux_dim > 0
-        env_per_mb = max(1, nenv // cfg.num_minibatches)
+        b_auxlab = self.b_auxlab.reshape(N, AUX_DIM) if use_aux else None
+        b_auxmask = self.b_auxmask.reshape(N, 2) if use_aux else None
+
+        mb_size = max(1, N // cfg.num_minibatches)
+        idx = torch.arange(N, device=cfg.device)
         clip = cfg.clip_coef
-
-        def _aux_seq_loss(aux_seq, me):   # (T,B,AUX) masked MSE (rollout 전체 라벨/마스크로)
-            return self._aux_loss(aux_seq.reshape(-1, AUX_DIM),
-                                  self.b_auxlab[:, me].reshape(-1, AUX_DIM),
-                                  self.b_auxmask[:, me].reshape(-1, 2))
-
         last_pl = last_vl = last_ent = last_kl = last_cf = last_aux = 0.0
         early = False
         epoch = 0
         for epoch in range(cfg.update_epochs):
-            env_perm = torch.randperm(nenv, device=cfg.device)
+            perm = idx[torch.randperm(N, device=cfg.device)]
             kls = []
-            for s in range(0, nenv, env_per_mb):
-                me = env_perm[s:s + env_per_mb]          # 이 미니배치의 env 인덱스(시퀀스들)
-
-                # ── actor BPTT 패스 ───────────────────────────────────────────
-                new_logp, entropy, a_aux = self._replay_actor(me, use_aux)   # (T,B)
-                log_ratio = new_logp - self.b_logp[:, me]
+            for s in range(0, N, mb_size):
+                mb = perm[s:s + mb_size]
+                new_logp, entropy, a_aux = self.model.evaluate_actions(
+                    b_obs[mb], b_act[mb], with_aux=use_aux)
+                log_ratio = new_logp - b_logp[mb]
                 ratio = log_ratio.exp()
-                mb_adv = adv[:, me]
+
+                mb_adv = b_adv[mb]
                 if cfg.norm_adv:
                     mb_adv = (mb_adv - mb_adv.mean()) / (mb_adv.std() + 1e-8)
+
                 pg1 = -mb_adv * ratio
                 pg2 = -mb_adv * torch.clamp(ratio, 1 - clip, 1 + clip)
                 policy_loss = torch.max(pg1, pg2).mean()
                 ent = entropy.mean()
                 actor_loss = policy_loss - cfg.ent_coef * ent
-                a_aux_loss = _aux_seq_loss(a_aux, me) if use_aux else None
+                # actor trunk aux 미래위치 예측(표현학습). 작은 계수로 정책 gradient 에 가산.
+                a_aux_loss = (self._aux_loss(a_aux, b_auxlab[mb], b_auxmask[mb])
+                              if use_aux else None)
                 if use_aux:
                     actor_loss = actor_loss + cfg.aux_coef * a_aux_loss
+
                 self.actor_opt.zero_grad(set_to_none=True)
                 actor_loss.backward()
                 nn.utils.clip_grad_norm_(self.model.actor_parameters(), cfg.max_grad_norm)
                 self.actor_opt.step()
 
-                # ── critic BPTT 패스 ──────────────────────────────────────────
-                new_value, c_aux = self._replay_critic(me, use_aux)          # (T,B)
-                value_loss = 0.5 * ((new_value - ret[:, me]) ** 2).mean()
+                mb_cext = b_cext[mb] if b_cext is not None else None
+                if use_aux:
+                    new_value, c_aux = self.model.get_value(b_obs[mb], mb_cext, with_aux=True)
+                    c_aux_loss = self._aux_loss(c_aux, b_auxlab[mb], b_auxmask[mb])
+                else:
+                    new_value = self.model.get_value(b_obs[mb], mb_cext)
+                value_loss = 0.5 * ((new_value - b_ret[mb]) ** 2).mean()
                 critic_loss = cfg.vf_coef * value_loss
                 if use_aux:                                   # critic trunk aux(추론 미사용)
-                    critic_loss = critic_loss + cfg.aux_coef * _aux_seq_loss(c_aux, me)
+                    critic_loss = critic_loss + cfg.aux_coef * c_aux_loss
                 self.critic_opt.zero_grad(set_to_none=True)
                 critic_loss.backward()
                 nn.utils.clip_grad_norm_(self.model.critic_parameters(), cfg.max_grad_norm)
@@ -942,13 +841,9 @@ class PPOGPUTrainer:
                 early = True
                 break
 
-        # explained variance: rollout 수집 시점 value(b_val) vs return(ret) 로 계산(BPTT 재계산
-        # value 가 아니라 수집 당시 값 기준 — 기존 규약 유지).
-        ret_flat = ret.reshape(-1)
-        val_flat = self.b_val.reshape(-1)
-        var_y = ret_flat.var()
+        var_y = b_ret.var()
         ev = torch.where(var_y == 0, torch.zeros((), device=cfg.device),
-                         1.0 - (ret_flat - val_flat).var() / (var_y + 1e-8))
+                         1.0 - (b_ret - b_val).var() / (var_y + 1e-8))
         return {"pl": last_pl, "vl": last_vl, "ent": last_ent, "kl": last_kl,
                 "cf": last_cf, "ev": ev, "epochs": epoch + 1, "early": early, "aux": last_aux}
 
