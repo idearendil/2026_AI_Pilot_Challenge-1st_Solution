@@ -385,12 +385,14 @@ class PPOGPUConfig:
     seed: int = 0
     device: str = "cuda"
     # ── iteration 스케줄 (sched_period iter 마다 단계 k=(it-1)//period 증가) ──────────
-    # lr = base_lr·lr_decay^k, ent_coef = base_ent·ent_decay^k, rollout = base + increment·k.
+    # lr = base_lr·lr_decay^k, ent_coef = base_ent·ent_decay^k,
+    # rollout = min(base + increment·k, sched_rollout_max).
     # gamma / (own_dmg·shaping 없음) 는 불변. sched_period<=0 이면 스케줄 비활성(값 고정).
     sched_period: int = 2000
-    sched_lr_decay: float = 1.0 / 3.0
-    sched_ent_decay: float = 1.0 / 3.0
+    sched_lr_decay: float = 0.85
+    sched_ent_decay: float = 0.85
     sched_rollout_increment: int = 8
+    sched_rollout_max: int = 96   # rollout(T) 상한: 이 값에 도달하면 더 안 늘림(메모리 상한)
     # ── opponent pool / gated self-play (원본과 동일 규약) ──────────────────────
     pool_evict_cap: int = 4               # evictable(net) snapshot 최대 수
     selfplay_gate_threshold: float = 0.6  # evictable 최소 EMA ≥ 이 값이면 snapshot 추가
@@ -535,6 +537,7 @@ class PPOGPUTrainer:
         for g in self.critic_opt.param_groups:
             g["lr"] = b["critic_lr"] * lr_factor
         new_T = b["rollout"] + int(self.cfg.sched_rollout_increment) * k
+        new_T = min(new_T, int(getattr(self.cfg, "sched_rollout_max", new_T)))   # 메모리 상한(기본 96)
         if new_T != int(self.cfg.rollout_steps):
             self.cfg.rollout_steps = new_T
             self._alloc_rollout_buffers(new_T)

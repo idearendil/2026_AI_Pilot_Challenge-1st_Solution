@@ -39,16 +39,14 @@ def main():
     ap.add_argument("--target-kl", type=float, default=0.03)
     ap.add_argument("--no-norm-obs", action="store_true")
     ap.add_argument("--num-bins", type=int, default=21, help="채널별 discrete 행동 격자 수(원본 train.py 기본=21)")
-    ap.add_argument("--lstm-hidden", type=int, default=512,
-                    help="actor/critic LSTM trunk 차원(기본 512)")
-    ap.add_argument("--lstm-layers", type=int, default=3,
-                    help="actor/critic LSTM 층 수(단방향/시간순, 기본 3)")
     # ── iteration 스케줄 (sched-period iter 마다 단계 상승) ──
     ap.add_argument("--sched-period", type=int, default=2000,
                     help="이 iter 수마다 단계 k↑: lr·ent-coef ×= 각 decay, rollout += increment (0이면 비활성)")
-    ap.add_argument("--sched-lr-decay", type=float, default=1.0 / 3.0, help="단계마다 lr 에 곱할 계수")
-    ap.add_argument("--sched-ent-decay", type=float, default=1.0 / 3.0, help="단계마다 ent-coef 에 곱할 계수")
+    ap.add_argument("--sched-lr-decay", type=float, default=0.85, help="단계마다 lr 에 곱할 계수")
+    ap.add_argument("--sched-ent-decay", type=float, default=0.85, help="단계마다 ent-coef 에 곱할 계수")
     ap.add_argument("--sched-rollout-increment", type=int, default=8, help="단계마다 rollout 에 더할 값")
+    ap.add_argument("--sched-rollout-max", type=int, default=96,
+                    help="rollout(T) 상한. 스케줄로 증가하다 이 값에 도달하면 더 안 늘림(메모리 상한)")
     # ── opponent pool / gated self-play (원본과 동일 규약) ──
     ap.add_argument("--pool-evict-cap", type=int, default=4,
                     help="evictable(net) opponent snapshot 최대 수")
@@ -62,8 +60,9 @@ def main():
     ap.add_argument("--no-opp-sample", action="store_true",
                     help="opponent 행동을 deterministic(argmax)으로")
     # ── exploiter ──
-    ap.add_argument("--exploiter-iters", type=int, default=1000,
-                    help="exploiter 1회 학습 최대 iter(0 이하면 비활성)")
+    ap.add_argument("--exploiter-iters", type=int, default=3000,
+                    help="exploiter 1회 학습 최대 iter(0 이하면 비활성). 이 전에 main 상대 "
+                         "승률 EMA ≥ --exploiter-win-target 이면 조기 종료")
     ap.add_argument("--exploiter-win-target", type=float, default=0.7)
     ap.add_argument("--exploiter-lr", type=float, default=1e-4)
     ap.add_argument("--exploiter-ent-coef", type=float, default=0.0001)
@@ -104,9 +103,9 @@ def main():
         update_epochs=args.epochs, num_minibatches=args.minibatches,
         lr=args.lr, critic_lr=args.critic_lr, ent_coef=args.ent_coef,
         target_kl=args.target_kl, normalize_obs=not args.no_norm_obs, num_bins=args.num_bins,
-        lstm_hidden=args.lstm_hidden, lstm_layers=args.lstm_layers,
         sched_period=args.sched_period, sched_lr_decay=args.sched_lr_decay,
         sched_ent_decay=args.sched_ent_decay, sched_rollout_increment=args.sched_rollout_increment,
+        sched_rollout_max=args.sched_rollout_max,
         pool_evict_cap=args.pool_evict_cap, selfplay_gate_threshold=args.selfplay_gate_threshold,
         selfplay_ema_alpha=args.selfplay_ema_alpha, pool_sample_temp=args.pool_sample_temp,
         pool_uniform_floor=args.pool_uniform_floor, milestone_period=args.milestone_period,

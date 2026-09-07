@@ -1,8 +1,8 @@
 <initialize name="cruise">
-  <altitude unit="FT">2912.5541917696646</altitude>
-  <vt unit="FT/SEC">709.2242368312425</vt>
+  <altitude unit="FT">3657.9532991838314</altitude>
+  <vt unit="FT/SEC">953.3162423717463</vt>
   <gamma unit="DEG">0.0</gamma>
-  <latitude unit="DEG">37.949517517429086</latitude>
+  <latitude unit="DEG">37.950202662608675</latitude>
   <longitude unit="DEG">128.18188127777776</longitude>
   <phi unit="DEG">0.0</phi>
   <psi unit="DEG">270.0</psi>

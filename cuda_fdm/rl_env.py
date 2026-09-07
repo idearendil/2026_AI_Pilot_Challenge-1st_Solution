@@ -184,8 +184,9 @@ class GpuDogfightVecEnv:
         self.speed_mps_range = (200.0, 300.0)
         self.distA_ft_choices = (2000.0, 2500.0, 3000.0)
         self.dist_headon_ft = 10000.0
-        # 시나리오 B(head-on 마주봄) : A(수직·반대) = 1:3 → B 확률 0.25.
-        self.scenario_b_prob = 0.25
+        # 학습은 두 기체가 서로 마주보는 head-on(시나리오 B) 상황만 사용한다.
+        # (예전엔 B:A(수직·반대) = 1:3 = 0.25였으나, 항상 마주보게 1.0으로 고정.)
+        self.scenario_b_prob = 1.0
         # 종료 규약(env_utils.STANDARD_ENV_CONFIG): min_altitude 300m, max_engage 200s.
         self.min_altitude_m = min_altitude_m
         self.max_engage_time_s = max_engage_time_s
