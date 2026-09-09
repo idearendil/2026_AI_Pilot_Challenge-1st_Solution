@@ -183,7 +183,9 @@ class GpuDogfightVecEnv:
         self.alt_ft_range = (2000.0, 30000.0)
         self.speed_mps_range = (200.0, 300.0)
         self.distA_ft_choices = (2000.0, 2500.0, 3000.0)
-        self.dist_headon_ft = 10000.0
+        # 교전서버 Headon(HABFM) 초기 거리: UI엔 10,000ft(3048m)로 표기되나 실제 환경의
+        # 두 기체 초기 거리는 ~5539m(주최측 확인). 본선과 맞추려 실측 미터값을 그대로 쓴다.
+        self.dist_headon_m = 5539.0
         # 학습은 두 기체가 서로 마주보는 head-on(시나리오 B) 상황만 사용한다.
         # (예전엔 B:A(수직·반대) = 1:3 = 0.25였으나, 항상 마주보게 1.0으로 고정.)
         self.scenario_b_prob = 1.0
@@ -211,7 +213,7 @@ class GpuDogfightVecEnv:
         side_swap = bool(rng.integers(0, 2))
         if rng.random() < self.scenario_b_prob:
             # B: head-on
-            half = 0.5 * self.dist_headon_ft * FT2M
+            half = 0.5 * self.dist_headon_m
             own_n = self.center_n + (-half if side_swap else half)
             tgt_n = self.center_n + (half if side_swap else -half)
             own_hdg = 0.0 if side_swap else 180.0

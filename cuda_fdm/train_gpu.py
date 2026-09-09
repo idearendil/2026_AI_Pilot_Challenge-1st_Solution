@@ -24,7 +24,7 @@ from cuda_fdm.ppo_gpu import PPOGPUConfig, PPOGPUTrainer
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--nenv", type=int, default=4096)
-    ap.add_argument("--iters", type=int, default=10000, help="총 iteration(<=0 이면 무한)")
+    ap.add_argument("--iters", type=int, default=100000, help="총 iteration(<=0 이면 무한)")
     ap.add_argument("--rollout", type=int, default=64, help="iteration 당 env step 수 T")
     ap.add_argument("--epochs", type=int, default=4)
     ap.add_argument("--minibatches", type=int, default=8,
