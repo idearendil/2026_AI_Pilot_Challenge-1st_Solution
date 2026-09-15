@@ -1,6 +1,7 @@
 # DogFightEnv — F-16 1v1 Dogfight RL
 
-[한국어](README.md) · **English**
+[![한국어](https://img.shields.io/badge/한국어-64748b?style=for-the-badge)](README.md)
+[![English](https://img.shields.io/badge/English-2563eb?style=for-the-badge)](README.en.md)
 
 A reinforcement-learning (RL) environment for F-16 1v1 air combat (dogfighting), together with
 tools for training, evaluation, and submission. The physics use a JSBSim-based F-16 flight
