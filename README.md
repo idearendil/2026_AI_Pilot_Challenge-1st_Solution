@@ -1,7 +1,7 @@
 # DogFightEnv — F-16 1v1 Dogfight RL
 
 <details>
-<summary><img alt="English" src="https://img.shields.io/badge/English-2563eb?style=for-the-badge"> &nbsp;<sub>(click to read in English)</sub></summary>
+<summary>&nbsp;🇬🇧&nbsp;&nbsp;<b>ENGLISH</b>&nbsp;&nbsp;—&nbsp;click to expand&nbsp;/&nbsp;눌러서 영어로 보기&nbsp;</summary>
 
 <br>
 
