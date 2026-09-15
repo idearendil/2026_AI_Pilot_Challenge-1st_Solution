@@ -1,0 +1,78 @@
+{
+  "name": "junhwa_grid_3L749_gru_last",
+  "iteration": 7900,
+  "scenario": "common",
+  "source_name": "junhwa_grid_3L749_gru_last.pt",
+  "source_sha256": "d67ad48c4277a9a9bf04497980c6e98f2562750fee835f368cbdbf0a3b8f3e7a",
+  "model_sha256": "54168fb54bc8b22adedb534405b462f6dce1e31dd340ccc299708b6745ee3de9",
+  "observation_size": 214,
+  "observation_contract": "cuda_claude164r_command_poststep_v1",
+  "observation_contract_evidence": "shared-code owner declaration",
+  "policy_hz": 10,
+  "action_repeat": 6,
+  "action_mode": "argmax",
+  "channels": [
+    "roll",
+    "pitch",
+    "rudder",
+    "throttle"
+  ],
+  "normalization": "stored mean/var, sqrt(var+1e-8), clip [-10,10], frozen",
+  "cfg": {
+    "hidden": [
+      749,
+      749,
+      749
+    ],
+    "activation": "tanh",
+    "num_bins": 21,
+    "gru_last": true,
+    "gru_all": false
+  },
+  "recurrent": true,
+  "actor_layout": {
+    "actor_body.0.weight": [
+      749,
+      214
+    ],
+    "actor_body.0.bias": [
+      749
+    ],
+    "actor_body.2.weight": [
+      749,
+      749
+    ],
+    "actor_body.2.bias": [
+      749
+    ],
+    "actor_gru.weight_ih": [
+      2247,
+      749
+    ],
+    "actor_gru.weight_hh": [
+      2247,
+      749
+    ],
+    "actor_gru.bias_ih": [
+      2247
+    ],
+    "actor_gru.bias_hh": [
+      2247
+    ],
+    "actor_logits.weight": [
+      84,
+      749
+    ],
+    "actor_logits.bias": [
+      84
+    ]
+  },
+  "omitted": [
+    "optimizer",
+    "critic",
+    "auxiliary head",
+    "pool",
+    "training RNG"
+  ],
+  "original20k_conversion": null
+}

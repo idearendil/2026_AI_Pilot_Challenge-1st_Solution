@@ -186,9 +186,9 @@ class GpuDogfightVecEnv:
         # 교전서버 Headon(HABFM) 초기 거리: UI엔 10,000ft(3048m)로 표기되나 실제 환경의
         # 두 기체 초기 거리는 ~5539m(주최측 확인). 본선과 맞추려 실측 미터값을 그대로 쓴다.
         self.dist_headon_m = 5539.0
-        # 학습은 두 기체가 서로 마주보는 head-on(시나리오 B) 상황만 사용한다.
-        # (예전엔 B:A(수직·반대) = 1:3 = 0.25였으나, 항상 마주보게 1.0으로 고정.)
-        self.scenario_b_prob = 1.0
+        # 초기 분포: 시나리오 A(3-9 line, 두 기체가 서로 옆에서 반대 방향을 바라봄)와
+        # 시나리오 B(head-on, 정면 대치)를 A:B = 4:1 비율로 섞는다 → scenario_b_prob=0.2.
+        self.scenario_b_prob = 0.2
         # 종료 규약(env_utils.STANDARD_ENV_CONFIG): min_altitude 300m, max_engage 200s.
         self.min_altitude_m = min_altitude_m
         self.max_engage_time_s = max_engage_time_s
@@ -235,7 +235,7 @@ class GpuDogfightVecEnv:
         return dict(lat_deg=lat, lon_deg=lon, alt_ft=alt_ft,
                     vt_fps=speed_mps * M2FT, psi_deg=heading_deg,
                     phi_deg=0.0, theta_deg=0.0, alpha_deg=0.0, beta_deg=0.0,
-                    fuel_lbs=6000.0, throttle=0.8)
+                    fuel_lbs=6972.0, throttle=0.8)
 
     def _build_all_seeds(self):
         """nenv 쌍을 샘플 → (nac,101) seed numpy. even=ownship, odd=target."""

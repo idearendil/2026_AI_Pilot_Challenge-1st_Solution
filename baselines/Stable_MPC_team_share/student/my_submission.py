@@ -21,7 +21,7 @@ from safe_mpc.config import load_safe_mpc_config  # noqa: E402
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Stable_MPC competition UDP client")
-    parser.add_argument("--server-ip", default=os.getenv("DOGFIGHT_SERVER_IP", "221.151.77.208"))
+    parser.add_argument("--server-ip", default=os.getenv("DOGFIGHT_SERVER_IP", "127.0.0.1"))
     parser.add_argument("--server-port", type=int, default=int(os.getenv("DOGFIGHT_SERVER_PORT", "9999")))
     parser.add_argument("--team-name", default=os.getenv("DOGFIGHT_TEAM_NAME", "Stable_MPC"))
     parser.add_argument("--mpc-config", default=str(ROOT / "configs" / "mpc.yaml"))

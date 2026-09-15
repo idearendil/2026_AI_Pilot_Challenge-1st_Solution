@@ -35,10 +35,6 @@ class MLPActionProvider(ActionProvider):
         self.stochastic = bool(stochastic)
         self.model, self.metadata = load_bundle(bundle_dir, device=device)
         self.obs_dim = int(self.metadata.get("observation_size", 16))
-        # LSTM(recurrent) 정책이면 hidden 을 provider 가 보관하며 episode 마다 리셋한다.
-        # (MLP 정책은 hidden 없음 → None 유지, 기존 경로 그대로.)
-        self._is_lstm = bool(self.metadata.get("lstm")) or hasattr(self.model, "init_hidden")
-        self._hidden = None
         # 학습 때와 동일한 관측 정규화 적용 (없으면 항등).
         self._normalize_obs = make_obs_normalizer(self.metadata.get("obs_normalization"))
         # claude_code.my_observation 을 쓴 번들이면 HP/damage 재구성을 RL-step 당 1회
@@ -73,8 +69,6 @@ class MLPActionProvider(ActionProvider):
                   f"(head={self._dbg_head}, every={self._dbg_every})", flush=True)
 
     def reset(self, context: ActionContext | None = None) -> None:
-        # LSTM 정책이면 recurrent hidden 을 새 episode 로 리셋(다음 호출에서 0 으로 초기화).
-        self._hidden = None
         if self._reconstruct:
             self._reset_recon()
             self._first_recon_call = True
@@ -118,14 +112,7 @@ class MLPActionProvider(ActionProvider):
         obs_tensor = torch.as_tensor(obs, dtype=torch.float32, device=self.device).unsqueeze(0)
         act_fn = (self.model.act_stochastic if self.stochastic
                   else self.model.act_deterministic)
-        if self._is_lstm:
-            # recurrent: hidden 을 이어가며 1-스텝 전진(RL-step 당 1회 호출 = 학습과 동일 주기).
-            if self._hidden is None:
-                self._hidden = self.model.init_hidden(1, self.device)
-            raw_t, self._hidden = act_fn(obs_tensor, self._hidden)
-            raw = raw_t.squeeze(0).cpu().numpy()
-        else:
-            raw = act_fn(obs_tensor).squeeze(0).cpu().numpy()
+        raw = act_fn(obs_tensor).squeeze(0).cpu().numpy()
         # 이산 정책이면 카테고리 index → 연속값으로 변환.
         if hasattr(self.model, "num_bins"):
             raw = discrete_indices_to_continuous(raw, self.model.num_bins)

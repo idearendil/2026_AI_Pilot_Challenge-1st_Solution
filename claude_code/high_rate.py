@@ -59,11 +59,6 @@ class HighRateProvider(ActionProvider):
         self.source = source
         # 에피소드 첫 관측은 advance 없이 fresh recon(GPU 학습 reset→build 규약).
         self._first_boundary = True
-        # LSTM(recurrent) 정책이면 hidden 을 보관한다. **매 substep(60Hz) 재결정**하되 hidden 은
-        # **STEP_RATIO 경계(10Hz = 학습 recurrent 주기)에서만 commit** 한다(그 사이엔 직전
-        # committed hidden 을 입력으로 fresh 기하 반응만 얻음). episode 마다 리셋(0).
-        self._is_lstm = hasattr(self.model, "init_hidden")
-        self._hidden = None
         # ── 60Hz 재구성 (claude164r StateReconstructor 전용) ────────────────────────
         # 재구성이 필요한 feature 를 성격별로 학습 분포에 맞게 만든다:
         #   · 미분량(가속도·pqr): '현재 − 0.1s(STEP substep) 전' sliding 차분(아래 60Hz 상태 큐).
@@ -92,7 +87,6 @@ class HighRateProvider(ActionProvider):
         self._rate_q.clear()
         self._sub = 0
         self._first_boundary = True
-        self._hidden = None
 
     def _subsampled_history(self) -> np.ndarray:
         """60Hz 큐 → 0.1s(STEP_RATIO) 간격 K 개(row0=가장 최근=STEP substep 전). 부족분 0 패딩."""
@@ -183,15 +177,7 @@ class HighRateProvider(ActionProvider):
         obs_t = torch.as_tensor(self._normalize(obs), dtype=torch.float32,
                                 device=self.device).unsqueeze(0)
         with torch.no_grad():
-            if self._is_lstm:
-                if self._hidden is None:
-                    self._hidden = self.model.init_hidden(1, self.device)
-                act_fn = self.model.act_stochastic if self.explore else self.model.act_deterministic
-                idx, new_h = act_fn(obs_t, self._hidden)
-                if self._sub % self.step == 0:      # 10Hz 경계에서만 hidden 전진(학습 주기)
-                    self._hidden = new_h
-                raw = idx.squeeze(0).cpu().numpy()
-            elif self.explore:
+            if self.explore:
                 if hasattr(self.model, "act_stochastic"):
                     raw = self.model.act_stochastic(obs_t)
                 else:
@@ -240,24 +226,27 @@ def high_rate_from_bundle(bundle_dir, *, step_ratio, device="cpu", explore=False
         source="high_rate_rl")
 
 
-def high_rate_from_gylee(snapshot, *, step_ratio, device="cpu", explore=False):
-    """model2_gylee(claude47r) → 60Hz HighRateProvider. 47D 관측엔 action history 가 없다."""
-    from GeoMathUtil import GeometryInfo
-    from model2_gylee.loader import load_model
-    from model2_gylee import my_observation as GMO
-    from model2_gylee.model import discrete_indices_to_continuous, policy_action_to_command
+def high_rate_from_model(model, obs_rms, *, step_ratio, device="cpu", explore=False):
+    """이미 로드된 claude164r(my_observation) 정책 모델 → 60Hz HighRateProvider.
 
-    model, obs_rms, _ = load_model(snapshot, device=device, verify_checksum=False)
+    번들(high_rate_from_bundle)과 달리 in-memory model+obs_rms 를 그대로 받는다
+    (runs 체크포인트를 gpu_ckpt_to_bundle.load_ckpt_as_model 로 로드해 60Hz 상대로 붙일 때)."""
+    from GeoMathUtil import GeometryInfo
+    from claude_code.model import discrete_indices_to_continuous, policy_action_to_command
+    from claude_code import my_observation as MO
+
     geo = GeometryInfo()
-    recon = GMO.StateReconstructor()
+    recon = MO.StateReconstructor()
 
     def build(own, opp, rec):
-        return GMO.build_observation(own, opp, geo, None, reconstructor=rec)
+        return MO.build_observation(own, opp, geo, None, reconstructor=rec)
 
     return HighRateProvider(
         model=model, obs_rms=obs_rms, build_obs=build, recon=recon, step_ratio=step_ratio,
         device=device, explore=explore, to_continuous=discrete_indices_to_continuous,
-        to_command=policy_action_to_command, uses_action_history=False, source="high_rate_gylee")
+        to_command=policy_action_to_command, uses_action_history=True,
+        action_hist_len=int(MO.ACTION_HISTORY_LEN), action_dim=int(MO.ACTION_DIM),
+        source="high_rate_rl")
 
 
-__all__ = ["HighRateProvider", "high_rate_from_bundle", "high_rate_from_gylee"]
+__all__ = ["HighRateProvider", "high_rate_from_bundle", "high_rate_from_model"]

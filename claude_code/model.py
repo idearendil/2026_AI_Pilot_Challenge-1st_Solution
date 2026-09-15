@@ -331,105 +331,6 @@ class MLPDiscreteActor(nn.Module):
         return idx, None, None, None
 
 
-def _init_lstm(lstm: nn.LSTM) -> nn.LSTM:
-    """LSTM 파라미터 직교 초기화(weight) + bias 0. (cuda_fdm.ppo_gpu._init_lstm 과 동일 규약.)"""
-    for name, p in lstm.named_parameters():
-        if "weight" in name:
-            nn.init.orthogonal_(p, 1.0)
-        elif "bias" in name:
-            nn.init.zeros_(p)
-    return lstm
-
-
-class LSTMDiscreteActor(nn.Module):
-    """**추론 전용** 단방향 다층 LSTM factorized categorical actor.
-
-    cuda_fdm.ppo_gpu.ActorCritic 의 **actor trunk 과 파라미터 이름·구조가 동일**하다
-    (`actor_lstm` = nn.LSTM(obs→lstm_hidden, lstm_layers, batch_first, bidirectional=False),
-    `actor_logits` = Linear(lstm_hidden, act_dim*num_bins)). 그래서 GPU 체크포인트 →
-    제출 번들 변환이 actor_lstm.*/actor_logits.* 를 그대로 복사하면 된다(critic·aux 는 추론
-    미사용이라 버림).
-
-    **stateful 추론 계약**: 모든 act/logits 는 1-스텝 관측 (B,obs) 과 hidden (h,c) 을 받아
-    (출력, new_hidden) 을 돌려준다. provider 가 hidden 을 보관하다가 episode 시작마다
-    reset(=init_hidden 으로 0)한다. 학습(GPU)과 동일하게 hidden 이 RL-step(0.1s) 주기로만
-    전진하도록, provider 는 RL-step 경계에서만 hidden 을 commit 한다."""
-
-    def __init__(
-        self,
-        obs_dim: int,
-        act_dim: int = 4,
-        num_bins: int = ACTION_BINS,
-        lstm_hidden: int = 512,
-        lstm_layers: int = 3,
-        **_ignored,
-    ):
-        super().__init__()
-        self.obs_dim = int(obs_dim)
-        self.act_dim = int(act_dim)
-        self.num_bins = int(num_bins)
-        self.lstm_hidden = int(lstm_hidden)
-        self.lstm_layers = int(lstm_layers)
-        # save_bundle 메타 호환: hidden 은 [lstm_hidden]*lstm_layers, activation="lstm".
-        self.hidden = [self.lstm_hidden] * self.lstm_layers
-        self.activation = "lstm"
-        self.critic_hidden = None
-        self.critic_activation = None
-        self.actor_lstm = _init_lstm(
-            nn.LSTM(self.obs_dim, self.lstm_hidden, self.lstm_layers, batch_first=True))
-        self.actor_logits = nn.Linear(self.lstm_hidden, self.act_dim * self.num_bins)
-        nn.init.orthogonal_(self.actor_logits.weight, gain=0.01)
-        nn.init.zeros_(self.actor_logits.bias)
-
-    def actor_parameters(self):
-        return list(self.actor_lstm.parameters()) + list(self.actor_logits.parameters())
-
-    def init_hidden(self, batch: int = 1, device=None):
-        h = torch.zeros(self.lstm_layers, int(batch), self.lstm_hidden, device=device)
-        return (h, torch.zeros_like(h))
-
-    def logits(self, obs: torch.Tensor, hidden):
-        """(B,obs), hidden → (logits(B,act_dim,num_bins), new_hidden). 1-스텝."""
-        y, hidden = self.actor_lstm(obs.unsqueeze(1), hidden)      # (B,1,obs)->(B,1,H)
-        return self.actor_logits(y.squeeze(1)).view(-1, self.act_dim, self.num_bins), hidden
-
-    def _dist(self, obs, hidden):
-        logits, hidden = self.logits(obs, hidden)
-        return torch.distributions.Categorical(logits=logits), hidden
-
-    @torch.no_grad()
-    def act_deterministic(self, obs: torch.Tensor, hidden):
-        """추론용: 채널별 argmax index(B,act_dim) + new_hidden."""
-        logits, hidden = self.logits(obs, hidden)
-        return logits.argmax(-1).float(), hidden
-
-    @torch.no_grad()
-    def act_stochastic(self, obs: torch.Tensor, hidden):
-        """추론용: 채널별 Categorical 샘플 index + new_hidden."""
-        dist, hidden = self._dist(obs, hidden)
-        return dist.sample().float(), hidden
-
-    @torch.no_grad()
-    def get_action_and_value(self, obs: torch.Tensor, hidden, action=None):
-        """SelfPlayProvider(explore) 호환 shim(가치망 없음 → value=None). (idx, None, None, None, hidden)."""
-        dist, hidden = self._dist(obs, hidden)
-        idx = dist.sample().float() if action is None else action.float()
-        return idx, None, None, None, hidden
-
-
-def make_lstm_actor(
-    obs_dim: int,
-    act_dim: int = 4,
-    num_bins: int = ACTION_BINS,
-    lstm_hidden: int = 512,
-    lstm_layers: int = 3,
-    **_ignored,
-) -> LSTMDiscreteActor:
-    """추론용 LSTM actor 팩토리(GPU 학습 정책의 제출 번들 로드/변환용)."""
-    return LSTMDiscreteActor(obs_dim, act_dim, num_bins=num_bins,
-                             lstm_hidden=lstm_hidden, lstm_layers=lstm_layers)
-
-
 # ── 환경/서버로 보낼 action 변환 ──────────────────────────────────────────────
 # 학습 환경 DogFightEnv._to_sim_action 과 동일한 변환을 추론에서도 적용해
 # train/inference action 의미를 일치시킨다.
@@ -475,11 +376,8 @@ def save_bundle(
     out = Path(output_dir)
     out.mkdir(parents=True, exist_ok=True)
 
-    is_lstm = isinstance(model, LSTMDiscreteActor)
-    if is_lstm:
-        model_type = "lstm_discrete_actor"          # 추론 전용 LSTM actor(가치망 없음).
-    elif isinstance(model, MLPDiscreteActor):
-        model_type = "mlp_discrete_actor"          # 정책 전용(REDQ/SAC). 가치망 없음.
+    if isinstance(model, MLPDiscreteActor):
+        model_type = "mlp_discrete_actor"          # 정책 전용. 가치망 없음.
     elif isinstance(model, MLPDiscreteActorCritic):
         model_type = "mlp_discrete_actor_critic"
     else:
@@ -493,16 +391,12 @@ def save_bundle(
     }
     if model_type != "mlp_actor_critic":
         model_meta["num_bins"] = model.num_bins
-    if is_lstm:                                     # 추론 재구성에 필요한 LSTM 구조 파라미터.
-        model_meta["lstm_hidden"] = model.lstm_hidden
-        model_meta["lstm_layers"] = model.lstm_layers
     metadata = {
         "framework": "claude_code_ppo",
         "algorithm": "PPO",
         "observation_mode": "tactical16",
         "observation_size": model.obs_dim,
         "action_size": model.act_dim,
-        "lstm": bool(is_lstm),
         "model": model_meta,
         "throttle_remap": "(a+1)/2",
         "action_clip": {"low": SIM_ACTION_LOW.tolist(), "high": SIM_ACTION_HIGH.tolist()},
@@ -539,14 +433,7 @@ def load_bundle(bundle_dir: str | Path, device: str = "cpu") -> tuple[MLPActorCr
         critic_activation=model_meta.get("critic_activation"),
     )
     mtype = model_meta.get("type")
-    if mtype == "lstm_discrete_actor":
-        # 추론 전용 LSTM actor(가치망 없음). GPU 학습 정책의 제출 번들.
-        model = make_lstm_actor(
-            obs_dim=common["obs_dim"], act_dim=common["act_dim"],
-            num_bins=int(model_meta.get("num_bins", ACTION_BINS)),
-            lstm_hidden=int(model_meta.get("lstm_hidden", 512)),
-            lstm_layers=int(model_meta.get("lstm_layers", 3)))
-    elif mtype == "mlp_discrete_actor":
+    if mtype == "mlp_discrete_actor":
         # 정책 전용 actor(REDQ/SAC). critic 관련 kwargs 는 무시.
         model = MLPDiscreteActor(
             obs_dim=common["obs_dim"], act_dim=common["act_dim"],
@@ -566,9 +453,7 @@ __all__ = [
     "MLPActorCritic",
     "MLPDiscreteActorCritic",
     "MLPDiscreteActor",
-    "LSTMDiscreteActor",
     "make_actor_critic",
-    "make_lstm_actor",
     "ACTION_BINS",
     "make_action_grid",
     "discrete_indices_to_continuous",

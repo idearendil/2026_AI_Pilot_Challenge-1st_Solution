@@ -27,20 +27,23 @@ ENV_KEY = "AIP_RULE_XML"
 #   서로 다른 rule 3개를 한 프로세스에 동시에 로드해도 전부 같은 rule 로 동작한다(DLL 을
 #   파일명만 바꿔 복사해도 마찬가지 — DLL 은 자기 이름의 XML 을 읽지 않고 전역 값을 읽는다).
 #   따라서 학습에서 3개 BT 를 동시에 쓰려면 **워커(프로세스)별로 다른 rule 을 주입**해야 한다.
+# BT DLL·rule XML 은 모두 baselines/ 아래로 모았다. DLL 은 native_bt.AIPilot 이
+# ROOT/<filename> 로 로드하므로 "baselines/<dll>" 로, rule XML 은 CWD(=ROOT) 상대라
+# "./baselines/<name>.xml" 로 준다. dict 키는 basename(rule_for 가 Path(dll).name 으로 조회).
 BT_RULE_DEFAULTS = {
-    "Lee_BT1.dll": "./Lee_BT1.xml",     # 기존 baseline(BaselineCore) 을 이름만 바꾼 것
-    "Jeon_BT1.dll": "./Jeon_BT1.xml",   # 추가 BT #1 (WEZ 추적 + 지면 회피)
-    "Jeon_BT2.dll": "./Jeon_BT2.xml",   # 추가 BT #2 (FarNeutral + PurePursuit)
-    "Shin_BT_def.dll": "./Shin_BT_def.xml",   # 추가 BT #3 (Shin, default)
-    "Shin_BT_best.dll": "./Shin_BT_best.xml",  # 추가 BT #4 (Shin, best)
+    "Lee_BT1.dll": "./baselines/Lee_BT1.xml",     # 기존 baseline(BaselineCore) 을 이름만 바꾼 것
+    "Jeon_BT1.dll": "./baselines/Jeon_BT1.xml",   # 추가 BT #1 (WEZ 추적 + 지면 회피)
+    "Jeon_BT2.dll": "./baselines/Jeon_BT2.xml",   # 추가 BT #2 (FarNeutral + PurePursuit)
+    "Shin_BT_def.dll": "./baselines/Shin_BT_def.xml",   # 추가 BT #3 (Shin, default)
+    "Shin_BT_best.dll": "./baselines/Shin_BT_best.xml",  # 추가 BT #4 (Shin, best)
 }
-DEFAULT_BT_DLL = "Lee_BT1.dll"
+DEFAULT_BT_DLL = "baselines/Lee_BT1.dll"
 
-# 학습 opponent pool 에 넣을 BT 3종(dll, rule XML). 순서 = pool 슬롯 순서.
+# 학습 opponent pool 에 넣을 BT 2종(dll, rule XML). 순서 = pool 슬롯 순서.
 # 한 프로세스 = 1 rule 제약 때문에, 학습에서는 이 목록을 **워커별로 round-robin 배정**한다.
 BT_OPPONENTS = [
-    ("Lee_BT1.dll", "./Lee_BT1.xml"),
-    ("Shin_BT_best.dll", "./Shin_BT_best.xml"),
+    ("baselines/Lee_BT1.dll", "./baselines/Lee_BT1.xml"),
+    ("baselines/Shin_BT_best.dll", "./baselines/Shin_BT_best.xml"),
 ]
 
 

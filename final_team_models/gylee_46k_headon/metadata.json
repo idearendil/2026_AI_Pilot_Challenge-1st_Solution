@@ -1,0 +1,69 @@
+{
+  "name": "gylee_46k_headon",
+  "iteration": 46000,
+  "scenario": "headon",
+  "source_name": "headon_iter_46000.pt",
+  "source_sha256": "858d4ee83d5cc3cd073ebf804cc8d29358ad047adfb991692cccc5f858a2faa3",
+  "model_sha256": "1142904579e31b0e5dc6226b0c6ee55d9c8b2a33d38b12af0501444dd9b407bf",
+  "observation_size": 214,
+  "observation_contract": "cuda_claude164r_command_poststep_v1",
+  "observation_contract_evidence": "training code",
+  "policy_hz": 10,
+  "action_repeat": 6,
+  "action_mode": "argmax",
+  "channels": [
+    "roll",
+    "pitch",
+    "rudder",
+    "throttle"
+  ],
+  "normalization": "stored mean/var, sqrt(var+1e-8), clip [-10,10], frozen",
+  "cfg": {
+    "hidden": [
+      384,
+      384,
+      384
+    ],
+    "activation": "tanh",
+    "num_bins": 21
+  },
+  "recurrent": false,
+  "actor_layout": {
+    "actor_body.0.weight": [
+      384,
+      214
+    ],
+    "actor_body.0.bias": [
+      384
+    ],
+    "actor_body.2.weight": [
+      384,
+      384
+    ],
+    "actor_body.2.bias": [
+      384
+    ],
+    "actor_body.4.weight": [
+      384,
+      384
+    ],
+    "actor_body.4.bias": [
+      384
+    ],
+    "actor_logits.weight": [
+      84,
+      384
+    ],
+    "actor_logits.bias": [
+      84
+    ]
+  },
+  "omitted": [
+    "optimizer",
+    "critic",
+    "auxiliary head",
+    "pool",
+    "training RNG"
+  ],
+  "original20k_conversion": null
+}

@@ -8,7 +8,8 @@
   ├── metadata.json
   └── policy_weights.pkl.gz
 
-이 번들은 claude_code/submission.py 로 대결 서버에 바로 연결할 수 있다.
+이 번들은 claude_code/snapshot_to_bundle.py → build_submission.py 로 제출 파일로 만들어
+대결 서버(BattleServer_V1.2_VeryLow 포함)에 연결할 수 있다.
 """
 from __future__ import annotations
 
@@ -21,10 +22,9 @@ from pathlib import Path
 import numpy as np
 import torch
 
-# wandb API key. 환경변수 WANDB_API_KEY 가 있으면 그것을 우선 사용한다.
-# 주의: 이 키가 소스에 하드코딩돼 있으므로 이 파일을 외부(공개 repo 등)에 commit/push
-# 하지 않도록 유의할 것. 팀 공유 시엔 각자 환경변수로 넣는 방식을 권장.
-_WANDB_API_KEY = "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"
+# wandb API key 는 소스에 넣지 않는다. wandb 로깅을 쓰려면 환경변수 WANDB_API_KEY 를
+# 미리 설정하거나 `wandb login` 을 한 번 실행해 둘 것(키가 없으면 wandb 로깅은 건너뛴다).
+_WANDB_API_KEY = os.environ.get("WANDB_API_KEY", "")
 
 # Release 루트/ src import 경로 등록 (단독 실행 대비).
 ROOT = Path(__file__).resolve().parents[1]
@@ -203,7 +203,7 @@ def parse_args():
                         "글로벌 슬롯이 BT 다음·snapshot 앞에 1칸 늘어난다(--pool-size 에 포함). "
                         "**기본 켜짐**; 끄려면 --no-mpc-opponent. self-play + num_workers>1 에서만 실제 "
                         "활성화되고, 조건 미충족·번들 없음이면 (크래시 없이) 자동 비활성된다.")
-    p.add_argument("--mpc-root", default="Release_MPC_team_share",
+    p.add_argument("--mpc-root", default="baselines/Release_MPC_team_share",
                    help="MPC 번들 루트(=native DLL·config·F16 XML 자산 위치). 프로젝트 루트 기준 상대경로 허용.")
     p.add_argument("--mpc-config", default="",
                    help="MPC config yaml 경로(비우면 <mpc-root>/configs/mpc.yaml).")
@@ -216,8 +216,8 @@ def parse_args():
                         "**기본 켜짐**; 끄려면 --no-cutoff-opponent. self-play + num_workers>1 + exe "
                         "존재에서만 활성화되고, 미충족이면 (크래시 없이) 자동 비활성된다. 워커마다 "
                         "exe 1개(포트 --cutoff-base-port+worker_id)를 상주 실행한다.")
-    p.add_argument("--cutoff-exe-path", default=str(ROOT / "unreal_bt_client.exe"),
-                   help="컷오프 exe 경로(기본: 프로젝트 루트 unreal_bt_client.exe).")
+    p.add_argument("--cutoff-exe-path", default=str(ROOT / "baselines" / "unreal_bt_client.exe"),
+                   help="컷오프 exe 경로(기본: baselines/unreal_bt_client.exe).")
     p.add_argument("--cutoff-base-port", type=int, default=9700,
                    help="컷오프 exe UDP 베이스 포트. 워커 i 는 base+i 를 쓴다(기본 9700).")
     p.add_argument("--cutoff-force-own", type=int, default=1,
@@ -509,7 +509,7 @@ def main():
     if args.wandb:
         try:
             import wandb
-            if not os.environ.get("WANDB_API_KEY"):
+            if not os.environ.get("WANDB_API_KEY") and _WANDB_API_KEY:
                 os.environ["WANDB_API_KEY"] = _WANDB_API_KEY
             run_name = args.wandb_run_name or f"{args.output_name}/{args.output_tag}"
             # crash 재시작 시 같은 run 에 이어 붙도록 run id 고정 + resume 허용.

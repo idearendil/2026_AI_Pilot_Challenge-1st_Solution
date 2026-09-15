@@ -1,0 +1,69 @@
+{
+  "name": "gylee_20k",
+  "iteration": 20000,
+  "scenario": "common",
+  "source_name": "original20k_20000.pt",
+  "source_sha256": "eaa578d54a1e5086bd8fc9ee3585020ef480c1926271728c5b95ee35058db057",
+  "model_sha256": "9f4b8e1810847ae5a1f3bdbc4f8f163922975cdd031b40f0ca80000e34e4b6ae",
+  "observation_size": 214,
+  "observation_contract": "cuda_claude164r_command_poststep_v1",
+  "observation_contract_evidence": "training code",
+  "policy_hz": 10,
+  "action_repeat": 6,
+  "action_mode": "argmax",
+  "channels": [
+    "roll",
+    "pitch",
+    "rudder",
+    "throttle"
+  ],
+  "normalization": "stored mean/var, sqrt(var+1e-8), clip [-10,10], frozen",
+  "cfg": {
+    "hidden": [
+      384,
+      384,
+      384
+    ],
+    "activation": "tanh",
+    "num_bins": 21
+  },
+  "recurrent": false,
+  "actor_layout": {
+    "actor_body.0.weight": [
+      384,
+      214
+    ],
+    "actor_body.0.bias": [
+      384
+    ],
+    "actor_body.2.weight": [
+      384,
+      384
+    ],
+    "actor_body.2.bias": [
+      384
+    ],
+    "actor_body.4.weight": [
+      384,
+      384
+    ],
+    "actor_body.4.bias": [
+      384
+    ],
+    "actor_logits.weight": [
+      84,
+      384
+    ],
+    "actor_logits.bias": [
+      84
+    ]
+  },
+  "omitted": [
+    "optimizer",
+    "critic",
+    "auxiliary head",
+    "pool",
+    "training RNG"
+  ],
+  "original20k_conversion": "legacy184_to_obs214_zero_acceleration_columns_v1: old indices 0:164 -> 0:164; 164:184 -> 194:214; new acceleration columns have zero weights"
+}

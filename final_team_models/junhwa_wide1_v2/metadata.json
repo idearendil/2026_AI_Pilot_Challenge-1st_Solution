@@ -1,0 +1,53 @@
+{
+  "name": "junhwa_wide1_v2",
+  "iteration": 7400,
+  "scenario": "common",
+  "source_name": "junhwa_wide1_v2.pt",
+  "source_sha256": "3b6ceafefd6b3df49030679da3deaa8ca3ae14beeff3f555ae22e18bc1b138ee",
+  "model_sha256": "e43826da6f434cc7b1435a1dccfecc22e492581859cf087d1e9e011a359c6e9f",
+  "observation_size": 214,
+  "observation_contract": "cuda_claude164r_command_poststep_v1",
+  "observation_contract_evidence": "shared-code owner declaration",
+  "policy_hz": 10,
+  "action_repeat": 6,
+  "action_mode": "argmax",
+  "channels": [
+    "roll",
+    "pitch",
+    "rudder",
+    "throttle"
+  ],
+  "normalization": "stored mean/var, sqrt(var+1e-8), clip [-10,10], frozen",
+  "cfg": {
+    "hidden": [
+      4096
+    ],
+    "activation": "tanh",
+    "num_bins": 21
+  },
+  "recurrent": false,
+  "actor_layout": {
+    "actor_body.0.weight": [
+      4096,
+      214
+    ],
+    "actor_body.0.bias": [
+      4096
+    ],
+    "actor_logits.weight": [
+      84,
+      4096
+    ],
+    "actor_logits.bias": [
+      84
+    ]
+  },
+  "omitted": [
+    "optimizer",
+    "critic",
+    "auxiliary head",
+    "pool",
+    "training RNG"
+  ],
+  "original20k_conversion": null
+}

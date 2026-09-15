@@ -117,7 +117,7 @@ def _flatten_state(fdm):
 def build_seed_vector(lat_deg, lon_deg, alt_ft, vt_fps,
                       gamma_deg=0.0, phi_deg=0.0, psi_deg=0.0, theta_deg=0.0,
                       alpha_deg=0.0, beta_deg=0.0, lat_type="geodetic",
-                      fuel_lbs=6000.0, throttle=0.8):
+                      fuel_lbs=6972.0, throttle=0.8):
     """IC → 101 double FdmState seed 벡터 (GPU 업로드용). CPU(ref) 로 계산.
     prev_aux 는 IC-일관 근사(alpha/mach/vc 정확, n_pilot 는 1프레임 근사)."""
     from cuda_fdm.ref.jsb_fdm import FDM

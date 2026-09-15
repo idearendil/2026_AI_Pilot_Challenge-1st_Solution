@@ -82,16 +82,12 @@ class SelfPlayProvider(ActionProvider):
         self._cached: ActionResult | None = None
         # 에피소드 첫 관측은 GPU 학습(reset→build, advance 없음)과 동일하게 fresh recon 으로.
         self._first_call = True
-        # LSTM(recurrent) 정책이면 hidden 을 보관하며 episode 마다 리셋(0). MLP 는 None 유지.
-        self._is_lstm = hasattr(self.model, "init_hidden")
-        self._hidden = None
 
     def reset(self, context: ActionContext | None = None) -> None:
         self._recon.reset()
         self._count = 0
         self._cached = None
         self._first_call = True
-        self._hidden = None
 
     def _normalize(self, obs: np.ndarray) -> np.ndarray:
         if self.obs_rms is None:
@@ -125,17 +121,7 @@ class SelfPlayProvider(ActionProvider):
             obs_t = torch.as_tensor(self._normalize(obs), dtype=torch.float32,
                                     device=self.device).unsqueeze(0)
             with torch.no_grad():
-                if self._is_lstm:
-                    # recurrent: hidden 을 이어가며 1-스텝 전진(RL-step 당 1회 = 학습과 동일 주기).
-                    if self._hidden is None:
-                        self._hidden = self.model.init_hidden(1, self.device)
-                    if self.explore:
-                        raw, _, _, _, self._hidden = self.model.get_action_and_value(
-                            obs_t, self._hidden)
-                    else:
-                        raw, self._hidden = self.model.act_deterministic(obs_t, self._hidden)
-                    raw = raw.squeeze(0).cpu().numpy()
-                elif self.explore:
+                if self.explore:
                     raw, _, _, _ = self.model.get_action_and_value(obs_t)
                     raw = raw.squeeze(0).cpu().numpy()
                 else:

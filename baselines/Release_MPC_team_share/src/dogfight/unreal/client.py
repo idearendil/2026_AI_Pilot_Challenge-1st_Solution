@@ -73,7 +73,7 @@ class UnrealAIPilotUDPClient:
     def __init__(
         self,
         command_policy: CommandPolicy,
-        server_ip: str = "221.151.77.208",
+        server_ip: str = "127.0.0.1",
         server_port: int = 9999,
         team_name: str = "ASDF",
         ai_type: AIType = AIType.ReinforcementLearning,

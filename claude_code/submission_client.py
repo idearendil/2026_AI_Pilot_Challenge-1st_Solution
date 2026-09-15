@@ -10,25 +10,23 @@ PyInstaller 로 얼린 exe 로도 동작한다. 얼린 exe 는 **자기 옆(상�
   DogfightSubmission/
     DogfightSubmission.exe      ← 이 스크립트를 얼린 실행 파일
     _internal/                  ← PyInstaller 런타임(파이썬/torch 등)
-    config.json                 ← 서버 IP/포트, 팀명, 모드, 자원 상대경로
-    model/                      ← basic 번들(metadata.json + policy_weights.pkl.gz)
-    Release_MPC_team_share/     ← altguard 저고도 MPC(예측기 DLL + f16 에셋 + configs)
+    config.json                 ← 서버 IP/포트, 팀명, 제어주기·argmax 여부, 번들 상대경로
+    model/                      ← 학습 번들(metadata.json + policy_weights.pkl.gz)
 
-주최측은 exe 만 실행하면 된다. side(ownship/target)는 지정하지 않는다 —
-서버가 MT_SetPlaneID 로 조종할 기체를 배정하고, 클라이언트는 배정된 기체를
-기준으로 관측을 만들어 어느 편에 붙든 동일하게 동작한다.
+CPU 학습 번들·CUDA 학습 번들 모두 같은 포맷이라 그대로 넣으면 된다. 주최측은 exe 만
+실행하면 된다. side(ownship/target)는 지정하지 않는다 — 서버가 MT_SetPlaneID 로 조종할
+기체를 배정하고, 클라이언트는 배정된 기체 기준으로 관측을 만들어 어느 편에 붙든 동일하게
+동작한다.
 
 config.json 필드
 ----------------
-  server_ip        : 대회 서버 IP (예: "221.151.77.208")
+  server_ip        : 대회 서버 IP (예: "127.0.0.1" 로 로컬 BattleServer)
   server_port      : 서버 UDP 포트 (기본 9999)
   team_name        : 참가 팀 이름
-  mode             : "altguard" | "altblend" | "basic"
-  bundle_dir       : basic 번들 경로(상대=config 기준). 세 모드 공통 사용.
-  mpc_root         : altguard/altblend 전용. Release_MPC_team_share 폴더 경로(상대).
-  guard_altitude_ft: altguard 저고도 하드 전환 임계(기본 3000).
-  blend_hi_ft/blend_lo_ft: altblend 선형 블렌딩 상·하한(기본 4000/2000).
-  action_repeat    : 정책 재호출 주기(생략 시 altguard/altblend=1/60Hz, basic=6/10Hz).
+  bundle_dir       : 학습 번들 경로(상대=config 기준).
+  control_hz       : 10(action_repeat=6) | 60(action_repeat=1). 기본 10.
+  deterministic    : true=argmax | false=stochastic(정책 분포 샘플링). 기본 false.
+  action_repeat    : (선택) 정책 재호출 주기 직접 지정(생략 시 control_hz 로 결정).
   heartbeat_sec / recv_timeout_sec / command_delay_sec : 연결 튜닝(선택).
 """
 from __future__ import annotations
@@ -68,89 +66,44 @@ def _resolve(base: Path, value: str) -> Path:
     return p if p.is_absolute() else (base / p)
 
 
-# ── 관측 더미(altguard 는 자체 관측을 만들므로 정책에 넘길 관측은 무시됨) ──
-_DUMMY_OBS = np.zeros(1, dtype=np.float32)
+# ── provider 구성 (순수 학습모델) ────────────────────────────────────────────
+def _build_model(cfg: dict, base: Path):
+    """CPU/CUDA 학습 번들 → provider. config 로 제어주기(10/60Hz)와 argmax/stochastic 지정.
 
-
-def _dummy_obs(*_args, **_kwargs) -> np.ndarray:
-    return _DUMMY_OBS
-
-
-# ── provider 구성 ──────────────────────────────────────────────────────────
-def _build_altguard(cfg: dict, base: Path):
-    from claude_code.altguard_provider import make_altguard_provider
-
-    bundle_dir = _resolve(base, cfg["bundle_dir"])
-    mpc_root = _resolve(base, cfg.get("mpc_root", "Release_MPC_team_share"))
-    if not bundle_dir.exists():
-        raise FileNotFoundError(f"basic 번들을 찾을 수 없습니다: {bundle_dir}")
-    if not mpc_root.exists():
-        raise FileNotFoundError(f"MPC 자원 폴더를 찾을 수 없습니다: {mpc_root}")
-
-    provider = make_altguard_provider(
-        bundle_dir=str(bundle_dir),
-        mpc_root=str(mpc_root),
-        mpc_config_path=str(mpc_root / "configs" / "mpc.yaml"),
-        step_ratio=int(cfg.get("step_ratio", 6)),
-        device="cpu",
-        stochastic=True,
-        guard_altitude_ft=float(cfg.get("guard_altitude_ft", 3000.0)),
-    )
-    # altguard 는 매 substep(60Hz) 호출을 받아 내부에서 basic(10Hz)/MPC(60Hz)를
-    # 스스로 분할한다 → 정책 쪽 action_repeat 는 1 이어야 한다.
-    action_repeat = int(cfg.get("action_repeat", 1))
-    print(f"[{cfg['team_name']}] 모드: altguard "
-          f"(저고도 {cfg.get('guard_altitude_ft', 3000.0)}ft↓ → team-share MPC 60Hz)")
-    return provider, "tactical16", _dummy_obs, action_repeat
-
-
-def _build_altblend(cfg: dict, base: Path):
-    from claude_code.altblend_provider import make_altblend_provider
-
-    bundle_dir = _resolve(base, cfg["bundle_dir"])
-    mpc_root = _resolve(base, cfg.get("mpc_root", "Release_MPC_team_share"))
-    if not bundle_dir.exists():
-        raise FileNotFoundError(f"basic 번들을 찾을 수 없습니다: {bundle_dir}")
-    if not mpc_root.exists():
-        raise FileNotFoundError(f"MPC 자원 폴더를 찾을 수 없습니다: {mpc_root}")
-
-    hi = float(cfg.get("blend_hi_ft", 4000.0))
-    lo = float(cfg.get("blend_lo_ft", 2000.0))
-    provider = make_altblend_provider(
-        bundle_dir=str(bundle_dir),
-        mpc_root=str(mpc_root),
-        mpc_config_path=str(mpc_root / "configs" / "mpc.yaml"),
-        step_ratio=int(cfg.get("step_ratio", 6)),
-        device="cpu",
-        stochastic=True,
-        blend_hi_ft=hi,
-        blend_lo_ft=lo,
-    )
-    # altguard 와 마찬가지로 매 substep(60Hz) 호출을 받아 내부에서 actor(10Hz)/MPC(60Hz)를
-    # 섞으므로 정책 쪽 action_repeat 는 1 이어야 한다.
-    action_repeat = int(cfg.get("action_repeat", 1))
-    print(f"[{cfg['team_name']}] 모드: altblend "
-          f"({hi:.0f}~{lo:.0f}ft 에서 actor·MPC action 고도 선형 가중평균)")
-    return provider, "tactical16", _dummy_obs, action_repeat
-
-
-def _build_basic(cfg: dict, base: Path):
-    from claude_code.action_provider import MLPActionProvider
+    config.json 필드:
+      bundle_dir     : 학습 번들 경로(상대=config 기준). CPU·CUDA 번들 모두 동일 포맷.
+      control_hz     : 10(action_repeat=6) | 60(action_repeat=1). 기본 10.
+      deterministic  : true=argmax | false=stochastic(정책 분포 샘플링). 기본 false.
+    """
     from dogfight.ai.student_hooks import load_observation_hook
 
     bundle_dir = _resolve(base, cfg["bundle_dir"])
     if not bundle_dir.exists():
-        raise FileNotFoundError(f"basic 번들을 찾을 수 없습니다: {bundle_dir}")
+        raise FileNotFoundError(f"번들을 찾을 수 없습니다: {bundle_dir}")
 
-    provider = MLPActionProvider(bundle_dir=str(bundle_dir), stochastic=True)
-    obs_module = provider.metadata.get("observation_module", "") or ""
+    stochastic = not bool(cfg.get("deterministic", False))
+    hz = int(cfg.get("control_hz", 10))
+    # action_repeat: config 우선, 없으면 hz 로 결정(10Hz=6, 60Hz=1).
+    action_repeat = int(cfg.get("action_repeat", 1 if hz == 60 else 6))
+
+    if hz == 60:
+        # 매 substep(60Hz) 재결정. HighRateProvider 가 context 상태로 스스로 관측을
+        # 재구성하므로 ProviderCommandPolicy 의 obs 는 무시된다(claude164r 번들만 지원).
+        from claude_code.high_rate import high_rate_from_bundle
+        provider = high_rate_from_bundle(
+            str(bundle_dir), step_ratio=int(cfg.get("step_ratio", 6)),
+            device="cpu", explore=stochastic)
+        obs_module = "claude_code.my_observation"
+    else:
+        from claude_code.action_provider import MLPActionProvider
+        provider = MLPActionProvider(bundle_dir=str(bundle_dir), stochastic=stochastic)
+        obs_module = provider.metadata.get("observation_module", "") or ""
+
     hook = load_observation_hook(obs_module) if obs_module else None
-    obs_mode = hook["mode"] if hook else \
-        (provider.metadata.get("observation_mode") or "tactical16")
+    obs_mode = hook["mode"] if hook else "claude164r"
     obs_fn = hook["build_observation"] if hook else None
-    action_repeat = int(cfg.get("action_repeat", 6))
-    print(f"[{cfg['team_name']}] 모드: basic (PPO MLP, 관측={obs_mode}"
-          f"{', custom:' + obs_module if obs_module else ''})")
+    print(f"[{cfg['team_name']}] 순수 학습모델 (PPO MLP, 관측={obs_mode}, "
+          f"{hz}Hz, {'argmax' if not stochastic else 'stochastic'})")
     return provider, obs_mode, obs_fn, action_repeat
 
 
@@ -163,7 +116,7 @@ def load_config(cfg_path: Path) -> dict:
         )
     with cfg_path.open("r", encoding="utf-8") as fh:
         cfg = json.load(fh)
-    for key in ("server_ip", "team_name", "mode", "bundle_dir"):
+    for key in ("server_ip", "team_name", "bundle_dir"):
         if not cfg.get(key):
             raise ValueError(f"config.json 에 필수 항목 '{key}' 이(가) 없습니다: {cfg_path}")
     return cfg
@@ -191,19 +144,11 @@ def main() -> None:
     server_ip = str(cfg["server_ip"])
     server_port = int(cfg.get("server_port", 9999))
     team_name = str(cfg["team_name"])
-    mode = str(cfg["mode"]).lower()
 
     print(f"=== [claude_code] {team_name} 경진대회 클라이언트 시작 ===")
     print(f"서버: {server_ip}:{server_port}  (config: {cfg_path})")
 
-    if mode == "altguard":
-        provider, obs_mode, obs_fn, action_repeat = _build_altguard(cfg, base)
-    elif mode == "altblend":
-        provider, obs_mode, obs_fn, action_repeat = _build_altblend(cfg, base)
-    elif mode == "basic":
-        provider, obs_mode, obs_fn, action_repeat = _build_basic(cfg, base)
-    else:
-        raise ValueError(f"알 수 없는 mode: {mode!r} (altguard/altblend/basic)")
+    provider, obs_mode, obs_fn, action_repeat = _build_model(cfg, base)
 
     command_policy = ProviderCommandPolicy(
         action_provider=provider,

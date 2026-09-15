@@ -1,0 +1,61 @@
+{
+  "name": "junhwa_final",
+  "iteration": 16200,
+  "scenario": "common",
+  "source_name": "junhwa_final.pt",
+  "source_sha256": "026e77f16c18e65410582d075f38b8ef638520dd0c49346091582c75360a6413",
+  "model_sha256": "cc784354252a38db3fcc36b65e95af157fcf3ec92c57343c07aab3e49cf0b3d5",
+  "observation_size": 214,
+  "observation_contract": "cuda_claude164r_command_poststep_v1",
+  "observation_contract_evidence": "shared-code owner declaration",
+  "policy_hz": 10,
+  "action_repeat": 6,
+  "action_mode": "argmax",
+  "channels": [
+    "roll",
+    "pitch",
+    "rudder",
+    "throttle"
+  ],
+  "normalization": "stored mean/var, sqrt(var+1e-8), clip [-10,10], frozen",
+  "cfg": {
+    "hidden": [
+      768,
+      768
+    ],
+    "activation": "tanh",
+    "num_bins": 21
+  },
+  "recurrent": false,
+  "actor_layout": {
+    "actor_body.0.weight": [
+      768,
+      214
+    ],
+    "actor_body.0.bias": [
+      768
+    ],
+    "actor_body.2.weight": [
+      768,
+      768
+    ],
+    "actor_body.2.bias": [
+      768
+    ],
+    "actor_logits.weight": [
+      84,
+      768
+    ],
+    "actor_logits.bias": [
+      84
+    ]
+  },
+  "omitted": [
+    "optimizer",
+    "critic",
+    "auxiliary head",
+    "pool",
+    "training RNG"
+  ],
+  "original20k_conversion": null
+}

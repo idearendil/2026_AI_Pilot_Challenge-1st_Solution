@@ -130,18 +130,11 @@ def main():
         print(f"[resume] {args.resume} 에서 iter {start_it} 부터 재개", flush=True)
 
     # ── wandb 초기화 (실패해도 학습 계속) ─────────────────────────────────────
-    # 하드코딩 API 키는 새 파일에 복제하지 않고 claude_code/train.py 것을 재사용한다
-    # (그 파일이 유일한 키 보관처이자 '공개 repo 커밋 금지' 대상). 환경변수가 있으면 우선.
+    # wandb API key 는 소스에 넣지 않는다. 환경변수 WANDB_API_KEY 또는 `wandb login` 사용.
     wb = None
     if args.wandb:
         try:
-            import wandb
-            if not os.environ.get("WANDB_API_KEY"):
-                try:
-                    from claude_code.train import _WANDB_API_KEY
-                    os.environ["WANDB_API_KEY"] = _WANDB_API_KEY
-                except Exception:
-                    pass   # 키 없으면 wandb 로그인/오프라인 설정에 위임
+            import wandb   # 키가 없으면 wandb 로그인/오프라인 설정에 위임
             run_name = args.wandb_run_name or f"gpu-ppo/seed{args.seed}"
             # run id: '--save 파일명 stem' 같은 고정 id 는 서버에서 삭제된 run 과 충돌한다
             # (resume 으로 삭제된 id 재사용 금지). 대신 매 새 run 마다 unique id 를 생성하고

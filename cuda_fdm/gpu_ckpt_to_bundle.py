@@ -14,7 +14,10 @@ snapshot 포맷과 두 군데가 다르다:
 
 두 네트워크는 레이어 수·shape·활성화·연산이 100% 동일하고 파라미터가 1:1 대응하므로,
 키 이름만 remap 하면 수치적으로 동일한(bit-identical) 정책이 제출 번들 포맷으로 나온다.
-관측도 CUDA env 가 claude_code 와 같은 claude164r(OBS_SIZE=184)라 추론 측과 그대로 맞는다.
+관측도 CUDA env 가 claude_code 와 같은 claude164r(OBS_SIZE=214)라 추론 측과 그대로 맞는다.
+
+`load_ckpt_as_model()` 은 이 변환을 in-memory 로 수행해 (model, obs_norm, obs_mode) 를
+돌려준다 → power_test/final_power_test 가 runs 체크포인트를 번들 변환 없이 바로 상대로 쓴다.
 
 예:
   python -m cuda_fdm.gpu_ckpt_to_bundle \
@@ -103,6 +106,42 @@ def _detect_obs_mode(observation_module: str) -> str:
             return getattr(m, "OBSERVATION_MODE", "claude164r")
         except Exception:
             return "claude164r"
+
+
+def load_ckpt_as_model(ckpt_path, device: str = "cpu",
+                       observation_module: str = "claude_code.my_observation"):
+    """CUDA PPOGPUTrainer 체크포인트(.pt) → (model, obs_norm, obs_mode) in-memory 로딩.
+
+    번들로 저장하지 않고 바로 추론용 MLPDiscreteActorCritic 을 만든다(gpu_ckpt_to_bundle
+    변환과 동일 remap). power_test/final_power_test 가 runs 체크포인트를 상대로 붙일 때 사용.
+      - model     : eval() 상태의 MLPDiscreteActorCritic(device 로 이동)
+      - obs_norm  : 번들 obs_normalization dict(mean/var/count) 또는 None
+      - obs_mode  : 관측 mode 문자열(기본 claude164r)
+    """
+    ckpt_path = Path(ckpt_path)
+    if not ckpt_path.exists():
+        raise FileNotFoundError(f"체크포인트를 찾을 수 없음: {ckpt_path}")
+    ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+    if "model" not in ckpt:
+        raise KeyError(f"{ckpt_path} 는 CUDA PPOGPUTrainer 체크포인트가 아님('model' 키 없음)")
+    cuda_sd = ckpt["model"]
+    cfg = ckpt.get("cfg", {}) or {}
+
+    hidden = tuple(cfg.get("hidden", (256, 256)))
+    activation = cfg.get("activation", "tanh")
+    num_bins = int(cfg.get("num_bins", cuda_sd["actor_logits.weight"].shape[0] // 4))
+    obs_dim = int(cuda_sd["actor_body.0.weight"].shape[1])
+    act_dim = int(cuda_sd["actor_logits.weight"].shape[0] // num_bins)
+
+    remapped = remap_state_dict(cuda_sd, num_hidden=len(hidden))
+    model = make_actor_critic(obs_dim=obs_dim, act_dim=act_dim, num_bins=num_bins,
+                              hidden=hidden, activation=activation)
+    model.load_state_dict(remapped, strict=True)
+    model.eval().to(device)
+
+    obs_norm = obs_norm_from_ckpt(ckpt.get("norm"))
+    obs_mode = _detect_obs_mode(observation_module)
+    return model, obs_norm, obs_mode
 
 
 def parse_args():

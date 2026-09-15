@@ -1,17 +1,24 @@
 # -*- coding: utf-8 -*-
-"""제출용 단일 실행 파일(zip) 빌더.
+"""제출용 단일 실행 파일(zip) 빌더 (순수 학습모델).
 
 `claude_code/submission_client.py` 를 PyInstaller(onedir)로 얼려서,
-  exe + config.json + 모델 번들 + (altguard 시) Release_MPC_team_share
-를 하나의 폴더로 묶고 zip 으로 압축한다. 주최측은 zip 을 풀고 exe 만 실행하면
-config.json(상대경로)을 읽어 대회 서버에 접속한다.
+  exe + config.json + 학습 번들(model/)
+을 하나의 폴더로 묶고 zip 으로 압축한다. 주최측(또는 로컬 BattleServer_V1.2_VeryLow)은
+zip 을 풀고 exe 만 실행하면 config.json(상대경로)을 읽어 서버에 접속한다.
+
+CPU 학습 번들(snapshot_to_bundle)·CUDA 학습 번들(gpu_ckpt_to_bundle) 모두 지정 가능하다.
+제어 주기(10/60Hz)와 argmax/stochastic 은 config.json(control_hz·deterministic)에서 정한다.
 
 사용 예
 ------
-  python claude_code/build_submission.py --mode altguard \
-      --team-name team01 --server-ip 221.151.77.208 --server-port 9999
+  # CUDA 학습 번들, 10Hz stochastic, 로컬 BattleServer 확인
+  python claude_code/build_submission.py --bundle-dir artifacts/gpu_ppo_final \
+      --team-name team01 --server-ip 127.0.0.1 --server-port 9999
+  # 60Hz argmax
+  python claude_code/build_submission.py --bundle-dir artifacts/cpu_ppo_final \
+      --control-hz 60 --deterministic
 
-결과: dist/submission_<mode>/DogfightSubmission/  및  dist/submission_<mode>.zip
+결과: dist/submission/DogfightSubmission/  및  dist/submission.zip
 """
 from __future__ import annotations
 
@@ -25,22 +32,15 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 SRC = ROOT / "src"
-MPC_ROOT = ROOT / "Release_MPC_team_share"
-# 기본 ownship 번들 = basic2(현재 모델 구조: obs 214, accel+aux 로 학습). --bundle-dir 로 교체 가능.
-DEFAULT_BUNDLE = ROOT / "artifacts" / "models" / "team01" / "basic2"
 ENTRY = ROOT / "claude_code" / "submission_client.py"
 APP_NAME = "DogfightSubmission"
 
-# 런타임에 sys.path.append 로 동적 로드되거나(mpc/yaml), 함수 내부에서 import 되어
-# PyInstaller 정적 분석이 놓칠 수 있는 모듈들을 명시적으로 포함한다.
+# 함수 내부에서 import 되어 PyInstaller 정적 분석이 놓칠 수 있는 모듈들을 명시적으로 포함한다.
 HIDDEN_IMPORTS = [
-    "yaml",
     "GeoMathUtil",
-    "mpc", "mpc.config", "mpc.native", "mpc.planner", "mpc.provider",
-    "mpc.target_prediction", "mpc.transforms",
     "claude_code.submission_client",
-    "claude_code.altguard_provider", "claude_code.altblend_provider",
     "claude_code.action_provider",
+    "claude_code.high_rate",
     "claude_code.model", "claude_code.my_observation",
     "dogfight.unreal", "dogfight.unreal.client", "dogfight.unreal.protocol",
     "dogfight.ai.action_provider", "dogfight.ai.student_hooks",
@@ -71,31 +71,20 @@ def _ensure_pyinstaller() -> None:
 
 
 def _make_config(args) -> dict:
-    cfg = {
+    return {
         "server_ip": args.server_ip,
         "server_port": args.server_port,
         "team_name": args.team_name,
-        "mode": args.mode,
         "bundle_dir": "model",
-        "guard_altitude_ft": 3000.0,
+        "control_hz": int(args.control_hz),        # 10(action_repeat=6) | 60(action_repeat=1)
+        "deterministic": bool(args.deterministic),  # true=argmax | false=stochastic
     }
-    if args.mode == "altguard":
-        cfg["mpc_root"] = "Release_MPC_team_share"
-        cfg["action_repeat"] = 1
-    elif args.mode == "altblend":
-        cfg["mpc_root"] = "Release_MPC_team_share"
-        cfg["action_repeat"] = 1
-        cfg["blend_hi_ft"] = 4000.0
-        cfg["blend_lo_ft"] = 2000.0
-    else:
-        cfg["action_repeat"] = 6
-    return cfg
 
 
 def _run_pyinstaller(work: Path, dist: Path) -> Path:
     import PyInstaller.__main__ as pyi
 
-    pathex = [str(ROOT), str(SRC), str(MPC_ROOT / "src")]
+    pathex = [str(ROOT), str(SRC)]
     cli = [
         str(ENTRY),
         "--name", APP_NAME,
@@ -134,14 +123,6 @@ def _assemble(app_dir: Path, cfg: dict, bundle_dir: Path) -> None:
         shutil.rmtree(dst_model)
     shutil.copytree(bundle_dir, dst_model)
     print(f"  + model/ ({bundle_dir.name})")
-    # altguard/altblend MPC 자원(폴더 통째로: predictor DLL + f16 에셋 + configs)
-    if cfg["mode"] in ("altguard", "altblend"):
-        dst_mpc = app_dir / "Release_MPC_team_share"
-        if dst_mpc.exists():
-            shutil.rmtree(dst_mpc)
-        shutil.copytree(MPC_ROOT, dst_mpc,
-                        ignore=shutil.ignore_patterns("dist", "__pycache__", "*.pyc"))
-        print("  + Release_MPC_team_share/ (MPCJSBSim.dll + f16 assets + configs)")
 
 
 def _zip(app_dir: Path, out_zip: Path) -> None:
@@ -155,25 +136,27 @@ def _zip(app_dir: Path, out_zip: Path) -> None:
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser(description="제출 exe/zip 빌더")
-    ap.add_argument("--mode", choices=["altguard", "altblend", "basic"], default="altguard")
-    ap.add_argument("--bundle-dir", default=str(DEFAULT_BUNDLE),
-                    help="ownship 번들 경로(기본 basic2 = 현재 모델 구조 obs 214)")
+    ap = argparse.ArgumentParser(description="제출 exe/zip 빌더 (순수 학습모델)")
+    ap.add_argument("--bundle-dir", required=True,
+                    help="학습 번들 경로(CPU snapshot_to_bundle 또는 CUDA gpu_ckpt_to_bundle 산출물)")
+    ap.add_argument("--control-hz", type=int, choices=[10, 60], default=10,
+                    help="제어 주기(10=action_repeat 6, 60=action_repeat 1). 기본 10")
+    ap.add_argument("--deterministic", action="store_true",
+                    help="action 을 argmax 로(기본은 stochastic 샘플링)")
     ap.add_argument("--team-name", default="team01")
-    ap.add_argument("--server-ip", default="221.151.77.208")
+    ap.add_argument("--server-ip", default="127.0.0.1",
+                    help="대회 서버 IP(로컬 BattleServer 확인 시 127.0.0.1)")
     ap.add_argument("--server-port", type=int, default=9999)
-    ap.add_argument("--out", default=None, help="출력 루트(기본 dist/submission_<mode>)")
+    ap.add_argument("--out", default=None, help="출력 루트(기본 dist/submission)")
     args = ap.parse_args()
 
     bundle_dir = Path(args.bundle_dir).resolve()
     if not bundle_dir.exists():
-        raise FileNotFoundError(f"ownship 번들 없음: {bundle_dir}")
-    if args.mode in ("altguard", "altblend") and not MPC_ROOT.exists():
-        raise FileNotFoundError(f"MPC 자원 폴더 없음: {MPC_ROOT}")
+        raise FileNotFoundError(f"번들 없음: {bundle_dir}")
 
     _ensure_pyinstaller()
 
-    out_root = Path(args.out).resolve() if args.out else (ROOT / "dist" / f"submission_{args.mode}")
+    out_root = Path(args.out).resolve() if args.out else (ROOT / "dist" / "submission")
     if out_root.exists():
         shutil.rmtree(out_root)
     out_root.mkdir(parents=True, exist_ok=True)
@@ -181,7 +164,8 @@ def main() -> None:
     dist = out_root / "_dist"
 
     cfg = _make_config(args)
-    print(f"=== 제출 빌드: mode={args.mode} team={args.team_name} "
+    print(f"=== 제출 빌드(순수 학습모델): team={args.team_name} "
+          f"{args.control_hz}Hz {'argmax' if args.deterministic else 'stochastic'} "
           f"server={args.server_ip}:{args.server_port} ===")
 
     app_dir = _run_pyinstaller(work, dist)
@@ -194,7 +178,7 @@ def main() -> None:
     shutil.move(str(app_dir), str(final_app))
     shutil.rmtree(dist, ignore_errors=True)
 
-    out_zip = ROOT / "dist" / f"submission_{args.mode}.zip"
+    out_zip = ROOT / "dist" / "submission.zip"
     _zip(final_app, out_zip)
 
     print("\n완료.")

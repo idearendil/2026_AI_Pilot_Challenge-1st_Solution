@@ -1,0 +1,15 @@
+{
+  "source_actor_tensors_preserved": true,
+  "normalization_preserved": true,
+  "reference": "existing Junhwa evaluator",
+  "devices": [
+    "cpu",
+    "cuda"
+  ],
+  "batch_size": 256,
+  "sequence_steps": 4,
+  "episode_reset_test": true,
+  "argmax_exact_match": true,
+  "hidden_state_exact_match": true,
+  "max_gylee_logit_error": 0.0
+}
