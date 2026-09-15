@@ -1,4 +1,0 @@
-[claude_code/PPO] wandb 로깅 활성: project='AIP contest' run='_smoke141/t'
-[claude_code/PPO] opponent 초기화 = iter0 정책 (EMA α=0.05, 승격 임계 EMA≥0.60, 초기 EMA=0.5)
-[claude_code/PPO] snapshot 저장: claude_code\models\_smoke141\t (iter 0 = 초기 network)
-iter   1 | step     400 | return      nan | len    nan | damage    nan | dist    nan | aim    nan | ent  6.499 | kl 0.0002 | ev -0.050 | opp(gen0) W/L/D 0/0/0 raw_wr nan ema 0.500

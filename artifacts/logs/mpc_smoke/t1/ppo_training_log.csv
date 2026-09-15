@@ -1,3 +1,0 @@
-iteration,global_step,mean_return,mean_length,completed_episodes,policy_loss,value_loss,entropy,approx_kl,explained_variance,ep_pursuit,ep_damage,ep_shaping,ep_terminal,elapsed_sec,win,loss,draw,raw_win_rate,ema_mean,ema_min,pool_size,opp_added,altitude_term,ema_bt,bt_win_rate,bt_games,update_epochs,critic_epochs,update_early_stop
-1,8000,-16.9163,386.9,20,-0.02029,1.76579,11.4302,0.05032,0.0024,0.0000,-0.2959,-1.6204,-15.0000,72.50,4,16,0,0.2000,0.5000,0.5000,4,0,16,0.4500,0.0000,6,2,5,1
-2,16000,-13.0754,367.0,21,-0.10753,0.08734,10.9878,0.05613,0.8566,0.0000,-0.2361,-2.1250,-10.7143,61.21,7,14,0,0.3333,0.5278,0.5278,4,0,13,0.4050,0.0000,4,5,5,1
