@@ -392,3 +392,5 @@ python claude_code/build_submission.py --bundle-dir artifacts/gpu_ppo_final \
   한 프로세스에서 동시에 붙일 수는 없습니다.
 - **관측 규약.** 두 학습 pipeline 이 모두 claude164r(`claude_code.my_observation`)로 학습하므로,
   bundle 이든 ckpt 든 슬롯을 가리지 않고 서로 붙여 비교할 수 있다.
+- 본선 최종 제출 모델을 학습시킨 exploiter 및 pool 고도화 학습 파이프라인 코드는
+  https://github.com/gyuLee21/aipilot-rl을 참고.
